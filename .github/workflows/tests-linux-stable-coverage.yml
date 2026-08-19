@@ -2,9 +2,6 @@
 name: tests linux stable coverage
 
 on:
-  push:
-    branches:
-      - master
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review, labeled]
   merge_group:

@@ -696,6 +696,12 @@ pub struct NetworkConfiguration {
 
 	/// Networking backend used for P2P communication.
 	pub network_backend: NetworkBackendType,
+
+	/// WSS 自签证书私钥（DER 编码）。None 时使用明文 WS。
+	pub tls_private_key_der: Option<Vec<u8>>,
+
+	/// WSS 自签证书链（DER 编码）。None 时使用明文 WS。
+	pub tls_certificate_chain_der: Option<Vec<Vec<u8>>>,
 }
 
 impl NetworkConfiguration {
@@ -732,6 +738,8 @@ impl NetworkConfiguration {
 			ipfs_server: false,
 			ipfs_bootnodes: Vec::new(),
 			network_backend: NetworkBackendType::Litep2p,
+			tls_private_key_der: None,
+			tls_certificate_chain_der: None,
 		}
 	}
 
@@ -982,17 +990,12 @@ impl<B: BlockT + 'static, H: ExHashT, N: NetworkBackend<B, H>> FullNetworkConfig
 #[derive(Debug, Clone, Default, Copy)]
 pub enum NetworkBackendType {
 	/// Use litep2p for P2P networking.
-	///
-	/// This is the preferred option for Substrate-based chains.
-	#[default]
 	Litep2p,
 
 	/// Use libp2p for P2P networking.
 	///
-	/// The libp2p is still used for compatibility reasons until the
-	/// ecosystem switches entirely to litep2p. The backend will enter
-	/// a "best-effort" maintenance mode, where only critical issues will
-	/// get fixed. If you are unsure, please use `NetworkBackendType::Litep2p`.
+	/// CitizenChain 默认使用 libp2p，以支持 WSS + 自签证书传输。
+	#[default]
 	Libp2p,
 }
 

@@ -53,7 +53,7 @@ sp-rpc = { workspace = true, default-features = true }
 sp-runtime = { workspace = true, default-features = true }
 sp-timestamp = { workspace = true }
 sp-weights = { workspace = true, default-features = true }
-sqlx = { workspace = true, features = ["macros", "runtime-tokio", "sqlite"] }
+sqlx = { workspace = true, features = ["macros", "migrate", "runtime-tokio", "sqlite"] }
 subxt = { workspace = true, default-features = true, features = [
 	"reconnecting-rpc-client",
 ] }

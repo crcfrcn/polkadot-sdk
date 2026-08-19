@@ -1,10 +1,6 @@
 name: Build and push ETH-RPC image
 
 on:
-  push:
-    branches:
-      - master
-      - stable*
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
 

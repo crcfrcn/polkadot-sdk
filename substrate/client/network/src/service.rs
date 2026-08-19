@@ -333,7 +333,12 @@ where
 				TransportConfig::Normal { .. } => false,
 			};
 
-			transport::build_transport(local_identity.clone().into(), config_mem)
+			transport::build_transport(
+				local_identity.clone().into(),
+				config_mem,
+				network_config.tls_private_key_der.clone(),
+				network_config.tls_certificate_chain_der.clone(),
+			)
 		};
 
 		let (to_notifications, from_protocol_controllers) =

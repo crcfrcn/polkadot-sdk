@@ -35,6 +35,7 @@ codec = { features = ["derive"], workspace = true, default-features = true }
 either = { workspace = true, default-features = true }
 fnv = { workspace = true }
 futures = { workspace = true }
+futures-rustls = { version = "0.26.0", default-features = false, features = ["ring", "tls12"] }
 futures-timer = { workspace = true }
 hmac = { workspace = true }
 ip_network = { workspace = true }
