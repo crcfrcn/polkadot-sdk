@@ -48,6 +48,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          # Linux平台C开发头文件是Git的HTTPS编译输入；不能因缺curl头文件关闭HTTPS功能。
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends libcurl4-openssl-dev libexpat1-dev
           tool="$(mktemp -d "$RUNNER_TEMP/tatagate-git-XXXXXX")"
           curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' \
             'https://www.kernel.org/pub/software/scm/git/git-2.54.0.tar.xz' -o "$tool/archive.tar.xz"
