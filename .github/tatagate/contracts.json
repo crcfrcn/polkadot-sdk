@@ -1,0 +1,15 @@
+{
+  "schema": 1,
+  "repository": "polkadot-sdk",
+  "checks": [
+    "identity",
+    "history",
+    "source",
+    "workflow",
+    "tests",
+    "changed-crates"
+  ],
+  "upstream": "paritytech/polkadot-sdk",
+  "upstream_base": "0bf9cb31b867b91b2e9cca3cf59ef3014e430a0b",
+  "initial_sha": "1aa4447575d446ab393e89b86cd8ec0a8fca100d"
+}
