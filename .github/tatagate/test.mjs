@@ -6,7 +6,8 @@ import { gateContract, gatePath, gateRange, gateEnvironment, lockedPackages, loc
 import { readFileSync, mkdtempSync, mkdirSync, writeFileSync, realpathSync, rmSync, symlinkSync, renameSync, linkSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
+import { spawnSync } from 'node:child_process';
 const contract = JSON.parse(readFileSync(new URL('./contracts.json', import.meta.url), 'utf8'));
 test('准确SDK来源与提交区间有效', () => {
   assert.equal(gateContract(contract).repository, 'polkadot-sdk');
@@ -220,6 +221,40 @@ test('错仓、错来源、缺检查与非法区间拒绝', () => {
 });
 test('绝对路径、空段及路径穿越拒绝', () => {
   for (const path of ['', '/substrate/lib.rs', '../lib.rs', 'a/../b', 'a//b', 'a\\b']) assert.throws(() => gatePath(path));
+});
+
+test('真实离线子Cargo拒绝父cfg泄漏，WASM命令隔离后按自身目标重新生成', context => {
+  const cargo = process.env.TATAGATE_CARGO, rustc = process.env.TATAGATE_RUSTC;
+  assert.ok(cargo?.startsWith('/') && rustc?.startsWith('/'), '回归需要SDK公开交付的同一Rust对象');
+  assert.equal(realpathSync(cargo), cargo); assert.equal(realpathSync(rustc), rustc);
+  assert.equal(dirname(cargo), dirname(rustc));
+  for (const [tool, expected] of [[cargo, 'cargo 1.97.1 '], [rustc, 'rustc 1.97.1 ']]) {
+    const result = spawnSync(tool, ['--version'], { encoding: 'utf8', timeout: 10_000 });
+    assert.equal(result.status, 0); assert.ok(result.stdout.startsWith(expected));
+  }
+  const source = readFileSync(new URL('../../substrate/utils/wasm-builder/src/wasm_project.rs', import.meta.url), 'utf8');
+  assert.match(source, /\.env_remove\("CARGO_ENCODED_RUSTFLAGS"\)[\s\S]*?\.env_remove\("CARGO_CFG_RUSTIX_USE_LIBC"\)[\s\S]*?\.env_remove\("RUSTC"\)/u);
+  const directory = realpathSync(mkdtempSync(join(tmpdir(), 'sdk-child-cargo-cfg-')));
+  context.after(() => rmSync(directory, { recursive: true, force: true }));
+  mkdirSync(join(directory, 'src')); mkdirSync(join(directory, 'home'));
+  const manifest = '[package]\nname = "sdk-child-cargo-cfg"\nversion = "0.1.0"\nedition = "2021"\n[workspace]\n';
+  const frozenLock = 'version = 4\n\n[[package]]\nname = "sdk-child-cargo-cfg"\nversion = "0.1.0"\n';
+  writeFileSync(join(directory, 'Cargo.toml'), manifest); writeFileSync(join(directory, 'Cargo.lock'), frozenLock);
+  writeFileSync(join(directory, 'src/lib.rs'), '#![no_std]\n');
+  // 零外部依赖的真实构建脚本独立比较环境与编译cfg，不能以字符串断言代替子Cargo行为。
+  writeFileSync(join(directory, 'build.rs'), 'fn main() { assert_eq!(std::env::var_os("CARGO_CFG_RUSTIX_USE_LIBC").is_some(), cfg!(rustix_use_libc), "父cfg泄漏到子Cargo"); }\n');
+  for (const inherited of [true, false]) {
+    const environment = { PATH: process.env.PATH, CARGO_HOME: join(directory, 'home'), CARGO_NET_OFFLINE: 'true',
+      CARGO_TARGET_DIR: join(directory, inherited ? 'leaked-target' : 'isolated-target'),
+      RUSTC: rustc, CARGO: cargo, RUSTFLAGS: '', RUSTC_BOOTSTRAP: '1' };
+    if (inherited) environment.CARGO_CFG_RUSTIX_USE_LIBC = '';
+    const result = spawnSync(cargo, ['check', '--locked', '--offline', '--target', 'wasm32-unknown-unknown'],
+      { cwd: directory, env: environment, encoding: 'utf8', timeout: 60_000 });
+    assert.equal(result.error, undefined);
+    assert.equal(result.status, inherited ? 101 : 0, result.stderr);
+    assert.equal(result.stderr.includes('panicked at') && result.stderr.includes('父cfg泄漏到子Cargo'), inherited);
+    assert.equal(readFileSync(join(directory, 'Cargo.lock'), 'utf8'), frozenLock);
+  }
 });
 
 test('完整门禁使用同一Rust对象和独立离线环境，拒绝跳过及工具替换', context => {

@@ -956,6 +956,8 @@ fn build_bloaty_blob(
 		// our own `RUSTFLAGS` and thus, we need to remove this. Otherwise cargo favors this
 		// env variable.
 		.env_remove("CARGO_ENCODED_RUSTFLAGS")
+		// 清除父原生构建派生配置，由子Cargo按自身目标重新生成。
+		.env_remove("CARGO_CFG_RUSTIX_USE_LIBC")
 		// Make sure if we're called from within a `build.rs` the host toolchain won't override a
 		// rustup toolchain we've picked.
 		.env_remove("RUSTC")
