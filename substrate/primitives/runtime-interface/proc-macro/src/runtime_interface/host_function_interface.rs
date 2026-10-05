@@ -145,6 +145,8 @@ fn generate_extern_host_function(
 		#[doc = #doc_string]
 		pub fn #function ( #( #unpacked_args ),* ) #unpacked_return_value {
 			#[cfg_attr(target_arch = "riscv64", #crate_::polkavm::polkavm_import(abi = #crate_::polkavm::polkavm_abi))]
+			// 显式声明WASM宿主导入，兼容严格的未定义符号检查。
+			#[cfg_attr(target_arch = "wasm32", link(wasm_import_module = "env"))]
 			extern "C" {
 				pub fn #ext_function (
 					#( #arg_names: <#arg_types as #crate_::RIType>::FFIType ),*

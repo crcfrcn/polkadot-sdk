@@ -22,7 +22,9 @@ use anyhow::{bail, Context, Result};
 use cargo_metadata::MetadataCommand;
 use pallet_revive_uapi::precompiles::INTERFACE_DIR;
 use std::{
-	env, fs,
+	env,
+	ffi::OsString,
+	fs,
 	io::Write,
 	path::{Path, PathBuf},
 	process::Command,
@@ -123,12 +125,21 @@ pub fn create_cargo_toml<'a>(
 ) -> Result<()> {
 	let mut cargo_toml: toml::Value = toml::from_str(include_str!("../build/_Cargo.toml"))?;
 	let uapi_dep = cargo_toml["dependencies"]["uapi"].as_table_mut().unwrap();
+	let fixtures_dir = fixtures_dir.unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")));
+	let manifest_path = fixtures_dir.join("Cargo.toml");
+	// 使用父级准确Cargo及原锁离线解析，不从其它工具链或网络补齐来源。
+	let cargo = env::var("CARGO").context("missing parent Cargo executable")?;
+	let metadata = MetadataCommand::new()
+		.cargo_path(&cargo)
+		.manifest_path(&manifest_path)
+		.other_options(vec!["--locked".into(), "--offline".into()])
+		.exec()
+		.context("failed to resolve locked fixture dependencies offline")?;
+	let original_lock = fs::read_to_string(metadata.workspace_root.join("Cargo.lock"))?;
 
 	// Set uapi dependency path
-	if let Some(fixtures_dir) = fixtures_dir {
+	{
 		// Use cargo metadata to resolve the uapi dependency
-		let manifest_path = fixtures_dir.join("Cargo.toml");
-		let metadata = MetadataCommand::new().manifest_path(&manifest_path).exec().unwrap();
 		let dependency_graph = metadata.resolve.unwrap();
 
 		// Resolve the pallet-revive-fixtures package id
@@ -156,21 +167,29 @@ pub fn create_cargo_toml<'a>(
 			uapi_dep.insert(
 				"path".to_string(),
 				toml::Value::String(
-					fixtures_dir.join("../uapi").canonicalize()?.to_str().unwrap().to_string(),
+					uapi_pkg
+						.manifest_path
+						.parent()
+						.unwrap()
+						.canonicalize()?
+						.to_str()
+						.unwrap()
+						.to_string(),
 				),
 			);
 		} else {
-			uapi_dep
-				.insert("version".to_string(), toml::Value::String(uapi_pkg.version.to_string()));
+			uapi_dep.insert(
+				"version".to_string(),
+				toml::Value::String(format!("={}", uapi_pkg.version)),
+			);
 		}
-	} else {
-		// Use simple hardcoded path
-		let manifest_dir = env!("CARGO_MANIFEST_DIR");
-		let uapi_path = PathBuf::from(manifest_dir).parent().unwrap().join("uapi");
-		uapi_dep.insert(
-			"path".to_string(),
-			toml::Value::String(uapi_path.to_str().unwrap().to_string()),
-		);
+	}
+	// 生成工程直接依赖使用模板准确版本，不能在离线目录的多版本闭包中自行升级。
+	for (_, dependency) in cargo_toml["dependencies"].as_table_mut().unwrap().iter_mut() {
+		if let Some(version) = dependency.get_mut("version") {
+			let exact = version.as_str().context("fixture dependency version must be text")?;
+			*version = toml::Value::String(format!("={}", exact.trim_start_matches('=')));
+		}
 	}
 
 	// Set binary targets
@@ -190,7 +209,64 @@ pub fn create_cargo_toml<'a>(
 	let cargo_toml = toml::to_string_pretty(&cargo_toml)?;
 	fs::write(output_dir.join("Cargo.toml"), cargo_toml.clone())
 		.with_context(|| format!("Failed to write {cargo_toml:?}"))?;
+	// 以原锁作为生成工程的解析种子；只允许增减本地包，不改变任何外部包坐标或摘要。
+	fs::write(output_dir.join("Cargo.lock"), &original_lock)?;
+	MetadataCommand::new()
+		.cargo_path(cargo)
+		.manifest_path(output_dir.join("Cargo.toml"))
+		.other_options(vec!["--offline".into()])
+		.exec()
+		.context("failed to lock generated fixture workspace offline")?;
+	assert_fixture_lock(&original_lock, &fs::read_to_string(output_dir.join("Cargo.lock"))?)?;
 	Ok(())
+}
+
+fn assert_fixture_lock(original: &str, generated: &str) -> Result<()> {
+	let original: toml::Value = toml::from_str(original)?;
+	let generated: toml::Value = toml::from_str(generated)?;
+	let packages = original["package"].as_array().context("source lock has no packages")?;
+	for package in generated["package"].as_array().context("fixture lock has no packages")? {
+		if package.get("source").is_some()
+			&& !packages.iter().any(|source| {
+				["name", "version", "source", "checksum"]
+					.iter()
+					.all(|key| source.get(*key) == package.get(*key))
+			}) {
+			bail!("generated fixture lock changed an external dependency");
+		}
+	}
+	Ok(())
+}
+
+// 子构建继承编译必要项，排除认证字段、注入器和父Cargo目标目录。
+fn fixture_environment(
+	input: impl Iterator<Item = (OsString, OsString)>,
+) -> Vec<(OsString, OsString)> {
+	input
+		.filter(|(key, _)| {
+			let Some(key) = key.to_str() else { return false };
+			matches!(
+				key,
+				"PATH"
+					| "CARGO" | "RUSTC"
+					| "RUSTDOC" | "CARGO_HOME"
+					| "CARGO_NET_OFFLINE"
+					| "CARGO_CACHE_AUTO_CLEAN_FREQUENCY"
+					| "RUSTUP_HOME" | "TMPDIR"
+					| "TMP" | "TEMP"
+					| "CC" | "CXX" | "AR"
+					| "RANLIB" | "MAKE"
+					| "CMAKE_COMMAND"
+					| "CMAKE_MAKE_PROGRAM"
+					| "DEVELOPER_DIR"
+					| "SDKROOT" | "PROTOC"
+					| "CARGO_WORKSPACE_ROOT_DIR"
+			) || ["CC_", "CXX_", "AR_", "CFLAGS_", "CXXFLAGS_"]
+				.iter()
+				.any(|prefix| key.starts_with(prefix))
+				|| (key.starts_with("CARGO_TARGET_") && key.ends_with("_LINKER"))
+		})
+		.collect()
 }
 
 /// Invoke cargo build to compile contracts to RISC-V ELF.
@@ -200,11 +276,14 @@ pub fn invoke_build(current_dir: &Path) -> Result<()> {
 
 	// Detect rustc major.minor for the version-gated flags below.
 	let (major, minor) = {
-		let mut cmd = Command::new("rustc");
+		let mut cmd = Command::new(env::var("RUSTC").context("missing parent Rustc executable")?);
 		if let Ok(toolchain) = &toolchain {
 			cmd.env("RUSTUP_TOOLCHAIN", toolchain);
 		}
 		let out = cmd.arg("--version").output().context("rustc --version failed")?;
+		if !out.status.success() {
+			bail!("parent rustc --version failed");
+		}
 		let ver = String::from_utf8(out.stdout).context("utf8 from rustc --version failed")?;
 		let ver_num = ver
 			.split_whitespace()
@@ -240,15 +319,17 @@ pub fn invoke_build(current_dir: &Path) -> Result<()> {
 	let mut args = polkavm_linker::TargetJsonArgs::default();
 	args.is_64_bit = true;
 
-	let mut build_command = Command::new("cargo");
+	let mut build_command =
+		Command::new(env::var("CARGO").context("missing parent Cargo executable")?);
 	build_command
 		.current_dir(current_dir)
 		.env_clear()
-		.env("PATH", env::var("PATH").unwrap_or_default())
+		.envs(fixture_environment(env::vars_os()))
 		.env("CARGO_ENCODED_RUSTFLAGS", encoded_rustflags)
-		.env("RUSTUP_HOME", env::var("RUSTUP_HOME").unwrap_or_default())
+		.env("CARGO_NET_OFFLINE", "true")
+		.env("CARGO_TARGET_DIR", current_dir.join("target"))
 		.env("RUSTC_BOOTSTRAP", "1")
-		.args(["build", "--release", "-Zbuild-std=core"])
+		.args(["build", "--release", "--locked", "--offline", "-Zbuild-std=core"])
 		.arg("--target")
 		.arg(polkavm_linker::target_json_path(args).unwrap());
 
@@ -275,6 +356,51 @@ pub fn invoke_build(current_dir: &Path) -> Result<()> {
 	}
 
 	Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn child_keeps_offline_inputs_without_parent_target_or_credentials() {
+		let values = [
+			"CARGO_HOME",
+			"RUSTC",
+			"CARGO",
+			"CC",
+			"CARGO_TARGET_AARCH64_APPLE_DARWIN_LINKER",
+			"CARGO_TARGET_DIR",
+			"GITHUB_TOKEN",
+			"RUSTC_WRAPPER",
+			"DYLD_INSERT_LIBRARIES",
+		];
+		let selected = fixture_environment(
+			values.iter().map(|key| (OsString::from(key), OsString::from("fixture"))),
+		);
+		assert_eq!(
+			selected.iter().map(|(key, _)| key.to_str().unwrap()).collect::<Vec<_>>(),
+			&values[..5]
+		);
+	}
+
+	#[test]
+	fn generated_lock_preserves_external_coordinates_and_checksum() {
+		let package = "[[package]]\nname='fixture'\nversion='1.0.0'\nsource='registry+https://github.com/rust-lang/crates.io-index'\nchecksum='original'\n";
+		assert!(assert_fixture_lock(package, package).is_ok());
+		assert!(assert_fixture_lock(
+			package,
+			&format!("{package}\n[[package]]\nname='contracts'\nversion='1.0.0'\n")
+		)
+		.is_ok());
+		for invalid in [
+			package.replace("1.0.0", "1.0.1"),
+			package.replace("original", "changed"),
+			package.replace("github.com/rust-lang/crates.io-index", "other.invalid/index"),
+		] {
+			assert!(assert_fixture_lock(package, &invalid).is_err());
+		}
+	}
 }
 
 #[allow(dead_code)]

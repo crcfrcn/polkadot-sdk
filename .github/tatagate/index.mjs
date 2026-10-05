@@ -24,11 +24,50 @@ export function gatePath(value) {
   return value;
 }
 function command(file, args, root, environment = process.env) {
-  if (!file || !file.startsWith('/') || !lstatSync(file).isFile()) throw new Error('SDK门禁缺少准确工具路径');
+  if (!file || !file.startsWith('/') || realpathSync(file) !== file
+    || !lstatSync(file).isFile() || !(lstatSync(file).mode & 0o111)) throw new Error('SDK门禁缺少准确工具路径');
   const result = spawnSync(file, args, { cwd: root, env: environment, encoding: 'utf8', timeout: 3_600_000,
-    stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 8 * 1024 * 1024 });
-  if (result.status !== 0 || result.error) throw new Error('SDK门禁工具检查失败：' + args.slice(0, 4).join(' '));
+    // SDK完整metadata当前约13MiB，保留有界缓冲以容纳完整依赖图。
+    stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 32 * 1024 * 1024 });
+  if (result.status !== 0 || result.error) {
+    process.stderr.write((result.stderr ?? '').slice(-64 * 1024));
+    throw new Error('SDK门禁工具检查失败：' + args.slice(0, 4).join(' ') + '；退出码 ' + result.status
+      + (result.error ? '；' + result.error.message : ''));
+  }
   return result.stdout.trim();
+}
+
+// 门禁只使用调用方已准备的离线目录源；完整夹具和Runtime构建不能跳过。
+export function gateEnvironment(root, work, input, { canonical = realpathSync, stat = lstatSync, execute = command } = {}) {
+  for (const key of ['SKIP_PALLET_REVIVE_FIXTURES', 'SKIP_WASM_BUILD', 'RUSTC_WRAPPER', 'RUSTC_WORKSPACE_WRAPPER',
+    'RUSTUP_TOOLCHAIN', 'WASM_BUILD_TOOLCHAIN', 'PALLET_REVIVE_FIXTURES_RUSTUP_TOOLCHAIN']) {
+    if (Object.hasOwn(input, key)) throw new Error('SDK完整门禁拒绝跳过或替换工具：' + key);
+  }
+  const regular = path => typeof path === 'string' && path.startsWith('/') && resolve(path) === path
+    && canonical(path) === path && stat(path).isFile() && !!(stat(path).mode & 0o111);
+  const cargo = input.TATAGATE_CARGO, rustc = input.TATAGATE_RUSTC;
+  if (!regular(cargo) || !regular(rustc) || dirname(cargo) !== dirname(rustc)
+    || input.RUSTC !== rustc || input.CARGO !== cargo
+    || execute(rustc, ['--version'], root, input).split(' ')[1] !== '1.97.1'
+    || execute(cargo, ['--version'], root, input).split(' ')[1] !== '1.97.1') throw new Error('SDK门禁Rust对象或版本不符');
+  if (!work || !work.startsWith('/') || resolve(work) !== work || work === root || work.startsWith(root + '/')
+    || canonical(work) !== work || !stat(work).isDirectory()) throw new Error('SDK检查中间物目录无效');
+  const home = input.CARGO_HOME;
+  const boundary = dirname(root) === dirname(work) ? dirname(work) : work;
+  if (typeof home !== 'string' || !home.startsWith(boundary + '/') || home.startsWith(root + '/')
+    || canonical(home) !== home || !stat(home).isDirectory()) throw new Error('SDK门禁缺少独立离线Cargo主目录');
+  const config = join(home, 'config.toml');
+  if (canonical(config) !== config || !stat(config).isFile()) throw new Error('SDK门禁离线配置不是准确文件');
+  const text = readFileSync(config, 'utf8');
+  const directory = text.match(/^directory = (".*")$/mu)?.[1];
+  const packages = directory && JSON.parse(directory);
+  if (!/^\[net\]\noffline = true\n\n\[source\.crates-io\]\nreplace-with = "verified"\n\n\[source\.verified\]\ndirectory = "[^\n]+"\n$/u.test(text)
+    || typeof packages !== 'string' || !packages.startsWith(boundary + '/') || packages.startsWith(root + '/')
+    || canonical(packages) !== packages || !stat(packages).isDirectory()) throw new Error('SDK门禁缺少完整离线目录源');
+  return { ...input, RUSTC: rustc, CARGO: cargo, CARGO_NET_OFFLINE: 'true',
+    CARGO_TARGET_DIR: join(work, 'cargo-target'), RUSTC_BOOTSTRAP: '1', WASM_BUILD_STD: '1',
+    // OUT_DIR位于独立临时目录，WASM子工程必须明确继承受检源码的原锁。
+    WASM_BUILD_WORKSPACE_HINT: root };
 }
 function git(root, args) {
   const tool = process.env.PRODUCT_GIT_BIN;
@@ -85,18 +124,14 @@ export function runGate(root, baseSHA, headSHA, work) {
   }
   command(process.execPath, ['--test', '.github/tatagate/test.mjs'], root);
   if (crates.size || paths.includes('Cargo.lock') || paths.includes('Cargo.toml')) {
-    const cargo = process.env.TATAGATE_CARGO, rustc = process.env.TATAGATE_RUSTC;
-    if (!cargo || !rustc || command(rustc, ['--version'], root).split(' ')[1] !== '1.97.1') throw new Error('SDK源码改动缺少登记Rust');
-    if (!work || !work.startsWith('/') || resolve(work) !== work || work === root || work.startsWith(root + '/')
-      || realpathSync(work) !== work || !lstatSync(work).isDirectory()) throw new Error('SDK检查中间物目录无效');
-    const environment = { ...process.env, CARGO_TARGET_DIR: join(work, 'cargo-target') };
-    command(cargo, ['metadata', '--locked', '--format-version', '1'], root, environment);
+    const environment = gateEnvironment(root, work, process.env), cargo = environment.CARGO;
+    command(cargo, ['metadata', '--locked', '--offline', '--format-version', '1'], root, environment);
     for (const name of crates) {
-      command(cargo, ['check', '--locked', '-p', name], root, environment);
-      command(cargo, ['test', '--locked', '-p', name, '--lib'], root, environment);
+      command(cargo, ['check', '--locked', '--offline', '-p', name], root, environment);
+      command(cargo, ['test', '--locked', '--offline', '-p', name, '--lib'], root, environment);
     }
     // workspace声明与锁整体改动需要全工作空间检查，不能只验证门禁自身。
-    if (paths.includes('Cargo.lock') || paths.includes('Cargo.toml')) command(cargo, ['check', '--locked', '--workspace'], root, environment);
+    if (paths.includes('Cargo.lock') || paths.includes('Cargo.toml')) command(cargo, ['check', '--locked', '--offline', '--workspace'], root, environment);
   }
   return { repository: 'polkadot-sdk', base_sha: range.base, head_sha: range.head, changed_crates: [...crates].sort() };
 }
