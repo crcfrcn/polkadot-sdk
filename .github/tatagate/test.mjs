@@ -2,8 +2,8 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { gateContract, gatePath, gateRange, gateEnvironment, lockedPackages, lockedUnion, remoteContext,
-  remoteTools, prepareOffline, verifyVendor, hostChecks } from './index.mjs';
-import { readFileSync, mkdtempSync, mkdirSync, writeFileSync, realpathSync, rmSync, symlinkSync, renameSync } from 'node:fs';
+  remoteTools, prepareOffline, verifyVendor, hostChecks, remoteRange } from './index.mjs';
+import { readFileSync, mkdtempSync, mkdirSync, writeFileSync, realpathSync, rmSync, symlinkSync, renameSync, linkSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -164,6 +164,23 @@ test('远端工具版本、同一Rust及Clang对象和完整构建选项不能�
   for (const key of Object.keys(input)) assert.throws(() => remoteTools(f.root, f.work, { ...input, [key]: 'wrong' }, options), undefined, key);
   for (const tool of versions.keys()) assert.throws(() => remoteTools(f.root, f.work, input, { ...options, execute: value => value === tool ? '0.0.0' : versions.get(value) }));
   for (const key of ['SKIP_PALLET_REVIVE_FIXTURES', 'SKIP_WASM_BUILD', 'RUSTC_WRAPPER', 'RUSTC_WORKSPACE_WRAPPER', 'RUSTUP_TOOLCHAIN']) assert.throws(() => remoteTools(f.root, f.work, { ...input, [key]: '0' }, options), /拒绝/u);
+  const hardlink = input.PRODUCT_GIT_BIN + '-hardlink';
+  linkSync(input.PRODUCT_GIT_BIN, hardlink);
+  assert.throws(() => remoteTools(f.root, f.work, input, options), error =>
+    error.message === 'SDK准备文件不是独占普通文件：' + input.PRODUCT_GIT_BIN);
+  rmSync(hardlink);
+  assert.equal(remoteTools(f.root, f.work, input, options), join(rust, 'lib/rustlib/src/rust/library'));
+});
+test('远端首次与失败后的补修均覆盖合同初始提交以来的改动，非法区间拒绝', () => {
+  const after = 'b'.repeat(40), failed = 'a93ed7b73119fdf4edb512943dba616bd9d53ba1';
+  for (const before of [contract.initial_sha, failed]) {
+    assert.deepEqual(remoteRange(contract, { before, after }), { base: contract.initial_sha, head: after });
+  }
+  assert.throws(() => remoteRange({ ...contract, checks: [] }, { before: failed, after }));
+  for (const event of [{ before: 'main', after }, { before: failed, after: 'main' },
+    { before: after, after }, { before: failed, after: contract.initial_sha }]) {
+    assert.throws(() => remoteRange(contract, event));
+  }
 });
 test('宿主生成器变更同时触发原生、实际WASM执行器及文档测试，普通改动不增加范围', () => {
   const path = 'substrate/primitives/runtime-interface/proc-macro/src/runtime_interface/host_function_interface.rs';
@@ -178,7 +195,8 @@ test('Workflow保留固定官方安装器、只读同SHA push并明确完整准�
     'node-version: 25.2.1', 'toolchain: 1.97.1', 'components: rustfmt,clippy,rust-src',
     'a0853c24544627f65ddf259abe73b1d18a591444', '032958afbdc797a9164d3bc0b56325c1308924a5',
     '/home/runner/work/_temp/polkadot-sdk-tatagate', 'CARGO_BUILD_JOBS=2', 'CARGO_PROFILE_DEV_DEBUG=0',
-    'CARGO_PROFILE_TEST_DEBUG=0', 'CARGO_INCREMENTAL=0', '.github/tatagate/index.mjs prepare', '.github/tatagate/index.mjs remote']) assert.ok(workflow.includes(value), value);
+    'CARGO_PROFILE_TEST_DEBUG=0', 'CARGO_INCREMENTAL=0', '.github/tatagate/index.mjs prepare', '.github/tatagate/index.mjs remote',
+    'NO_INSTALL_HARDLINKS=YesPlease', 'test "$(stat -c \'%h\' "$tool/payload/bin/git")" = 1']) assert.ok(workflow.includes(value), value);
   for (const hash of ['c63393dd39d8bc49580e3e23be3eda63ce62ae4823d95f692c7547b25ade8a31',
     '87281ce46d74f261caff4ac404fe5af7b07f185d305246fef81797ddc20fa9f8',
     'f3e987dc6ecebd4bd350c48edcbc320b46cf9e3109bd3fc3d88f1acaf4c428f7',

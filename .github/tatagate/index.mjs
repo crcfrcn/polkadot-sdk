@@ -58,7 +58,7 @@ function exactDirectory(path) {
   return () => { const after = lstatSync(path); if (realpathSync(path) !== path || !after.isDirectory() || before.dev !== after.dev || before.ino !== after.ino) throw new Error('SDK准备目录被替换'); };
 }
 function exactFile(path) {
-  if (realpathSync(path) !== path || !lstatSync(path).isFile() || lstatSync(path).nlink !== 1) throw new Error('SDK准备文件不是独占普通文件');
+  if (realpathSync(path) !== path || !lstatSync(path).isFile() || lstatSync(path).nlink !== 1) throw new Error('SDK准备文件不是独占普通文件：' + path);
   return readFileSync(path);
 }
 
@@ -193,6 +193,11 @@ export function hostChecks(paths) {
 export function gateRange(base, head) {
   if (!shaPattern.test(base ?? '') || !shaPattern.test(head ?? '') || base === head) throw new Error('SDK门禁提交区间无效');
   return { base, head };
+}
+// 远端覆盖合同初始提交后的全部自有改动，失败后的工具补修不能漏验金额边界。
+export function remoteRange(contract, event) {
+  gateContract(contract); gateRange(event.before, event.after);
+  return gateRange(contract.initial_sha, event.after);
 }
 export function gateContract(value) {
   if (value?.schema !== 1 || value.repository !== 'polkadot-sdk' || value.upstream !== 'paritytech/polkadot-sdk'
@@ -346,7 +351,8 @@ if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.ur
         const union = lockedUnion(sdkLock.toString('utf8'), stdLock.toString('utf8'));
         if (union.size !== 1556) throw new Error('SDK远端联合闭包数量不符');
         verifyVendor(join(work, 'cargo/packages'), join(work, 'cargo-download/home'), union);
-        console.log(JSON.stringify(runGate(root, event.before, event.after, work)));
+        const range = remoteRange(JSON.parse(readFileSync(join(root, '.github/tatagate/contracts.json'), 'utf8')), event);
+        console.log(JSON.stringify(runGate(root, range.base, range.head, work)));
       }
     } else throw new Error('SDK门禁参数无效');
   } catch (error) { console.error(error.message); process.exitCode = 1; }

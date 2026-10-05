@@ -98,7 +98,8 @@ jobs:
           printf '%s  %s\n' 'f689162364c10de79ef89aa8dbf48731eb057e34edbbd20aca510ce0154681a3' "$tool/archive.tar.xz" > "$tool/SHA256"
           sha256sum -c "$tool/SHA256"
           tar -xf "$tool/archive.tar.xz" -C "$tool"
-          make -C "$tool/git-2.54.0" -j2 CC=/usr/lib/llvm-18/bin/clang NO_GETTEXT=YesPlease NO_TCLTK=YesPlease prefix="$tool/payload" install
+          make -C "$tool/git-2.54.0" -j2 CC=/usr/lib/llvm-18/bin/clang NO_GETTEXT=YesPlease NO_TCLTK=YesPlease NO_INSTALL_HARDLINKS=YesPlease prefix="$tool/payload" install
+          test "$(stat -c '%h' "$tool/payload/bin/git")" = 1
           test "$("$tool/payload/bin/git" --version)" = 'git version 2.54.0'
           printf 'PRODUCT_GIT_BIN=%s\n' "$tool/payload/bin/git" >> "$GITHUB_ENV"
       - name: 验真既有缺失编译工具并交付同一Rust对象
