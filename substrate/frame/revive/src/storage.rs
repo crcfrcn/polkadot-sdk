@@ -159,14 +159,16 @@ impl<T: Config> AccountInfo<T> {
 		preservation: Preservation,
 	) -> BalanceWithDust<BalanceOf<T>> {
 		let value = T::Currency::reducible_balance(account, preservation, Fortitude::Polite);
-		BalanceWithDust::new_unchecked::<T>(value, self.dust)
+		BalanceWithDust::try_new::<T>(value, self.dust)
+			.expect("stored native monetary state must be valid")
 	}
 
 	/// All the remaining in an account including ed and locked balances.
 	pub fn total_balance(account: AccountIdOrAddress<T>) -> BalanceWithDust<BalanceOf<T>> {
 		let value = T::Currency::total_balance(&account.account_id());
 		let dust = <AccountInfoOf<T>>::get(account.address()).map(|a| a.dust).unwrap_or_default();
-		BalanceWithDust::new_unchecked::<T>(value, dust)
+		BalanceWithDust::try_new::<T>(value, dust)
+			.expect("stored native monetary state must be valid")
 	}
 
 	/// Loads the contract information for a given address.

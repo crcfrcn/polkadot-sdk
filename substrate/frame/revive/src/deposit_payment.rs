@@ -20,6 +20,7 @@
 //! Storage deposits can be backed by the native currency or by PGAS.
 //! Runtimes without PGAS leave the default `()` binding,
 //! which always uses the native currency.
+use crate::address::AddressMapper;
 use crate::{
 	BalanceOf, Config, FreezeReason, HoldReason, LOG_TARGET, NativeDepositOf,
 	evm::fees::InfoT as FeeInfo,
@@ -71,7 +72,7 @@ pub trait Deposit<T: Config>: sealed::Sealed {
 	/// are no-ops, since there is no PGAS asset to migrate native deposits over to.
 	const SUPPORTS_PGAS: bool;
 
-	/// Mint each backend's existential deposit into `contract`.
+	/// 初始化合约押金账户；严格原生模式仅验证已有真实 ED。
 	///
 	/// Used by [`crate::exec`] when bringing a new contract account into existence.
 	fn init_contract(contract: &T::AccountId) -> DispatchResult;
@@ -153,12 +154,25 @@ pub trait Deposit<T: Config>: sealed::Sealed {
 impl<T: Config> Deposit<T> for () {
 	const SUPPORTS_PGAS: bool = false;
 
-	/// The native ED is freshly minted and immediately
+	/// 非严格的上游 dust 模式下，原生 ED freshly minted and immediately
 	/// [`deactivated`](frame_support::traits::fungible::Unbalanced::deactivate) so that
 	/// active issuance, and therefore opengov conviction, inflation accounting, etc., is
 	/// undisturbed by contract creation. The contract holds a system consumer for as long as it
 	/// exists, so this minted ED is not extractable: the account cannot be reaped.
 	fn init_contract(to: &T::AccountId) -> DispatchResult {
+		crate::BalanceWithDust::<BalanceOf<T>>::ensure_policy::<T>()
+			.map_err(|_| crate::Error::<T>::BalanceConversionFailed)?;
+		crate::BalanceWithDust::<BalanceOf<T>>::ensure_policy::<T>()
+			.map_err(|_| crate::Error::<T>::BalanceConversionFailed)?;
+		if T::StrictNativeBalance::get() {
+			// 调用者已转入真实 ED；backend 不能补发或清理异常状态。
+			crate::Pallet::<T>::ensure_clean_balance(&T::AddressMapper::to_address(to))?;
+			return if T::Currency::total_balance(to) >= T::Currency::minimum_balance() {
+				Ok(())
+			} else {
+				Err(crate::Error::<T>::StorageDepositNotEnoughFunds.into())
+			};
+		}
 		let ed = T::Currency::minimum_balance();
 		T::Currency::mint_into(to, ed)?;
 		T::Currency::deactivate(ed);
@@ -166,6 +180,15 @@ impl<T: Config> Deposit<T> for () {
 	}
 
 	fn destroy_contract(contract: &T::AccountId) -> DispatchResult {
+		crate::BalanceWithDust::<BalanceOf<T>>::ensure_policy::<T>()
+			.map_err(|_| crate::Error::<T>::BalanceConversionFailed)?;
+		crate::BalanceWithDust::<BalanceOf<T>>::ensure_policy::<T>()
+			.map_err(|_| crate::Error::<T>::BalanceConversionFailed)?;
+		if T::StrictNativeBalance::get() {
+			return crate::Pallet::<T>::ensure_clean_balance(&T::AddressMapper::to_address(
+				contract,
+			));
+		}
 		let ed = T::Currency::minimum_balance();
 		T::Currency::burn_from(
 			contract,
@@ -186,8 +209,12 @@ impl<T: Config> Deposit<T> for () {
 		to: &T::AccountId,
 		amount: BalanceOf<T>,
 	) -> DispatchResult {
+		crate::BalanceWithDust::<BalanceOf<T>>::ensure_policy::<T>()
+			.map_err(|_| crate::Error::<T>::BalanceConversionFailed)?;
+		crate::Pallet::<T>::ensure_clean_balance(&T::AddressMapper::to_address(to))?;
 		match src {
 			Funds::Balance(from) => {
+				crate::Pallet::<T>::ensure_clean_balance(&T::AddressMapper::to_address(from))?;
 				T::Currency::transfer_and_hold(
 					&reason.into(),
 					from,
@@ -199,6 +226,9 @@ impl<T: Config> Deposit<T> for () {
 				)?;
 			},
 			Funds::TxFee(_) => {
+				if T::StrictNativeBalance::get() {
+					return Err(crate::Error::<T>::NativeFeeNotConfigured.into());
+				}
 				let credit = T::FeeInfo::withdraw_txfee(amount)
 					.ok_or(DispatchError::Token(TokenError::FundsUnavailable))?;
 				T::Currency::resolve(to, credit)
@@ -215,8 +245,12 @@ impl<T: Config> Deposit<T> for () {
 		dst: Funds<T::AccountId>,
 		amount: BalanceOf<T>,
 	) -> DispatchResult {
+		crate::BalanceWithDust::<BalanceOf<T>>::ensure_policy::<T>()
+			.map_err(|_| crate::Error::<T>::BalanceConversionFailed)?;
+		crate::Pallet::<T>::ensure_clean_balance(&T::AddressMapper::to_address(from))?;
 		match dst {
 			Funds::Balance(to) => {
+				crate::Pallet::<T>::ensure_clean_balance(&T::AddressMapper::to_address(to))?;
 				T::Currency::transfer_on_hold(
 					&reason.into(),
 					from,
@@ -228,6 +262,9 @@ impl<T: Config> Deposit<T> for () {
 				)?;
 			},
 			Funds::TxFee(_) => {
+				if T::StrictNativeBalance::get() {
+					return Err(crate::Error::<T>::NativeFeeNotConfigured.into());
+				}
 				let released =
 					T::Currency::release(&reason.into(), from, amount, Precision::Exact)?;
 				let credit = T::Currency::withdraw(
@@ -251,6 +288,18 @@ impl<T: Config> Deposit<T> for () {
 		from: &T::AccountId,
 		dst: Funds<T::AccountId>,
 	) -> Result<BalanceOf<T>, DispatchError> {
+		crate::BalanceWithDust::<BalanceOf<T>>::ensure_policy::<T>()
+			.map_err(|_| crate::Error::<T>::BalanceConversionFailed)?;
+		crate::Pallet::<T>::ensure_clean_balance(&T::AddressMapper::to_address(from))?;
+		match &dst {
+			Funds::Balance(to) => {
+				crate::Pallet::<T>::ensure_clean_balance(&T::AddressMapper::to_address(to))?
+			},
+			Funds::TxFee(_) if T::StrictNativeBalance::get() => {
+				return Err(crate::Error::<T>::NativeFeeNotConfigured.into());
+			},
+			_ => {},
+		}
 		let reason = HoldReason::StorageDepositReserve;
 		let amount = T::Currency::balance_on_hold(&reason.into(), from);
 		if !amount.is_zero() {
@@ -264,6 +313,11 @@ impl<T: Config> Deposit<T> for () {
 		_contract: &T::AccountId,
 		_amount: BalanceOf<T>,
 	) -> DispatchResult {
+		if T::StrictNativeBalance::get() {
+			return Err(crate::Error::<T>::BalanceConversionFailed.into());
+		}
+		crate::BalanceWithDust::<BalanceOf<T>>::ensure_policy::<T>()
+			.map_err(|_| crate::Error::<T>::BalanceConversionFailed)?;
 		Ok(())
 	}
 }
@@ -305,6 +359,10 @@ where
 	/// pallet-assets' `reducible_balance` treats any frozen amount as untouchable, regardless
 	/// of `Preservation` / `Fortitude`.
 	fn init_contract(to: &T::AccountId) -> DispatchResult {
+		// 整单位原生币禁止 PGAS 铸造、销毁或兑换。
+		if T::StrictNativeBalance::get() {
+			return Err(crate::Error::<T>::BalanceConversionFailed.into());
+		}
 		<() as Deposit<T>>::init_contract(to)?;
 		let pgas_ed = <Mutator as fungibles::Inspect<T::AccountId>>::minimum_balance(Id::get());
 		<Mutator as fungibles::Mutate<T::AccountId>>::mint_into(Id::get(), to, pgas_ed)?;
@@ -319,6 +377,10 @@ where
 
 	/// Thaws and burns the PGAS ED frozen by [`Self::init_contract`], plus the native ED.
 	fn destroy_contract(contract: &T::AccountId) -> DispatchResult {
+		// 整单位原生币禁止 PGAS 铸造、销毁或兑换。
+		if T::StrictNativeBalance::get() {
+			return Err(crate::Error::<T>::BalanceConversionFailed.into());
+		}
 		<() as Deposit<T>>::destroy_contract(contract)?;
 
 		<Freezer as fungibles::freeze::Mutate<T::AccountId>>::thaw(
@@ -351,6 +413,10 @@ where
 		to: &T::AccountId,
 		amount: BalanceOf<T>,
 	) -> DispatchResult {
+		// 整单位原生币禁止 PGAS 铸造、销毁或兑换。
+		if T::StrictNativeBalance::get() {
+			return Err(crate::Error::<T>::BalanceConversionFailed.into());
+		}
 		let from = match &src {
 			Funds::Balance(from) | Funds::TxFee(from) => *from,
 		};
@@ -387,6 +453,10 @@ where
 		dst: Funds<T::AccountId>,
 		amount: BalanceOf<T>,
 	) -> DispatchResult {
+		// 整单位原生币禁止 PGAS 铸造、销毁或兑换。
+		if T::StrictNativeBalance::get() {
+			return Err(crate::Error::<T>::BalanceConversionFailed.into());
+		}
 		let to = match &dst {
 			Funds::Balance(to) | Funds::TxFee(to) => *to,
 		};
@@ -428,6 +498,10 @@ where
 		from: &T::AccountId,
 		dst: Funds<T::AccountId>,
 	) -> Result<BalanceOf<T>, DispatchError> {
+		// 整单位原生币禁止 PGAS 铸造、销毁或兑换。
+		if T::StrictNativeBalance::get() {
+			return Err(crate::Error::<T>::BalanceConversionFailed.into());
+		}
 		let to = match &dst {
 			Funds::Balance(to) | Funds::TxFee(to) => *to,
 		};
@@ -447,6 +521,10 @@ where
 		contract: &T::AccountId,
 		amount: BalanceOf<T>,
 	) -> DispatchResult {
+		// 整单位原生币禁止 PGAS 铸造、销毁或兑换。
+		if T::StrictNativeBalance::get() {
+			return Err(crate::Error::<T>::BalanceConversionFailed.into());
+		}
 		let pgas_ed = <Mutator as fungibles::Inspect<T::AccountId>>::minimum_balance(Id::get());
 		let freeze_id = FreezeReason::PGasMinBalance.into();
 		if <Freezer as fungibles::freeze::Inspect<T::AccountId>>::balance_frozen(

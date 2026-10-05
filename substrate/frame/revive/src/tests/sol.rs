@@ -15,6 +15,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::AddressMapper as _;
 use crate::{
 	BalanceOf, Code, Config, Error, EthBlockBuilderFirstValues, GenesisConfig, Origin, Pallet,
 	PristineCode, assert_refcount,
@@ -895,4 +896,148 @@ fn execution_tracing_works() {
 			});
 		}
 	}
+}
+
+/// 内层不足一分的 CALL 失败可以被合约捕获，不能把失败子调用的钱转出去。
+#[test]
+fn native_internal_fractional_call_fails_without_reverting_successful_parent() {
+	use crate::tests::native_monetary as n;
+	use frame_support::traits::fungible::Inspect;
+	use sp_core::U256;
+	n::externalities().execute_with(|| {
+		let beneficiary = n::address(&BOB);
+		// 外层写入一个存储值，再发出 1 个 EVM 单位的非法原生币 CALL，返回 CALL 状态。
+		let mut runtime =
+			vec![PUSH1, 42, PUSH1, 1, SSTORE, PUSH0, PUSH0, PUSH0, PUSH0, PUSH1, 1, PUSH20];
+		runtime.extend_from_slice(beneficiary.as_bytes());
+		runtime.extend_from_slice(&[GAS, CALL, PUSH0, MSTORE, PUSH1, 32, PUSH0, RETURN]);
+		let deployed =
+			n::instantiate(n::initcode(&runtime), U256::from(5 * n::SCALE)).result.unwrap();
+		assert!(!deployed.result.did_revert());
+		let account = <n::NativeTest as Config>::AddressMapper::to_account_id(&deployed.addr);
+		let issuance = n::Balances::total_issuance();
+		let recipient = n::Balances::balance(&BOB);
+		let result = n::call(deployed.addr, U256::zero()).result.unwrap();
+		assert!(!result.did_revert());
+		assert_eq!(result.data, vec![0; 32]);
+		assert_eq!(n::Balances::balance(&account), 116);
+		assert_eq!(n::Balances::balance(&BOB), recipient);
+		assert_eq!(n::Balances::total_issuance(), issuance);
+		let mut key = [0; 32];
+		key[31] = 1;
+		let mut expected = vec![0; 32];
+		expected[31] = 42;
+		assert_eq!(n::Contracts::get_storage(deployed.addr, key).unwrap(), Some(expected));
+	});
+}
+
+/// 同次创建并终止的合约把真实余额（包括出资 ED）交给受益人，不配对销毁 ED。
+#[test]
+fn native_same_transaction_termination_preserves_issuance() {
+	use crate::tests::native_monetary as n;
+	use frame_support::traits::fungible::Inspect;
+	use sp_core::U256;
+	n::externalities().execute_with(|| {
+		let mut constructor = vec![PUSH20];
+		constructor.extend_from_slice(n::address(&BOB).as_bytes());
+		constructor.push(SELFDESTRUCT);
+		let issuance = n::Balances::total_issuance();
+		let recipient = n::Balances::balance(&BOB);
+		let payer = n::Balances::balance(&ALICE);
+		let result = n::instantiate(constructor, U256::from(5 * n::SCALE)).result.unwrap();
+		assert!(!result.result.did_revert());
+		let account = <n::NativeTest as Config>::AddressMapper::to_account_id(&result.addr);
+		assert_eq!(n::Balances::balance(&account), 0);
+		assert_eq!(n::Balances::balance(&ALICE), payer - 116);
+		assert_eq!(n::Balances::balance(&BOB), recipient + 116);
+		assert_eq!(n::Balances::total_issuance(), issuance);
+		assert!(!crate::AccountInfoOf::<n::NativeTest>::contains_key(result.addr));
+	});
+}
+
+/// 非整分 CREATE 在创建子账户前拒绝，父合约可捕获失败并保留自己的成功写入。
+#[test]
+fn native_internal_fractional_create_never_funds_a_child_account() {
+	use crate::tests::native_monetary as n;
+	use frame_support::traits::fungible::Inspect;
+	use sp_core::U256;
+	n::externalities().execute_with(|| {
+		let child = n::initcode(&[STOP]);
+		let mut runtime = vec![
+			PUSH1,
+			42,
+			PUSH1,
+			1,
+			SSTORE,
+			PUSH1,
+			child.len() as u8,
+			PUSH1,
+			27,
+			PUSH1,
+			0,
+			CODECOPY,
+			PUSH1,
+			child.len() as u8,
+			PUSH1,
+			0,
+			PUSH1,
+			1,
+			CREATE,
+			PUSH1,
+			0,
+			MSTORE,
+			PUSH1,
+			32,
+			PUSH1,
+			0,
+			RETURN,
+		];
+		runtime.extend_from_slice(&child);
+		let deployed =
+			n::instantiate(n::initcode(&runtime), U256::from(5 * n::SCALE)).result.unwrap();
+		let issuance = n::Balances::total_issuance();
+		let payer = n::Balances::balance(&ALICE);
+		let result = n::call(deployed.addr, U256::zero()).result.unwrap();
+		assert!(!result.did_revert());
+		assert_eq!(result.data, vec![0; 32]);
+		assert_eq!(n::Balances::balance(&ALICE), payer);
+		assert_eq!(n::Balances::total_issuance(), issuance);
+		let mut key = [0; 32];
+		key[31] = 1;
+		let mut expected = vec![0; 32];
+		expected[31] = 42;
+		assert_eq!(n::Contracts::get_storage(deployed.addr, key).unwrap(), Some(expected));
+	});
+}
+
+/// 合约向新原生账户支付整分时，ED 只能由发起者出资一次，值由合约余额支付。
+#[test]
+fn native_internal_integer_call_funds_new_recipient_without_issuance() {
+	use crate::tests::native_monetary as n;
+	use frame_support::traits::fungible::Inspect;
+	use sp_core::{H160, U256};
+	n::externalities().execute_with(|| {
+		let recipient = H160::from_low_u64_be(0x1234);
+		let account = <n::NativeTest as Config>::AddressMapper::to_account_id(&recipient);
+		n::System::inc_providers(&account);
+		assert_eq!(n::Balances::balance(&account), 0);
+		let mut runtime = vec![PUSH0, PUSH0, PUSH0, PUSH0, 0x67]; // PUSH8：精确的一分
+		runtime.extend_from_slice(&n::SCALE.to_be_bytes());
+		runtime.push(PUSH20);
+		runtime.extend_from_slice(recipient.as_bytes());
+		runtime.extend_from_slice(&[GAS, CALL, PUSH0, MSTORE, PUSH1, 32, PUSH0, RETURN]);
+		let deployed =
+			n::instantiate(n::initcode(&runtime), U256::from(5 * n::SCALE)).result.unwrap();
+		let contract = <n::NativeTest as Config>::AddressMapper::to_account_id(&deployed.addr);
+		let payer = n::Balances::balance(&ALICE);
+		let issuance = n::Balances::total_issuance();
+		let result = n::call(deployed.addr, U256::zero()).result.unwrap();
+		let mut success = vec![0; 32];
+		success[31] = 1;
+		assert_eq!(result.data, success);
+		assert_eq!(n::Balances::balance(&account), 112);
+		assert_eq!(n::Balances::balance(&contract), 115);
+		assert_eq!(n::Balances::balance(&ALICE), payer - 111);
+		assert_eq!(n::Balances::total_issuance(), issuance);
+	});
 }

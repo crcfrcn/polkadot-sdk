@@ -28,6 +28,7 @@ use frame_support::{
 	migrations::{MigrationId, SteppedMigration, SteppedMigrationError},
 	pallet_prelude::PhantomData,
 	traits::{
+		Get,
 		fungible::{Inspect, Mutate, MutateHold},
 		tokens::{Fortitude, Precision, Restriction},
 	},
@@ -107,6 +108,12 @@ impl<T: Config> SteppedMigration for Migration<T> {
 			return Err(SteppedMigrationError::InsufficientWeight { required });
 		}
 
+		if T::StrictNativeBalance::get()
+			&& !frame_system::Pallet::<T>::account_exists(&Pallet::<T>::account_id())
+		{
+			// 禁止借历史升级补发 ED；资金准备不满足时明确失败。
+			return Err(SteppedMigrationError::Failed);
+		}
 		if !frame_system::Pallet::<T>::account_exists(&Pallet::<T>::account_id()) {
 			let _ =
 				T::Currency::mint_into(&Pallet::<T>::account_id(), T::Currency::minimum_balance());

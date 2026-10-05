@@ -369,7 +369,9 @@ impl pallet_revive::Config for Runtime {
 	type CodeHashLockupDepositPercent = CodeHashLockupDepositPercent;
 	type Balance = Balance;
 	type Currency = Balances;
-	type NativeToEthRatio = ConstU32<1_000_000>;
+	// 仅扩大倍率接口；该上游链继续使用原有 dust 货币策略。
+	type StrictNativeBalance = frame_support::traits::ConstBool<false>;
+	type NativeToEthRatio = frame_support::traits::ConstU64<1_000_000>;
 	type UploadOrigin = EnsureSigned<Self::AccountId>;
 	type InstantiateOrigin = EnsureSigned<Self::AccountId>;
 	type Time = Timestamp;

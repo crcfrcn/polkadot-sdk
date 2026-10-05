@@ -733,3 +733,374 @@ fn ext_builder_with_genesis_config_works() {
 		}
 	});
 }
+
+/// 与上游 dust/PGAS 夹具隔离的 u128 整单位 Runtime；只测试金额，Ethereum 收费入口关闭。
+mod native_monetary {
+	use crate::{
+		AccountId32Mapper, AddressMapper, BalanceWithDust, Config, Error, ExecConfig,
+		TransactionLimits,
+	};
+	use frame_support::{
+		assert_noop, assert_ok, derive_impl,
+		traits::{
+			ConstBool, ConstU64, ConstU128,
+			fungible::{Inspect, Mutate},
+			tokens::Preservation,
+		},
+		weights::Weight,
+	};
+	use sp_core::{H160, U256};
+	use sp_runtime::{AccountId32, BuildStorage};
+
+	pub(super) const SCALE: u64 = 10_000_000_000_000_000;
+	frame_support::parameter_types! { pub static NativeDepositPerItem: u128 = 0; }
+	frame_support::construct_runtime!(
+		pub enum NativeTest {
+			System: frame_system,
+			Balances: pallet_balances,
+			Contracts: crate,
+		}
+	);
+	#[derive_impl(frame_system::config_preludes::TestDefaultConfig)]
+	impl frame_system::Config for NativeTest {
+		type Block = frame_system::mocking::MockBlock<Self>;
+		type AccountId = AccountId32;
+		type Lookup = sp_runtime::traits::IdentityLookup<Self::AccountId>;
+		type AccountData = pallet_balances::AccountData<u128>;
+	}
+	#[derive_impl(pallet_balances::config_preludes::TestDefaultConfig)]
+	impl pallet_balances::Config for NativeTest {
+		type Balance = u128;
+		type ExistentialDeposit = ConstU128<111>;
+		type AccountStore = System;
+		type RuntimeHoldReason = RuntimeHoldReason;
+		type RuntimeFreezeReason = RuntimeFreezeReason;
+		type MaxFreezes = frame_support::traits::VariantCountOf<RuntimeFreezeReason>;
+	}
+	#[derive_impl(crate::config_preludes::TestDefaultConfig)]
+	impl Config for NativeTest {
+		type Balance = u128;
+		type Currency = Balances;
+		type AddressMapper = AccountId32Mapper<Self>;
+		type NativeToEthRatio = ConstU64<SCALE>;
+		type StrictNativeBalance = ConstBool<true>;
+		type Deposit = ();
+		type FeeInfo = ();
+		type DepositPerItem = NativeDepositPerItem;
+		type DepositPerByte = ConstU128<0>;
+		type DepositPerChildTrieItem = ConstU128<0>;
+		type UploadOrigin = frame_system::EnsureSigned<AccountId32>;
+		type InstantiateOrigin = frame_system::EnsureSigned<AccountId32>;
+		type Precompiles = (super::precompiles::WithInfo<Self>,);
+	}
+	impl crate::evm::runtime::SetWeightLimit for RuntimeCall {
+		fn set_weight_limit(&mut self, _: Weight) -> Weight {
+			Weight::zero()
+		}
+	}
+	pub(super) fn address(who: &AccountId32) -> H160 {
+		<NativeTest as Config>::AddressMapper::to_address(who)
+	}
+	pub(super) fn externalities() -> sp_io::TestExternalities {
+		let storage = frame_system::GenesisConfig::<NativeTest>::default().build_storage().unwrap();
+		let mut ext = sp_io::TestExternalities::new(storage);
+		ext.execute_with(|| {
+			NativeDepositPerItem::set(0);
+			System::set_block_number(1);
+			Balances::set_balance(&super::ALICE, 1_000_000);
+			Balances::set_balance(&super::BOB, 1_000);
+			Balances::set_balance(&Contracts::account_id(), 111);
+			assert!(<NativeTest as Config>::AddressMapper::is_mapped(&super::ALICE));
+			assert!(<NativeTest as Config>::AddressMapper::is_mapped(&super::BOB));
+		});
+		ext
+	}
+	pub(super) fn root() -> Vec<u8> {
+		sp_io::storage::root(sp_runtime::StateVersion::V1)
+	}
+	pub(super) fn call(
+		dest: H160,
+		value: U256,
+	) -> crate::ContractResult<crate::ExecReturnValue, u128> {
+		Contracts::bare_call(
+			RuntimeOrigin::signed(super::ALICE),
+			dest,
+			value,
+			TransactionLimits::WeightAndDeposit {
+				weight_limit: Weight::from_parts(1_000_000_000_000, 10_000_000),
+				deposit_limit: 100_000,
+			},
+			Vec::new(),
+			&ExecConfig::new_substrate_tx(),
+		)
+	}
+	pub(super) fn instantiate(
+		code: Vec<u8>,
+		value: U256,
+	) -> crate::ContractResult<crate::InstantiateReturnValue, u128> {
+		Contracts::bare_instantiate(
+			RuntimeOrigin::signed(super::ALICE),
+			value,
+			TransactionLimits::WeightAndDeposit {
+				weight_limit: Weight::from_parts(1_000_000_000_000, 10_000_000),
+				deposit_limit: 100_000,
+			},
+			crate::Code::Upload(code),
+			Vec::new(),
+			Some([7; 32]),
+			&ExecConfig::new_substrate_tx(),
+		)
+	}
+	pub(super) fn initcode(runtime: &[u8]) -> Vec<u8> {
+		assert!(runtime.len() < 256);
+		let n = runtime.len() as u8;
+		let mut code = vec![0x60, n, 0x60, 12, 0x60, 0, 0x39, 0x60, n, 0x60, 0, 0xf3];
+		code.extend_from_slice(runtime);
+		code
+	}
+
+	/// 覆盖零、分、元、ED 及 u128 上界，非法金额不得截断或舍入。
+	#[test]
+	fn strict_conversion_is_exact_at_all_native_boundaries() {
+		externalities().execute_with(|| {
+			for cents in [0, 1, 100, 111, u128::MAX] {
+				let evm = Contracts::convert_native_to_evm(cents);
+				assert_eq!(evm, U256::from(cents) * U256::from(SCALE));
+				let native = BalanceWithDust::<u128>::from_value::<NativeTest>(evm).unwrap();
+				assert_eq!(native.deconstruct(), (cents, 0));
+			}
+			for amount in [U256::from(1), U256::from(SCALE - 1), U256::from(SCALE + 1), U256::MAX] {
+				assert!(BalanceWithDust::<u128>::from_value::<NativeTest>(amount).is_err());
+			}
+			let overflow = (U256::from(u128::MAX) + U256::from(1)) * U256::from(SCALE);
+			assert_eq!(
+				BalanceWithDust::<u128>::from_value::<NativeTest>(overflow),
+				Err(crate::BalanceConversionError::Value)
+			);
+			assert_eq!(
+				Contracts::new_balance_with_dust(U256::from(u128::MAX) * U256::from(SCALE)),
+				Err(crate::BalanceConversionError::Value)
+			);
+			assert_eq!(
+				Contracts::new_balance_with_dust(U256::from(u128::MAX - 111) * U256::from(SCALE)),
+				Ok((u128::MAX, 0))
+			);
+		});
+	}
+
+	/// 已有 dust、手工构造、整数支付、自转账、零值及 setter 均不得绕过底层检查。
+	#[test]
+	fn strict_sinks_reject_dust_before_any_state_change() {
+		externalities().execute_with(|| {
+			let fractional = BalanceWithDust::new_unchecked::<super::Test>(1u128, 1);
+			assert_noop!(
+				crate::evm::transfer_with_dust::<NativeTest>(
+					&super::ALICE,
+					&super::BOB,
+					fractional,
+					Preservation::Preserve
+				),
+				Error::<NativeTest>::BalanceConversionFailed
+			);
+			assert_noop!(
+				crate::evm::burn_with_dust::<NativeTest>(&super::ALICE, fractional),
+				Error::<NativeTest>::BalanceConversionFailed
+			);
+			for who in [&super::ALICE, &super::BOB] {
+				crate::AccountInfoOf::<NativeTest>::insert(
+					address(who),
+					crate::AccountInfo { dust: 1, ..Default::default() },
+				);
+				for value in [0u128, 1] {
+					assert_noop!(
+						crate::evm::transfer_with_dust::<NativeTest>(
+							&super::ALICE,
+							&super::BOB,
+							value.into(),
+							Preservation::Preserve
+						),
+						Error::<NativeTest>::BalanceConversionFailed
+					);
+				}
+				assert_noop!(
+					crate::evm::transfer_with_dust::<NativeTest>(
+						who,
+						who,
+						0u128.into(),
+						Preservation::Preserve
+					),
+					Error::<NativeTest>::BalanceConversionFailed
+				);
+				assert_noop!(
+					crate::evm::burn_with_dust::<NativeTest>(who, 0u128.into()),
+					Error::<NativeTest>::BalanceConversionFailed
+				);
+				assert_noop!(
+					Contracts::set_evm_balance(&address(who), U256::zero())
+						.map_err(sp_runtime::DispatchError::from),
+					Error::<NativeTest>::BalanceConversionFailed
+				);
+				crate::AccountInfoOf::<NativeTest>::remove(address(who));
+			}
+		});
+	}
+
+	/// 不足一分在 bare 执行前拒绝，且源余额、发行量及完整状态均保持原值。
+	#[test]
+	fn bare_calls_validate_even_when_value_would_not_move() {
+		externalities().execute_with(|| {
+			for dest in [address(&super::ALICE), address(&super::BOB)] {
+				let before = root();
+				assert_eq!(
+					call(dest, U256::from(1)).result.unwrap_err(),
+					Error::<NativeTest>::BalanceConversionFailed.into()
+				);
+				assert_eq!(root(), before);
+			}
+			let before = root();
+			assert_eq!(
+				instantiate(initcode(&[0]), U256::from(SCALE + 1)).result.unwrap_err(),
+				Error::<NativeTest>::BalanceConversionFailed.into()
+			);
+			assert_eq!(root(), before);
+			let issuance = Balances::total_issuance();
+			assert!(call(address(&super::BOB), U256::from(SCALE)).result.is_ok());
+			assert_eq!(Balances::balance(&super::BOB), 1_001);
+			assert_eq!(Balances::total_issuance(), issuance);
+		});
+	}
+
+	/// RPC 覆盖是必定恢复的模拟；部分覆盖失败不能留下前一个账户的改动。
+	#[test]
+	fn overrides_are_exact_and_always_ephemeral() {
+		use crate::evm::{StateOverride, StateOverrideSet};
+		externalities().execute_with(|| {
+			let before = root();
+			let override_set = StateOverrideSet(
+				[(
+					address(&super::ALICE),
+					StateOverride { balance: Some(U256::from(100 * SCALE)), ..Default::default() },
+				)]
+				.into_iter()
+				.collect(),
+			);
+			assert_ok!(crate::state_overrides::with_state_overrides::<NativeTest, _>(
+				override_set,
+				|| {
+					assert_eq!(Balances::balance(&super::ALICE), 211);
+					Ok(())
+				}
+			));
+			assert_eq!(root(), before);
+			let mut addresses = [address(&super::ALICE), address(&super::BOB)];
+			addresses.sort();
+			let override_set = StateOverrideSet(
+				[
+					(
+						addresses[0],
+						StateOverride { balance: Some(U256::from(SCALE)), ..Default::default() },
+					),
+					(
+						addresses[1],
+						StateOverride { balance: Some(U256::from(1)), ..Default::default() },
+					),
+				]
+				.into_iter()
+				.collect(),
+			);
+			assert!(
+				crate::state_overrides::with_state_overrides::<NativeTest, _>(override_set, || Ok(
+					()
+				))
+				.is_err()
+			);
+			assert_eq!(root(), before);
+		});
+	}
+
+	/// 制度收费未接入前，直接派发及交易解码不能绕过门禁，也不能补扣舍入差额。
+	#[test]
+	fn ethereum_execution_fails_closed_without_native_fee_adapter() {
+		externalities().execute_with(|| {
+			let before = root();
+			assert!(
+				crate::evm::GenericTransaction::default()
+					.into_call::<NativeTest>(crate::evm::CreateCallMode::DryRun)
+					.is_err()
+			);
+			let result = Contracts::eth_call(
+				crate::Origin::<NativeTest>::EthTransaction(super::ALICE).into(),
+				address(&super::BOB),
+				U256::zero(),
+				Weight::zero(),
+				U256::from(100),
+				Vec::new(),
+				Vec::new(),
+				U256::from(3),
+				0,
+			);
+			assert_eq!(
+				result.unwrap_err().error,
+				Error::<NativeTest>::NativeFeeNotConfigured.into()
+			);
+			let inner = RuntimeCall::Balances(pallet_balances::Call::transfer_allow_death {
+				dest: super::BOB,
+				value: 1,
+			});
+			let result = Contracts::eth_substrate_call(
+				crate::Origin::<NativeTest>::EthTransaction(super::ALICE).into(),
+				Box::new(inner),
+				Vec::new(),
+			);
+			assert_eq!(
+				result.unwrap_err().error,
+				Error::<NativeTest>::NativeFeeNotConfigured.into()
+			);
+			let result = crate::evm::block_storage::EthereumCallResult::new::<NativeTest>(
+				super::ALICE,
+				Default::default(),
+				Weight::zero(),
+				0,
+				&Default::default(),
+				U256::from(3),
+			);
+			assert_eq!(
+				result.result.unwrap_err().error,
+				Error::<NativeTest>::NativeFeeNotConfigured.into()
+			);
+			assert_eq!(root(), before);
+		});
+	}
+
+	/// Genesis 只能核对已由原生账本出资的余额，不能追加分配或忽略非法金额。
+	#[test]
+	fn genesis_neither_mints_ed_nor_ignores_invalid_amounts() {
+		use frame_support::traits::BuildGenesisConfig;
+		externalities().execute_with(|| {
+			let issuance = Balances::total_issuance();
+			let account = crate::genesis::Account {
+				address: address(&super::ALICE),
+				balance: U256::from(1_000_000u128 - 111) * U256::from(SCALE),
+				nonce: 0,
+				contract_data: None,
+			};
+			crate::GenesisConfig::<NativeTest> { accounts: vec![account], ..Default::default() }
+				.build();
+			assert_eq!(Balances::total_issuance(), issuance);
+			let before = root();
+			let invalid = crate::GenesisConfig::<NativeTest> {
+				accounts: vec![crate::genesis::Account {
+					address: address(&super::ALICE),
+					balance: U256::from(1),
+					nonce: 0,
+					contract_data: None,
+				}],
+				..Default::default()
+			};
+			assert!(
+				std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| invalid.build())).is_err()
+			);
+			assert_eq!(root(), before);
+		});
+	}
+}

@@ -51,6 +51,7 @@ use frame_support::{
 	Twox64Concat,
 	migrations::{MigrationId, SteppedMigration, SteppedMigrationError},
 	storage_alias,
+	traits::Get,
 	weights::WeightMeter,
 };
 use scale_info::TypeInfo;
@@ -92,6 +93,9 @@ impl<T: Config> SteppedMigration for Migration<T> {
 		mut cursor: Option<Self::Cursor>,
 		meter: &mut WeightMeter,
 	) -> Result<Option<Self::Cursor>, SteppedMigrationError> {
+		if T::StrictNativeBalance::get() && T::Deposit::SUPPORTS_PGAS {
+			return Err(SteppedMigrationError::Failed);
+		}
 		let code_step = <T as Config>::WeightInfo::v4_code_upload_step();
 		let contract_step = <T as Config>::WeightInfo::v4_contract_step();
 		let deletion_queue_step = <T as Config>::WeightInfo::v4_deletion_queue_step();

@@ -68,6 +68,12 @@ impl GenericTransaction {
 		T: Config,
 		CallOf<T>: SetWeightLimit,
 	{
+		// 制度费用适配未完成时拒绝执行，不能套用上游 gas 收费或测试空实现。
+		if T::StrictNativeBalance::get() {
+			return Err(InvalidTransaction::Payment);
+		}
+		crate::BalanceWithDust::<crate::BalanceOf<T>>::ensure_policy::<T>()
+			.map_err(|_| InvalidTransaction::Payment)?;
 		let is_dry_run = matches!(mode, CreateCallMode::DryRun);
 		let base_fee = <Pallet<T>>::evm_base_fee();
 
@@ -197,8 +203,8 @@ impl GenericTransaction {
 		};
 
 		// the fee as signed off by the eth wallet. we cannot consume more.
-		let eth_fee =
-			effective_gas_price.saturating_mul(gas) / <T as Config>::NativeToEthRatio::get();
+		let eth_fee = effective_gas_price.checked_mul(gas).ok_or(InvalidTransaction::Payment)?
+			/ <T as Config>::NativeToEthRatio::get();
 
 		let weight_limit = {
 			let fixed_fee = <T as Config>::FeeInfo::fixed_fee(encoded_len as u32);

@@ -34,7 +34,7 @@ use frame_support::{
 	pallet_prelude::{DispatchError, DispatchResultWithPostInfo},
 	storage::with_transaction,
 };
-use sp_core::U256;
+use sp_core::{Get, U256};
 use sp_runtime::{Saturating, TransactionOutcome};
 
 /// The maximum number of block hashes to keep in the history.
@@ -74,6 +74,13 @@ impl EthereumCallResult {
 		info: &DispatchInfo,
 		effective_gas_price: U256,
 	) -> Self {
+		// 原生整单位策略不允许收据舍入导致额外收费；生产收费接入前拒绝。
+		if T::StrictNativeBalance::get() {
+			return Self {
+				receipt_gas_info: ReceiptGasInfo::default(),
+				result: Err(Error::<T>::NativeFeeNotConfigured.into()),
+			};
+		}
 		let effective_gas_price = effective_gas_price.max(Pallet::<T>::evm_base_fee());
 
 		if let Ok(retval) = &output.result &&

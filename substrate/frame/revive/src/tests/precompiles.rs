@@ -17,6 +17,7 @@
 
 //! Precompiles added to the test runtime.
 
+use crate::AddressMapper as _;
 use crate::{
 	Config, DispatchError, ExecOrigin as Origin, ReentrancyProtection, U256, Weight,
 	exec::{CallResources, ErrorOrigin, ExecError},
@@ -136,4 +137,38 @@ impl<T: Config> Token<T> for MaxGasToken {
 	fn weight(&self) -> Weight {
 		Weight::MAX
 	}
+}
+
+/// 零金额预编译调用也必须由明确付款人出资 ED，重复调用不能重复出资或增发。
+#[test]
+fn native_precompile_ed_comes_from_payer_once() {
+	use crate::tests::native_monetary as n;
+	use alloy_core::sol_types::SolCall;
+	use frame_support::traits::fungible::Inspect;
+	n::externalities().execute_with(|| {
+		let dest = sp_core::H160(WithInfo::<n::NativeTest>::MATCHER.base_address());
+		let account = <n::NativeTest as Config>::AddressMapper::to_account_id(&dest);
+		// 已有 System provider 但无原生余额仍必须由 payer 出资。
+		n::System::inc_providers(&account);
+		assert_eq!(n::Balances::balance(&account), 0);
+		let payer = n::Balances::balance(&crate::tests::ALICE);
+		let issuance = n::Balances::total_issuance();
+		for _ in 0..2 {
+			let result = n::Contracts::bare_call(
+				n::RuntimeOrigin::signed(crate::tests::ALICE),
+				dest,
+				U256::zero(),
+				crate::TransactionLimits::WeightAndDeposit {
+					weight_limit: Weight::from_parts(1_000_000_000_000, 10_000_000),
+					deposit_limit: 100_000,
+				},
+				IWithInfo::dummyCall {}.abi_encode(),
+				&crate::ExecConfig::new_substrate_tx(),
+			);
+			assert!(result.result.is_ok(), "{:?}", result.result);
+			assert_eq!(n::Balances::balance(&account), 111);
+			assert_eq!(n::Balances::balance(&crate::tests::ALICE), payer - 111);
+			assert_eq!(n::Balances::total_issuance(), issuance);
+		}
+	});
 }

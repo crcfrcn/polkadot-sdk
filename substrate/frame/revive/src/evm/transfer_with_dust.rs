@@ -70,7 +70,12 @@ fn ensure_sufficient_dust<T: Config>(
 		return Ok(());
 	}
 
-	let plank = T::NativeToEthRatio::get();
+	if T::StrictNativeBalance::get() {
+		return Err(Error::<T>::BalanceConversionFailed.into());
+	}
+	let plank: u32 = T::NativeToEthRatio::get()
+		.try_into()
+		.map_err(|_| Error::<T>::BalanceConversionFailed)?;
 
 	T::Currency::burn_from(
 		from,
@@ -96,7 +101,11 @@ pub(crate) fn transfer_with_dust<T: Config>(
 	value: BalanceWithDust<BalanceOf<T>>,
 	preservation: Preservation,
 ) -> DispatchResult {
+	value.ensure_valid::<T>().map_err(|_| Error::<T>::BalanceConversionFailed)?;
 	let from_addr = <T::AddressMapper as AddressMapper<T>>::to_address(from);
+	// 写入处也检查双方状态，覆盖整数支付、自转账和零值提前返回。
+	crate::Pallet::<T>::ensure_clean_balance(&from_addr)?;
+	crate::Pallet::<T>::ensure_clean_balance(&T::AddressMapper::to_address(to))?;
 	let mut from_info = AccountInfoOf::<T>::get(&from_addr).unwrap_or_default();
 
 	if from_info.balance(from, preservation) < value {
@@ -118,7 +127,9 @@ pub(crate) fn transfer_with_dust<T: Config>(
 	transfer_balance::<T>(from, to, value, preservation)?;
 	transfer_dust::<T>(&mut from_info, &mut to_info, dust)?;
 
-	let plank = T::NativeToEthRatio::get();
+	let plank: u32 = T::NativeToEthRatio::get()
+		.try_into()
+		.map_err(|_| Error::<T>::BalanceConversionFailed)?;
 	if to_info.dust >= plank {
 		T::Currency::mint_into(to, 1u32.into())?;
 		to_info.dust = to_info.dust.checked_sub(plank).ok_or_else(|| Error::<T>::TransferFailed)?;
@@ -135,7 +146,9 @@ pub(crate) fn burn_with_dust<T: Config>(
 	from: &AccountIdOf<T>,
 	value: BalanceWithDust<BalanceOf<T>>,
 ) -> DispatchResult {
+	value.ensure_valid::<T>().map_err(|_| Error::<T>::BalanceConversionFailed)?;
 	let from_addr = <T::AddressMapper as AddressMapper<T>>::to_address(from);
+	crate::Pallet::<T>::ensure_clean_balance(&from_addr)?;
 	let mut from_info = AccountInfoOf::<T>::get(&from_addr).unwrap_or_default();
 
 	if from_info.balance(from, Preservation::Preserve) < value {
@@ -211,7 +224,8 @@ mod tests {
 			expected_error: Option<DispatchError>,
 		}
 
-		let plank: u32 = <Test as Config>::NativeToEthRatio::get();
+		let plank: u32 =
+			<<Test as Config>::NativeToEthRatio as Get<u64>>::get().try_into().unwrap();
 
 		let test_cases = vec![
 			TestCase {
@@ -395,7 +409,8 @@ mod tests {
 
 	#[test]
 	fn burn_with_dust_redirects_to_on_burn() {
-		let plank: u32 = <Test as Config>::NativeToEthRatio::get();
+		let plank: u32 =
+			<<Test as Config>::NativeToEthRatio as Get<u64>>::get().try_into().unwrap();
 		let burn_dest = BurnDestination::get();
 
 		struct TestCase {

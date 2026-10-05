@@ -30,7 +30,7 @@ use scale_info::TypeInfo;
 use sp_core::Get;
 use sp_runtime::{
 	DispatchError,
-	traits::{One, Saturating, Zero},
+	traits::{Saturating, Zero},
 };
 
 /// Result type of a `bare_call` or `bare_instantiate` call as well as `ContractsApi::call` and
@@ -142,37 +142,75 @@ impl<Balance> BalanceWithDust<Balance> {
 		(self.value, self.dust)
 	}
 
-	/// Creates a new `BalanceWithDust` with the given value and dust.
+	/// 验证类型固定的货币策略；宽倍率不能进入只支持 u32 dust 的支付路径。
+	pub(crate) fn ensure_policy<T: Config>() -> Result<(), BalanceConversionError> {
+		let ratio = T::NativeToEthRatio::get();
+		if ratio == 0 {
+			return Err(BalanceConversionError::Value);
+		}
+		if T::StrictNativeBalance::get() {
+			if ratio != 10_000_000_000_000_000
+				|| <T::Deposit as crate::Deposit<T>>::SUPPORTS_PGAS
+				|| U256::from(u128::MAX)
+					!= <BalanceOf<T> as sp_runtime::traits::Bounded>::max_value().into()
+			{
+				return Err(BalanceConversionError::Value);
+			}
+		} else if ratio > u64::from(u32::MAX) {
+			return Err(BalanceConversionError::Dust);
+		}
+		Ok(())
+	}
+
+	/// 统一校验入口和写入处的金额；整单位模式下 dust 必须为零。
+	pub(crate) fn ensure_valid<T: Config>(&self) -> Result<(), BalanceConversionError> {
+		Self::ensure_policy::<T>()?;
+		if u64::from(self.dust) >= T::NativeToEthRatio::get()
+			|| (T::StrictNativeBalance::get() && self.dust != 0)
+		{
+			return Err(BalanceConversionError::Dust);
+		}
+		Ok(())
+	}
+
+	/// 从原生余额和已有 dust 构造受检金额，不能静默清理异常状态。
+	pub fn try_new<T: Config>(value: Balance, dust: u32) -> Result<Self, BalanceConversionError> {
+		let balance = Self { value, dust };
+		balance.ensure_valid::<T>()?;
+		Ok(balance)
+	}
+
+	/// 测试与基准的历史夹具入口；生产代码必须使用受检构造。
+	#[cfg(any(test, feature = "runtime-benchmarks"))]
 	pub fn new_unchecked<T: Config>(value: Balance, dust: u32) -> Self {
-		debug_assert!(dust < T::NativeToEthRatio::get());
-		Self { value, dust }
+		Self::try_new::<T>(value, dust).expect("fixture balance must obey native monetary policy")
 	}
 
 	/// Creates a new `BalanceWithDust` from the given EVM value.
 	pub fn from_value<T: Config>(
 		value: U256,
 	) -> Result<BalanceWithDust<BalanceOf<T>>, BalanceConversionError> {
+		Self::ensure_policy::<T>()?;
 		if value.is_zero() {
 			return Ok(Default::default());
 		}
 
 		let (quotient, remainder) = value.div_mod(T::NativeToEthRatio::get().into());
+		// 先检查余数，任何不足一个原生单位的金额都不能进入账本。
+		if T::StrictNativeBalance::get() && !remainder.is_zero() {
+			return Err(BalanceConversionError::Dust);
+		}
 		let value = quotient.try_into().map_err(|_| BalanceConversionError::Value)?;
 		let dust = remainder.try_into().map_err(|_| BalanceConversionError::Dust)?;
 
-		Ok(BalanceWithDust { value, dust })
+		BalanceWithDust::try_new::<T>(value, dust)
 	}
 }
 
-impl<Balance: Zero + One + Saturating> BalanceWithDust<Balance> {
+impl<Balance: Zero> BalanceWithDust<Balance> {
 	/// Returns true if both the value and dust are zero.
 	pub fn is_zero(&self) -> bool {
 		self.value.is_zero() && self.dust == 0
-	}
-
-	/// Returns the Balance rounded to the nearest whole unit if the dust is non-zero.
-	pub fn into_rounded_balance(self) -> Balance {
-		if self.dust == 0 { self.value } else { self.value.saturating_add(Balance::one()) }
 	}
 }
 

@@ -850,6 +850,12 @@ where
 		input_data: Vec<u8>,
 		exec_config: &ExecConfig<T>,
 	) -> ExecResult {
+		BalanceWithDust::<BalanceOf<T>>::from_value::<T>(value)
+			.map_err(|_| Error::<T>::BalanceConversionFailed)?;
+		Contracts::<T>::ensure_clean_balance(&dest)?;
+		if let Ok(account) = origin.account_id() {
+			Contracts::<T>::ensure_clean_balance(&T::AddressMapper::to_address(account))?;
+		}
 		let dest = T::AddressMapper::to_account_id(&dest);
 		if let Some((mut stack, executable)) = Stack::<'_, T, E>::new(
 			FrameArgs::Call { dest: dest.clone(), cached_info: None, delegated_call: None },
@@ -921,6 +927,9 @@ where
 		salt: Option<&[u8; 32]>,
 		exec_config: &ExecConfig<T>,
 	) -> Result<(H160, ExecReturnValue), ExecError> {
+		BalanceWithDust::<BalanceOf<T>>::from_value::<T>(value)
+			.map_err(|_| Error::<T>::BalanceConversionFailed)?;
+		Contracts::<T>::ensure_clean_balance(&T::AddressMapper::to_address(&origin))?;
 		let deployer = T::AddressMapper::to_address(&origin);
 		let (mut stack, executable) = Stack::<'_, T, E>::new(
 			FrameArgs::Instantiate {
@@ -937,6 +946,8 @@ where
 		)?
 		.expect(FRAME_ALWAYS_EXISTS_ON_INSTANTIATE);
 		let address = T::AddressMapper::to_address(&stack.top_frame().account_id);
+		// 外层 CREATE 也属于本次创建集合，否则构造函数内的 SELFDESTRUCT 会被跳过。
+		stack.first_frame.contracts_created.insert(stack.first_frame.account_id.clone());
 		let result = stack
 			.run(executable, input_data)
 			.map(|_| (address, stack.first_frame.last_frame_output));
@@ -1054,6 +1065,9 @@ where
 		input_data: &[u8],
 		exec_config: &ExecConfig<T>,
 	) -> Result<Option<(Frame<T>, ExecutableOrPrecompile<T, E, Self>)>, ExecError> {
+		// 校验每个调用帧的金额，包含 delegate 和不实际转账的执行路径。
+		BalanceWithDust::<BalanceOf<T>>::from_value::<T>(value_transferred)
+			.map_err(|_| Error::<T>::BalanceConversionFailed)?;
 		let (account_id, contract_info, executable, delegate, entry_point) = match frame_args {
 			FrameArgs::Call { dest, cached_info, delegated_call } => {
 				let address = T::AddressMapper::to_address(&dest);
@@ -1314,7 +1328,18 @@ where
 			// We need to make sure that the contract's account exists before calling its
 			// constructor.
 			if entry_point == ExportedFunction::Constructor {
-				if !frame_system::Pallet::<T>::account_exists(&account_id) {
+				if T::StrictNativeBalance::get() {
+					// System provider 可能来自其他模块；是否出资只认原生账本。
+					if T::Currency::total_balance(account_id).is_zero() {
+						Self::fund_ed(
+							&self.origin,
+							account_id,
+							&mut frame.frame_meter,
+							self.exec_config,
+						)?;
+					}
+					T::Deposit::init_contract(account_id)?;
+				} else if !frame_system::Pallet::<T>::account_exists(&account_id) {
 					T::Deposit::init_contract(account_id)?;
 				}
 
@@ -1363,14 +1388,28 @@ where
 			//    account.
 			//  - Only when not delegate calling we are executing in the context of the pre-compile.
 			//    Pre-compiles itself cannot delegate call.
-			if let Some(precompile) = executable.as_precompile() &&
-				precompile.has_contract_info() &&
-				frame.delegate.is_none() &&
-				!<System<T>>::account_exists(account_id)
+			if let Some(precompile) = executable.as_precompile()
+				&& precompile.has_contract_info()
+				&& frame.delegate.is_none()
+				&& (!<System<T>>::account_exists(account_id)
+					|| (T::StrictNativeBalance::get()
+						&& T::Currency::total_balance(account_id) < T::Currency::minimum_balance()))
 			{
-				// prefix matching pre-compiles cannot have a contract info
-				// hence we only mint once per pre-compile
-				T::Currency::mint_into(account_id, T::Currency::minimum_balance())?;
+				// 固定地址 WithInfo 预编译只初始化一次；严格模式必须由真实余额出资。
+				if T::StrictNativeBalance::get() {
+					ensure!(
+						T::Currency::total_balance(account_id).is_zero(),
+						Error::<T>::BalanceConversionFailed
+					);
+					Self::fund_ed(
+						&self.origin,
+						account_id,
+						&mut frame.frame_meter,
+						self.exec_config,
+					)?;
+				} else {
+					T::Currency::mint_into(account_id, T::Currency::minimum_balance())?;
+				}
 				// make sure the pre-compile does not destroy its account by accident
 				<System<T>>::inc_consumers(account_id)?;
 			}
@@ -1443,6 +1482,12 @@ where
 					let contract_info = frame.contract_info();
 					contract_info.code_hash = *module.code_hash();
 					<CodeInfo<T>>::increment_refcount(contract_info.code_hash)?;
+					// 构造函数 SELFDESTRUCT 先登记终止；返回代码存入后必须使用最终代码哈希。
+					if let Some(termination) =
+						frame.contracts_to_be_destroyed.get_mut(&frame.account_id)
+					{
+						termination.code_hash = *module.code_hash();
+					}
 				}
 
 				let deposit = frame.contract_info().update_base_deposit(code_deposit);
@@ -1643,6 +1688,26 @@ where
 		}
 	}
 
+	/// 整单位账户的 ED 是现有资金的转移，不得铸造或挪用已收手续费。
+	fn fund_ed<S: State>(
+		origin: &Origin<T>,
+		to: &T::AccountId,
+		meter: &mut ResourceMeter<T, S>,
+		exec_config: &ExecConfig<T>,
+	) -> DispatchResult {
+		if exec_config.collect_deposit_from_hold.is_some() {
+			return Err(Error::<T>::NativeFeeNotConfigured.into());
+		}
+		let payer = origin.account_id()?;
+		Contracts::<T>::ensure_clean_balance(&T::AddressMapper::to_address(payer))?;
+		Contracts::<T>::ensure_clean_balance(&T::AddressMapper::to_address(to))?;
+		let ed = T::Currency::minimum_balance();
+		meter.charge_deposit(&StorageDeposit::Charge(ed))?;
+		T::Currency::transfer(payer, to, ed, Preservation::Preserve)
+			.map(|_| ())
+			.map_err(|_| Error::<T>::StorageDepositNotEnoughFunds.into())
+	}
+
 	/// Transfer some funds from `from` to `to`.
 	///
 	/// This is a no-op for zero `value`, avoiding events to be emitted for zero balance transfers.
@@ -1666,18 +1731,35 @@ where
 	) -> DispatchResult {
 		let value = BalanceWithDust::<BalanceOf<T>>::from_value::<T>(value)
 			.map_err(|_| Error::<T>::BalanceConversionFailed)?;
+		Contracts::<T>::ensure_clean_balance(&T::AddressMapper::to_address(from))?;
+		Contracts::<T>::ensure_clean_balance(&T::AddressMapper::to_address(to))?;
 		if value.is_zero() {
 			return Ok(());
 		}
 
-		if <System<T>>::account_exists(to) {
+		if <System<T>>::account_exists(to)
+			&& (!T::StrictNativeBalance::get()
+				|| T::Currency::total_balance(to) >= T::Currency::minimum_balance())
+		{
 			return transfer_with_dust::<T>(from, to, value, preservation);
 		}
 
+		if T::StrictNativeBalance::get() {
+			ensure!(T::Currency::total_balance(to).is_zero(), Error::<T>::BalanceConversionFailed);
+		}
 		let origin = origin.account_id()?;
 		let ed = <T as Config>::Currency::minimum_balance();
 		let is_eth_tx = exec_config.collect_deposit_from_hold.is_some();
 		with_transaction(|| -> TransactionOutcome<DispatchResult> {
+			if T::StrictNativeBalance::get() {
+				let result =
+					Self::fund_ed(&Origin::from_account_id(origin.clone()), to, meter, exec_config)
+						.and_then(|_| transfer_with_dust::<T>(from, to, value, preservation));
+				return match result {
+					Ok(()) => TransactionOutcome::Commit(Ok(())),
+					Err(err) => TransactionOutcome::Rollback(Err(err)),
+				};
+			}
 			match meter
 				.charge_deposit(&StorageDeposit::Charge(ed))
 				.and_then(|_| {
@@ -1731,6 +1813,8 @@ where
 		args: &TerminateArgs<T>,
 	) -> Result<(), DispatchError> {
 		let contract_address = T::AddressMapper::to_address(contract_account);
+		Contracts::<T>::ensure_clean_balance(&contract_address)?;
+		Contracts::<T>::ensure_clean_balance(&T::AddressMapper::to_address(&args.beneficiary))?;
 
 		// If root created this contract we need to use the pallet account_id because root has no
 		// account.
@@ -1747,7 +1831,8 @@ where
 			// we added this consumer manually when instantiating
 			System::<T>::dec_consumers(&contract_account);
 
-			// ED was minted when the account was brought into existence; burn it now.
+			// 整单位模式保留真实出资的 ED，并在下方按账户余额转给受益人。
+			// 上游 dust 模式仍由对应 backend 清理其初始化余额。
 			T::Deposit::destroy_contract(contract_account)?;
 
 			// this is needed to:
@@ -1942,6 +2027,8 @@ where
 	}
 
 	fn terminate_if_same_tx(&mut self, beneficiary: &H160) -> Result<CodeRemoved, DispatchError> {
+		Contracts::<T>::ensure_clean_balance(&T::AddressMapper::to_address(self.account_id()))?;
+		Contracts::<T>::ensure_clean_balance(beneficiary)?;
 		if_tracing(|tracer| {
 			let addr = T::AddressMapper::to_address(self.account_id());
 			tracer.terminate(

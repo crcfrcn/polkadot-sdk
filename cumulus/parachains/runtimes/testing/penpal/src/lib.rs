@@ -790,7 +790,9 @@ impl pallet_revive::Config for Runtime {
 	type RuntimeHoldReason = RuntimeHoldReason;
 	type CodeHashLockupDepositPercent = CodeHashLockupDepositPercent;
 	type ChainId = ConstU64<420_420_999>;
-	type NativeToEthRatio = ConstU32<1_000_000>; // 10^(18 - 12) Eth is 10^18, Native is 10^12.
+	// 仅扩大倍率接口；该上游链继续使用原有 dust 货币策略。
+	type StrictNativeBalance = frame_support::traits::ConstBool<false>;
+	type NativeToEthRatio = frame_support::traits::ConstU64<1_000_000>; // 10^(18 - 12) Eth is 10^18, Native is 10^12.
 	type FindAuthor = <Runtime as pallet_authorship::Config>::FindAuthor;
 	type FeeInfo = pallet_revive::evm::fees::Info<Address, Signature, EthExtraImpl>;
 	type MaxEthExtrinsicWeight = MaxEthExtrinsicWeight;

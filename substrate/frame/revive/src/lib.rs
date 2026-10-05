@@ -91,7 +91,7 @@ use scale_info::TypeInfo;
 use sp_runtime::{
 	AccountId32, DispatchError, FixedPointNumber, FixedU128, SaturatedConversion,
 	traits::{
-		BadOrigin, Bounded, Convert, Dispatchable, Saturating, UniqueSaturatedFrom,
+		BadOrigin, Bounded, CheckedAdd, Convert, Dispatchable, Saturating, UniqueSaturatedFrom,
 		UniqueSaturatedInto, Zero,
 	},
 };
@@ -327,7 +327,12 @@ pub mod pallet {
 
 		/// The ratio between the decimal representation of the native token and the ETH token.
 		#[pallet::constant]
-		type NativeToEthRatio: Get<u32>;
+		type NativeToEthRatio: Get<u64>;
+
+		/// 原生整单位策略：禁止 dust、无来源 ED 和尚未适配制度费用的 Ethereum 执行。
+		/// 此配置由 Runtime 类型固定，不能由交易、存储或治理临时切换。
+		#[pallet::constant]
+		type StrictNativeBalance: Get<bool>;
 
 		/// Set to [`crate::evm::fees::Info`] for a production runtime.
 		///
@@ -466,7 +471,8 @@ pub mod pallet {
 			type RuntimeMemory = ConstU32<{ 128 * 1024 * 1024 }>;
 			type PVFMemory = ConstU32<{ 512 * 1024 * 1024 }>;
 			type ChainId = ConstU64<42>;
-			type NativeToEthRatio = ConstU32<1_000_000>;
+			type NativeToEthRatio = ConstU64<1_000_000>;
+			type StrictNativeBalance = ConstBool<false>;
 			type FindAuthor = ();
 			type FeeInfo = ();
 			type Deposit = ();
@@ -654,6 +660,8 @@ pub mod pallet {
 		/// [`NativeDepositOf`] entries from a previously terminated contract that the deletion
 		/// queue has not yet drained.
 		PendingDepositCleanup = 0x43,
+		/// 原生制度收费适配尚未完成，禁止 Ethereum 执行或从手续费支付押金。
+		NativeFeeNotConfigured = 0x44,
 		/// Benchmarking only error.
 		#[cfg(feature = "runtime-benchmarks")]
 		BenchmarkingError = 0xFF,
@@ -854,7 +862,34 @@ pub mod pallet {
 			use crate::{exec::Key, vm::ContractBlob};
 			use frame_support::traits::fungible::Mutate;
 
-			if !System::<T>::account_exists(&Pallet::<T>::account_id()) {
+			BalanceWithDust::<BalanceOf<T>>::ensure_policy::<T>()
+				.expect("genesis monetary policy must be valid");
+			if T::StrictNativeBalance::get() {
+				// 原生 Genesis 是发行和资金真源；Revive 只验证，不能再次分配余额或 ED。
+				// 空配置不创建任何金额账户；有 EVM 账户时必须先有原生 pallet 出资。
+				if !self.accounts.is_empty() {
+					assert!(
+						T::Currency::total_balance(&Pallet::<T>::account_id())
+							>= T::Currency::minimum_balance(),
+						"native genesis must fund the pallet ED"
+					);
+				}
+				for account in &self.accounts {
+					let (expected, _) = Pallet::<T>::new_balance_with_dust(account.balance)
+						.expect("genesis EVM balance must be an exact native amount");
+					let account_id = T::AddressMapper::to_account_id(&account.address);
+					assert_eq!(
+						T::Currency::total_balance(&account_id),
+						expected,
+						"EVM genesis must agree with funded native balances"
+					);
+					Pallet::<T>::ensure_clean_balance(&account.address)
+						.expect("genesis dust must be zero");
+				}
+			}
+			if !T::StrictNativeBalance::get()
+				&& !System::<T>::account_exists(&Pallet::<T>::account_id())
+			{
 				let _ = T::Currency::mint_into(
 					&Pallet::<T>::account_id(),
 					T::Currency::minimum_balance(),
@@ -872,7 +907,7 @@ pub mod pallet {
 			for genesis::Account { address, balance, nonce, contract_data } in &self.accounts {
 				let account_id = T::AddressMapper::to_account_id(address);
 
-				if !System::<T>::account_exists(&account_id) {
+				if !T::StrictNativeBalance::get() && !System::<T>::account_exists(&account_id) {
 					let _ = T::Currency::mint_into(&account_id, T::Currency::minimum_balance());
 				}
 
@@ -928,9 +963,10 @@ pub mod pallet {
 					},
 				}
 
-				let _ = Pallet::<T>::set_evm_balance(address, *balance).inspect_err(|err| {
-					log::error!(target: LOG_TARGET, "Failed to set EVM balance for {address:?}: {err:?}");
-				});
+				if !T::StrictNativeBalance::get() {
+					Pallet::<T>::set_evm_balance(address, *balance)
+						.expect("genesis EVM balance must be valid");
+				}
 			}
 
 			// Build genesis block
@@ -972,6 +1008,8 @@ pub mod pallet {
 
 		fn integrity_test() {
 			assert!(T::ChainId::get() > 0, "ChainId must be greater than 0");
+			BalanceWithDust::<BalanceOf<T>>::ensure_policy::<T>()
+				.expect("native monetary configuration must be valid");
 
 			assert!(T::GasScale::get() > 0u32.into(), "GasScale must not be 0");
 
@@ -1345,6 +1383,7 @@ pub mod pallet {
 			effective_gas_price: U256,
 			encoded_len: u32,
 		) -> DispatchResultWithPostInfo {
+			ensure!(!T::StrictNativeBalance::get(), Error::<T>::NativeFeeNotConfigured);
 			let signer = Self::ensure_eth_signed(origin)?;
 			let origin = OriginFor::<T>::signed(signer.clone());
 			Self::ensure_non_contract_if_signed(&origin)?;
@@ -1423,6 +1462,7 @@ pub mod pallet {
 			effective_gas_price: U256,
 			encoded_len: u32,
 		) -> DispatchResultWithPostInfo {
+			ensure!(!T::StrictNativeBalance::get(), Error::<T>::NativeFeeNotConfigured);
 			let signer = Self::ensure_eth_signed(origin)?;
 			let origin = OriginFor::<T>::signed(signer.clone());
 
@@ -1491,6 +1531,7 @@ pub mod pallet {
 		) -> DispatchResultWithPostInfo {
 			// Note that the inner dispatch uses `RawOrigin::Signed`, which cannot
 			// re-enter `eth_substrate_call` (which requires `Origin::EthTransaction`).
+			ensure!(!T::StrictNativeBalance::get(), Error::<T>::NativeFeeNotConfigured);
 			let signer = Self::ensure_eth_signed(origin)?;
 			Self::ensure_non_contract_if_signed(&OriginFor::<T>::signed(signer.clone()))?;
 			let tx_len = transaction_encoded.len() as u32;
@@ -1747,6 +1788,16 @@ fn dispatch_result<R>(
 }
 
 impl<T: Config> Pallet<T> {
+	/// 先验证已有金额状态，不能通过整分转账、零值或 setter 清理非法 dust。
+	pub(crate) fn ensure_clean_balance(address: &H160) -> DispatchResult {
+		if T::StrictNativeBalance::get()
+			&& AccountInfoOf::<T>::get(address).is_some_and(|info| info.dust != 0)
+		{
+			return Err(Error::<T>::BalanceConversionFailed.into());
+		}
+		Ok(())
+	}
+
 	/// A generalized version of [`Self::call`].
 	///
 	/// Identical to [`Self::call`] but tailored towards being called by other code within the
@@ -1761,6 +1812,17 @@ impl<T: Config> Pallet<T> {
 		data: Vec<u8>,
 		exec_config: &ExecConfig<T>,
 	) -> ContractResult<ExecReturnValue, BalanceOf<T>> {
+		let amount_check = BalanceWithDust::<BalanceOf<T>>::from_value::<T>(evm_value)
+			.map_err(|_| Error::<T>::BalanceConversionFailed.into());
+		if let Err(error) = amount_check {
+			return ContractResult { result: Err(error), ..Default::default() };
+		}
+		if T::StrictNativeBalance::get() && exec_config.collect_deposit_from_hold.is_some() {
+			return ContractResult {
+				result: Err(Error::<T>::NativeFeeNotConfigured.into()),
+				..Default::default()
+			};
+		}
 		let mut transaction_meter = match TransactionMeter::new(transaction_limits) {
 			Ok(transaction_meter) => transaction_meter,
 			Err(error) => return ContractResult { result: Err(error), ..Default::default() },
@@ -1786,7 +1848,20 @@ impl<T: Config> Pallet<T> {
 
 			Ok(result)
 		};
-		let result = Self::run_guarded(try_call);
+		let result = Self::run_guarded(|| {
+			if !T::StrictNativeBalance::get() {
+				return try_call();
+			}
+			// 执行及延后押金共同提交，任一失败都恢复本调用的临时状态。
+			with_transaction(|| {
+				let result = try_call();
+				if matches!(&result, Ok(ret) if !ret.did_revert()) {
+					TransactionOutcome::Commit(result)
+				} else {
+					TransactionOutcome::Rollback(result)
+				}
+			})
+		});
 
 		log::trace!(target: LOG_TARGET, "Bare call ends: \
 			result={result:?}, \
@@ -1843,6 +1918,17 @@ impl<T: Config> Pallet<T> {
 		salt: Option<[u8; 32]>,
 		exec_config: &ExecConfig<T>,
 	) -> ContractResult<InstantiateReturnValue, BalanceOf<T>> {
+		let amount_check = BalanceWithDust::<BalanceOf<T>>::from_value::<T>(evm_value)
+			.map_err(|_| Error::<T>::BalanceConversionFailed.into());
+		if let Err(error) = amount_check {
+			return ContractResult { result: Err(error), ..Default::default() };
+		}
+		if T::StrictNativeBalance::get() && exec_config.collect_deposit_from_hold.is_some() {
+			return ContractResult {
+				result: Err(Error::<T>::NativeFeeNotConfigured.into()),
+				..Default::default()
+			};
+		}
 		let mut transaction_meter = match TransactionMeter::new(transaction_limits) {
 			Ok(transaction_meter) => transaction_meter,
 			Err(error) => return ContractResult { result: Err(error), ..Default::default() },
@@ -1900,7 +1986,19 @@ impl<T: Config> Pallet<T> {
 				})?;
 			result
 		};
-		let output = Self::run_guarded(try_instantiate);
+		let output = Self::run_guarded(|| {
+			if !T::StrictNativeBalance::get() {
+				return try_instantiate();
+			}
+			with_transaction(|| {
+				let result = try_instantiate();
+				if matches!(&result, Ok((_, ret)) if !ret.did_revert()) {
+					TransactionOutcome::Commit(result)
+				} else {
+					TransactionOutcome::Rollback(result)
+				}
+			})
+		});
 
 		log::trace!(target: LOG_TARGET, "Bare instantiate ends: weight_consumed={:?}\
 			weight_required={:?} \
@@ -2125,6 +2223,28 @@ impl<T: Config> Pallet<T> {
 	///
 	/// - `tx`: The Ethereum transaction to simulate.
 	pub fn dry_run_eth_transact(
+		tx: GenericTransaction,
+		dry_run_config: DryRunConfig<<<T as Config>::Time as Time>::Moment>,
+	) -> Result<EthTransactInfo<BalanceOf<T>>, EthTransactError>
+	where
+		T::Nonce: Into<U256> + TryFrom<U256>,
+		CallOf<T>: SetWeightLimit,
+	{
+		if T::StrictNativeBalance::get() {
+			return Err(EthTransactError::Message("native fee adapter is not configured".into()));
+		}
+		with_transaction(|| {
+			TransactionOutcome::Rollback(Ok::<_, DispatchError>(Self::dry_run_eth_transact_inner(
+				tx,
+				dry_run_config,
+			)))
+		})
+		.map_err(|err| {
+			EthTransactError::Message(format!("simulation transaction failed: {err:?}"))
+		})?
+	}
+
+	fn dry_run_eth_transact_inner(
 		mut tx: GenericTransaction,
 		mut dry_run_config: DryRunConfig<<<T as Config>::Time as Time>::Moment>,
 	) -> Result<EthTransactInfo<BalanceOf<T>>, EthTransactError>
@@ -2425,7 +2545,8 @@ impl<T: Config> Pallet<T> {
 	/// The account's total balance becomes the EVM value plus the existential deposit,
 	/// consistent with `evm_balance` which returns the spendable balance excluding the existential
 	/// deposit.
-	pub fn set_evm_balance(address: &H160, evm_value: U256) -> Result<(), Error<T>> {
+	pub(crate) fn set_evm_balance(address: &H160, evm_value: U256) -> Result<(), Error<T>> {
+		Self::ensure_clean_balance(address).map_err(|_| Error::<T>::BalanceConversionFailed)?;
 		let (balance, dust) = Self::new_balance_with_dust(evm_value)
 			.map_err(|_| <Error<T>>::BalanceConversionFailed)?;
 		let account_id = T::AddressMapper::to_account_id(&address);
@@ -2451,7 +2572,9 @@ impl<T: Config> Pallet<T> {
 		let balance_with_dust = BalanceWithDust::<BalanceOf<T>>::from_value::<T>(evm_value)?;
 		let (value, dust) = balance_with_dust.deconstruct();
 
-		Ok((ed.saturating_add(value), dust))
+		// ED 是账本资金，溢出必须拒绝，禁止饱和后伪造余额。
+		let value = ed.checked_add(&value).ok_or(BalanceConversionError::Value)?;
+		Ok((value, dust))
 	}
 
 	/// Get the nonce for the given `address`.
@@ -2602,11 +2725,15 @@ impl<T: Config> Pallet<T> {
 
 	/// Convert a native balance to EVM balance.
 	pub fn convert_native_to_evm(value: impl Into<BalanceWithDust<BalanceOf<T>>>) -> U256 {
-		let (value, dust) = value.into().deconstruct();
+		let value = value.into();
+		value.ensure_valid::<T>().expect("native monetary value must be valid");
+		let (value, dust) = value.deconstruct();
+		// u128 账本与 u64 倍率的乘积可精确装入 U256；不使用饱和换算。
+		let value: U256 = value.into();
 		value
-			.into()
-			.saturating_mul(T::NativeToEthRatio::get().into())
-			.saturating_add(dust.into())
+			.checked_mul(T::NativeToEthRatio::get().into())
+			.and_then(|value| value.checked_add(dust.into()))
+			.expect("native balance representation must fit U256")
 	}
 
 	/// Set storage of a specified contract under a specified key.
@@ -2698,6 +2825,10 @@ impl<T: Config> Pallet<T> {
 		meter: &mut TransactionMeter<T>,
 		exec_config: &ExecConfig<T>,
 	) -> Result<ContractBlob<T>, DispatchError> {
+		BalanceWithDust::<BalanceOf<T>>::ensure_policy::<T>()
+			.map_err(|_| Error::<T>::BalanceConversionFailed)?;
+		Self::ensure_clean_balance(&T::AddressMapper::to_address(&origin))?;
+		Self::ensure_clean_balance(&T::AddressMapper::to_address(&Self::account_id()))?;
 		let mut module = match code_type {
 			BytecodeType::Pvm => ContractBlob::from_pvm_code(code, origin)?,
 			BytecodeType::Evm => ContractBlob::from_evm_runtime_code(code, origin)?,
@@ -2790,7 +2921,8 @@ impl<T: Config> Pallet<T> {
 
 	/// Returns true if the evm value carries dust.
 	fn has_dust(value: U256) -> bool {
-		value % U256::from(<T>::NativeToEthRatio::get()) != U256::zero()
+		let ratio = <T>::NativeToEthRatio::get();
+		ratio == 0 || value % U256::from(ratio) != U256::zero()
 	}
 
 	/// Returns true if the evm value carries balance.
@@ -3338,7 +3470,9 @@ macro_rules! impl_runtime_apis_plus_revive_traits {
 					let $crate::evm::TracingConfig { state_overrides } = config;
 
 					if let Some(overrides) = state_overrides {
-						$crate::state_overrides::apply_state_overrides::<Runtime>(overrides)?;
+						return $crate::state_overrides::with_state_overrides::<Runtime, _>(
+							overrides, || Self::trace_call(tx, tracer_type),
+						);
 					}
 
 					Self::trace_call(tx, tracer_type)

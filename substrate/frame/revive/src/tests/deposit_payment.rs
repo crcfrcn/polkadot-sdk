@@ -17,6 +17,7 @@
 
 //! Tests for the [`PGasDeposit`] storage-deposit backend.
 
+use crate::AddressMapper as _;
 use crate::{
 	Code, Config, DeletionQueue, FreezeReason, HoldReason, NativeDepositOf,
 	deposit_payment::{Deposit, Funds},
@@ -731,4 +732,154 @@ fn code_upload_and_remove_with_pgas() {
 				"hold released",
 			);
 		});
+}
+
+/// 合约账户 ED 必须由付款人真实转入；没有资金时初始化不能补发。
+#[test]
+fn native_ed_is_funded_and_never_minted_or_burned_by_backend() {
+	use crate::tests::native_monetary as n;
+	n::externalities().execute_with(|| {
+		let before = n::root();
+		let empty = AccountId32::new([99; 32]);
+		assert!(<() as Deposit<n::NativeTest>>::init_contract(&empty).is_err());
+		assert_eq!(n::root(), before);
+		let issuance = n::Balances::total_issuance();
+		let payer = n::Balances::balance(&ALICE);
+		let result = n::instantiate(n::initcode(&[0]), sp_core::U256::zero()).result.unwrap();
+		assert!(!result.result.did_revert());
+		let account = <n::NativeTest as Config>::AddressMapper::to_account_id(&result.addr);
+		assert_eq!(n::Balances::balance(&account), 111);
+		assert_eq!(n::Balances::balance(&ALICE), payer - 111);
+		assert_eq!(n::Balances::total_issuance(), issuance);
+		assert_ok!(<() as Deposit<n::NativeTest>>::destroy_contract(&account));
+		assert_eq!(n::Balances::balance(&account), 111);
+		assert_eq!(n::Balances::total_issuance(), issuance);
+	});
+}
+
+/// 创建失败和押金不足必须恢复整次执行状态，不能留下 ED 或代码上传残留。
+#[test]
+fn native_creation_failure_restores_balances_and_storage() {
+	use crate::tests::native_monetary as n;
+	n::externalities().execute_with(|| {
+		let before = n::root();
+		let result = n::instantiate(vec![0x5f, 0x5f, 0xfd], sp_core::U256::zero());
+		assert!(result.result.is_err() || result.result.as_ref().unwrap().result.did_revert());
+		assert_eq!(n::root(), before);
+		n::Balances::set_balance(&ALICE, 111);
+		let before = n::root();
+		assert!(n::instantiate(n::initcode(&[0]), sp_core::U256::zero()).result.is_err());
+		assert_eq!(n::root(), before);
+	});
+}
+
+/// 即使直接调用 PGAS backend，也必须在第一次资产或原生写入前拒绝。
+#[test]
+fn native_policy_rejects_all_pgas_mutation_entries() {
+	use crate::tests::native_monetary as n;
+	type Forbidden = crate::PGasDeposit<
+		n::NativeTest,
+		Assets,
+		AssetsHolder,
+		AssetsFreezer,
+		crate::tests::PGasAssetId,
+		crate::tests::PGasRefundPercent,
+	>;
+	n::externalities().execute_with(|| {
+		let before = n::root();
+		assert!(<Forbidden as Deposit<n::NativeTest>>::init_contract(&BOB).is_err());
+		assert!(<Forbidden as Deposit<n::NativeTest>>::destroy_contract(&BOB).is_err());
+		assert!(
+			<Forbidden as Deposit<n::NativeTest>>::charge_and_hold(
+				HoldReason::StorageDepositReserve,
+				Funds::Balance(&ALICE),
+				&BOB,
+				1
+			)
+			.is_err()
+		);
+		assert!(
+			<Forbidden as Deposit<n::NativeTest>>::refund_on_hold(
+				HoldReason::StorageDepositReserve,
+				&BOB,
+				Funds::Balance(&ALICE),
+				1
+			)
+			.is_err()
+		);
+		assert!(
+			<Forbidden as Deposit<n::NativeTest>>::refund_all(&BOB, Funds::Balance(&ALICE))
+				.is_err()
+		);
+		assert!(
+			<Forbidden as Deposit<n::NativeTest>>::migrate_native_to_pgas(
+				HoldReason::StorageDepositReserve,
+				&BOB,
+				1
+			)
+			.is_err()
+		);
+		assert!(
+			<() as Deposit<n::NativeTest>>::charge_and_hold(
+				HoldReason::StorageDepositReserve,
+				Funds::TxFee(&ALICE),
+				&BOB,
+				1
+			)
+			.is_err()
+		);
+		assert!(
+			<() as Deposit<n::NativeTest>>::refund_on_hold(
+				HoldReason::StorageDepositReserve,
+				&BOB,
+				Funds::TxFee(&ALICE),
+				1
+			)
+			.is_err()
+		);
+		assert_eq!(n::root(), before);
+	});
+}
+
+/// 预先存在的 System 账户不能使新合约绕过真实 ED 出资。
+#[test]
+fn native_constructor_funds_system_only_account() {
+	use crate::tests::native_monetary as n;
+	use frame_support::storage::{TransactionOutcome, with_transaction};
+	use frame_support::traits::fungible::Inspect;
+	n::externalities().execute_with(|| {
+		let before = n::root();
+		let address = with_transaction(|| {
+			TransactionOutcome::Rollback(Ok::<_, sp_runtime::DispatchError>(
+				n::instantiate(n::initcode(&[0]), sp_core::U256::zero()).result.unwrap().addr,
+			))
+		})
+		.unwrap();
+		assert_eq!(n::root(), before);
+		let account = <n::NativeTest as Config>::AddressMapper::to_account_id(&address);
+		n::System::inc_providers(&account);
+		assert_eq!(n::Balances::balance(&account), 0);
+		let payer = n::Balances::balance(&ALICE);
+		let issuance = n::Balances::total_issuance();
+		let result = n::instantiate(n::initcode(&[0]), sp_core::U256::zero()).result.unwrap();
+		assert_eq!(result.addr, address);
+		assert_eq!(n::Balances::balance(&account), 111);
+		assert_eq!(n::Balances::balance(&ALICE), payer - 111);
+		assert_eq!(n::Balances::total_issuance(), issuance);
+	});
+}
+
+/// 执行完成后的延后押金不足，必须连同 ED、上传代码及合约状态一起恢复。
+#[test]
+fn native_postponed_deposit_failure_restores_entire_execution() {
+	use crate::tests::native_monetary as n;
+	n::externalities().execute_with(|| {
+		n::NativeDepositPerItem::set(1);
+		// 111分ED与2分代码押金可支付，剩余111分为ED，不够1分延后合约押金。
+		n::Balances::set_balance(&ALICE, 224);
+		let before = n::root();
+		let result = n::instantiate(n::initcode(&[0]), sp_core::U256::zero());
+		assert_eq!(result.result.unwrap_err(), crate::Error::<n::NativeTest>::StorageDepositNotEnoughFunds.into());
+		assert_eq!(n::root(), before);
+	});
 }

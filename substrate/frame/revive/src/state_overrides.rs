@@ -46,6 +46,23 @@ use frame_support::traits::Get;
 use sp_core::{H160, U256};
 use sp_runtime::DispatchError;
 
+/// 在必定恢复的事务中应用覆盖并执行模拟，不能把余额 setter 暴露为持久写入。
+pub fn with_state_overrides<T: Config, R>(
+	overrides: StateOverrideSet,
+	call: impl FnOnce() -> Result<R, EthTransactError>,
+) -> Result<R, EthTransactError>
+where
+	T::Nonce: TryFrom<U256>,
+{
+	frame_support::storage::with_transaction(|| {
+		sp_runtime::TransactionOutcome::Rollback(Ok::<_, DispatchError>((|| {
+			apply_state_overrides::<T>(overrides)?;
+			call()
+		})()))
+	})
+	.map_err(|err| EthTransactError::Message(format!("simulation transaction failed: {err:?}")))?
+}
+
 /// Applies all state overrides from the given set to storage.
 ///
 /// Each entry in the set maps an account address to overrides for that account's balance, nonce,
@@ -54,7 +71,9 @@ use sp_runtime::DispatchError;
 ///
 /// This must be called inside a dry-run transaction that will be rolled back, as the mutations are
 /// written directly to storage.
-pub fn apply_state_overrides<T: Config>(overrides: StateOverrideSet) -> Result<(), EthTransactError>
+pub(crate) fn apply_state_overrides<T: Config>(
+	overrides: StateOverrideSet,
+) -> Result<(), EthTransactError>
 where
 	T::Nonce: TryFrom<U256>,
 {
@@ -92,6 +111,8 @@ where
 		overrides.storage.is_some(),
 	);
 
+	Pallet::<T>::ensure_clean_balance(&address)
+		.map_err(|err| EthTransactError::Message(format!("invalid monetary state: {err:?}")))?;
 	if let Some(balance) = overrides.balance {
 		apply_balance_override::<T>(&address, balance)?;
 	}
