@@ -134,7 +134,8 @@ jobs:
             "LIBCLANG_PATH=/usr/lib/llvm-18/lib" "CMAKE_COMMAND=$(readlink -f /usr/local/bin/cmake)" \
             "CMAKE_MAKE_PROGRAM=/usr/bin/make" "PROTOC=$TATAGATE_WORK/tools/protoc/bin/protoc" \
             "CARGO_HOME=$TATAGATE_WORK/cargo/home" "CARGO_BUILD_JOBS=2" "CARGO_PROFILE_DEV_DEBUG=0" \
-            "CARGO_PROFILE_TEST_DEBUG=0" "CARGO_INCREMENTAL=0" >> "$GITHUB_ENV"
+            "CARGO_PROFILE_TEST_DEBUG=0" "CARGO_INCREMENTAL=0" \
+            "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS=--cfg=rustix_use_libc" >> "$GITHUB_ENV"
           # 子构建继承同一明确工具集，不借用另一产品或用户Cargo缓存。
           printf '%s\n' \
             "$(dirname "$cargo")" "$TATAGATE_WORK/tools/solidity/bin" "$TATAGATE_WORK/tools/protoc/bin" \

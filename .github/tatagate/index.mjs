@@ -81,7 +81,8 @@ export function remoteTools(root, work, input, { execute = command, expectedRust
   expectedNode = '/opt/hostedtoolcache/node/25.2.1/x64/bin/node', expectedClang = '/usr/lib/llvm-18/bin/clang',
   expectedCMake = '/usr/local/bin/cmake', expectedLibclang = '/usr/lib/llvm-18/lib' } = {}) {
   for (const key of ['SKIP_PALLET_REVIVE_FIXTURES', 'SKIP_WASM_BUILD', 'RUSTC_WRAPPER', 'RUSTC_WORKSPACE_WRAPPER',
-    'RUSTUP_TOOLCHAIN', 'WASM_BUILD_TOOLCHAIN', 'PALLET_REVIVE_FIXTURES_RUSTUP_TOOLCHAIN']) {
+    'RUSTUP_TOOLCHAIN', 'WASM_BUILD_TOOLCHAIN', 'PALLET_REVIVE_FIXTURES_RUSTUP_TOOLCHAIN',
+    'RUSTFLAGS', 'CARGO_ENCODED_RUSTFLAGS']) {
     if (Object.hasOwn(input, key)) throw new Error('SDK远端准备拒绝跳过或替换工具：' + key);
   }
   const check = (path, args, pattern) => {
@@ -89,6 +90,7 @@ export function remoteTools(root, work, input, { execute = command, expectedRust
     if (!(lstatSync(path).mode & 0o111) || !pattern.test(execute(path, args, root, input))) throw new Error('SDK远端工具版本不符');
   };
   const cargo = join(expectedRust, 'bin/cargo'), rustc = join(expectedRust, 'bin/rustc');
+  // 原锁rustix的Linux原生目标使用官方libc后端，避免新Rust拒绝其内部属性。
   if (input.CARGO !== cargo || input.TATAGATE_CARGO !== cargo || input.RUSTC !== rustc || input.TATAGATE_RUSTC !== rustc
     || input.RUSTDOC !== join(expectedRust, 'bin/rustdoc') || input.TATAGATE_NODE !== expectedNode
     || input.CC !== expectedClang || input.CXX !== join(dirname(expectedClang), 'clang++') || realpathSync(input.CXX) !== expectedClang
@@ -97,7 +99,8 @@ export function remoteTools(root, work, input, { execute = command, expectedRust
     || input.PRODUCT_GIT_BIN !== join(work, 'tools/git/payload/bin/git')
     || input.TATAGATE_ACTIONLINT !== join(work, 'tools/actionlint/actionlint')
     || input.CARGO_BUILD_JOBS !== '2' || input.CARGO_PROFILE_DEV_DEBUG !== '0' || input.CARGO_PROFILE_TEST_DEBUG !== '0'
-    || input.CARGO_INCREMENTAL !== '0') throw new Error('SDK远端工具对象交付不符');
+    || input.CARGO_INCREMENTAL !== '0'
+    || input.CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS !== '--cfg=rustix_use_libc') throw new Error('SDK远端工具对象交付不符');
   check(expectedNode, ['--version'], /^v25\.2\.1$/u);
   check(cargo, ['--version'], /^cargo 1\.97\.1 /u); check(rustc, ['--version'], /^rustc 1\.97\.1 /u);
   check(input.RUSTDOC, ['--version'], /^rustdoc 1\.97\.1 /u);

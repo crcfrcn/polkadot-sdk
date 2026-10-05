@@ -150,7 +150,8 @@ test('远端工具版本、同一Rust及Clang对象和完整构建选项不能�
     CXX: join(f.work, 'tools/llvm/bin/clang++'), CMAKE_COMMAND: cmake, LIBCLANG_PATH: libclang,
     PROTOC: join(f.work, 'tools/protoc/bin/protoc'), PRODUCT_GIT_BIN: join(f.work, 'tools/git/payload/bin/git'),
     TATAGATE_ACTIONLINT: join(f.work, 'tools/actionlint/actionlint'), CARGO_BUILD_JOBS: '2',
-    CARGO_PROFILE_DEV_DEBUG: '0', CARGO_PROFILE_TEST_DEBUG: '0', CARGO_INCREMENTAL: '0' };
+    CARGO_PROFILE_DEV_DEBUG: '0', CARGO_PROFILE_TEST_DEBUG: '0', CARGO_INCREMENTAL: '0',
+    CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: '--cfg=rustix_use_libc' };
   const versions = new Map([[node, 'v25.2.1'], [input.CARGO, 'cargo 1.97.1 fixture'], [input.RUSTC, 'rustc 1.97.1 fixture'],
     [input.RUSTDOC, 'rustdoc 1.97.1 fixture'], [clang, 'Ubuntu clang version 18.1.3 fixture'], [cmake, 'cmake version 3.31.6'],
     [input.PROTOC, 'libprotoc 35.0'], [input.PRODUCT_GIT_BIN, 'git version 2.54.0'], [input.TATAGATE_ACTIONLINT, '1.7.12\nbuild info'],
@@ -162,8 +163,11 @@ test('远端工具版本、同一Rust及Clang对象和完整构建选项不能�
   const options = { execute: tool => versions.get(tool), expectedRust: rust, expectedNode: node, expectedClang: clang, expectedCMake: cmake, expectedLibclang: libclang };
   assert.equal(remoteTools(f.root, f.work, input, options), join(rust, 'lib/rustlib/src/rust/library'));
   for (const key of Object.keys(input)) assert.throws(() => remoteTools(f.root, f.work, { ...input, [key]: 'wrong' }, options), undefined, key);
+  const missingFlag = { ...input }; delete missingFlag.CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS;
+  assert.throws(() => remoteTools(f.root, f.work, missingFlag, options), /交付不符/u);
   for (const tool of versions.keys()) assert.throws(() => remoteTools(f.root, f.work, input, { ...options, execute: value => value === tool ? '0.0.0' : versions.get(value) }));
-  for (const key of ['SKIP_PALLET_REVIVE_FIXTURES', 'SKIP_WASM_BUILD', 'RUSTC_WRAPPER', 'RUSTC_WORKSPACE_WRAPPER', 'RUSTUP_TOOLCHAIN']) assert.throws(() => remoteTools(f.root, f.work, { ...input, [key]: '0' }, options), /拒绝/u);
+  for (const key of ['SKIP_PALLET_REVIVE_FIXTURES', 'SKIP_WASM_BUILD', 'RUSTC_WRAPPER', 'RUSTC_WORKSPACE_WRAPPER', 'RUSTUP_TOOLCHAIN',
+    'RUSTFLAGS', 'CARGO_ENCODED_RUSTFLAGS']) assert.throws(() => remoteTools(f.root, f.work, { ...input, [key]: '0' }, options), /拒绝/u);
   const hardlink = input.PRODUCT_GIT_BIN + '-hardlink';
   linkSync(input.PRODUCT_GIT_BIN, hardlink);
   assert.throws(() => remoteTools(f.root, f.work, input, options), error =>
@@ -196,6 +200,7 @@ test('Workflow保留固定官方安装器、只读同SHA push并明确完整准�
     'a0853c24544627f65ddf259abe73b1d18a591444', '032958afbdc797a9164d3bc0b56325c1308924a5',
     '/home/runner/work/_temp/polkadot-sdk-tatagate', 'CARGO_BUILD_JOBS=2', 'CARGO_PROFILE_DEV_DEBUG=0',
     'CARGO_PROFILE_TEST_DEBUG=0', 'CARGO_INCREMENTAL=0', '.github/tatagate/index.mjs prepare', '.github/tatagate/index.mjs remote',
+    'CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS=--cfg=rustix_use_libc',
     'NO_INSTALL_HARDLINKS=YesPlease', 'test "$(stat -c \'%h\' "$tool/payload/bin/git")" = 1']) assert.ok(workflow.includes(value), value);
   for (const hash of ['c63393dd39d8bc49580e3e23be3eda63ce62ae4823d95f692c7547b25ade8a31',
     '87281ce46d74f261caff4ac404fe5af7b07f185d305246fef81797ddc20fa9f8',
