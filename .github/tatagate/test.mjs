@@ -192,7 +192,7 @@ test('宿主生成器变更同时触发原生、实际WASM执行器及文档测�
 test('Workflow保留固定官方安装器、只读同SHA push并明确完整准备；没有扩大下载或删除Runner', () => {
   const workflow = readFileSync(new URL('../workflows/tatagate.yml', import.meta.url), 'utf8');
   for (const value of ['timeout-minutes: 240', 'contents: read', 'ref: ${{ github.sha }}', 'persist-credentials: false',
-    'node-version: 25.2.1', 'toolchain: 1.97.1', 'components: rustfmt,clippy,rust-src',
+    'node-version: 25.2.1', 'toolchain: 1.97.1', 'components: rustfmt,clippy,rust-src', 'targets: wasm32-unknown-unknown',
     'a0853c24544627f65ddf259abe73b1d18a591444', '032958afbdc797a9164d3bc0b56325c1308924a5',
     '/home/runner/work/_temp/polkadot-sdk-tatagate', 'CARGO_BUILD_JOBS=2', 'CARGO_PROFILE_DEV_DEBUG=0',
     'CARGO_PROFILE_TEST_DEBUG=0', 'CARGO_INCREMENTAL=0', '.github/tatagate/index.mjs prepare', '.github/tatagate/index.mjs remote',

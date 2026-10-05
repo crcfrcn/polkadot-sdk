@@ -61,6 +61,7 @@ jobs:
         with:
           toolchain: 1.97.1
           components: rustfmt,clippy,rust-src
+          targets: wasm32-unknown-unknown
       - name: 验真Workflow检查器
         shell: bash
         run: |
