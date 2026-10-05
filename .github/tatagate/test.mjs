@@ -243,8 +243,12 @@ test('真实离线子Cargo拒绝父cfg泄漏，WASM命令隔离后按自身目�
   writeFileSync(join(directory, 'src/lib.rs'), '#![no_std]\n');
   // 零外部依赖的真实构建脚本独立比较环境与编译cfg，不能以字符串断言代替子Cargo行为。
   writeFileSync(join(directory, 'build.rs'), 'fn main() { assert_eq!(std::env::var_os("CARGO_CFG_RUSTIX_USE_LIBC").is_some(), cfg!(rustix_use_libc), "父cfg泄漏到子Cargo"); }\n');
+  // 构建脚本仍需宿主链接器及SDK；保留调用方已交付的公开输入，不从系统PATH补工具。
+  const hostInputs = Object.fromEntries(['DEVELOPER_DIR', 'SDKROOT',
+    'CARGO_TARGET_AARCH64_APPLE_DARWIN_LINKER', 'CARGO_TARGET_X86_64_APPLE_DARWIN_LINKER']
+    .flatMap(key => process.env[key] ? [[key, process.env[key]]] : []));
   for (const inherited of [true, false]) {
-    const environment = { PATH: process.env.PATH, CARGO_HOME: join(directory, 'home'), CARGO_NET_OFFLINE: 'true',
+    const environment = { ...hostInputs, PATH: process.env.PATH, CARGO_HOME: join(directory, 'home'), CARGO_NET_OFFLINE: 'true',
       CARGO_TARGET_DIR: join(directory, inherited ? 'leaked-target' : 'isolated-target'),
       RUSTC: rustc, CARGO: cargo, RUSTFLAGS: '', RUSTC_BOOTSTRAP: '1' };
     if (inherited) environment.CARGO_CFG_RUSTIX_USE_LIBC = '';
