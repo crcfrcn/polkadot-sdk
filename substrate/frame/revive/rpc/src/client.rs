@@ -206,6 +206,42 @@ const REVERT_CODE: i32 = 3;
 
 const NOTIFIER_CAPACITY: usize = 16;
 
+/// 最佳块通知可能跳过新分叉祖先；先完整校验父链，再交给调用方正序写入。
+/// 达到近期窗口仍未找到已索引父块时拒绝，不能把窗口边界当作共同祖先。
+async fn collect_best_chain<B, Info, Processed, Parent, ProcessedFuture, ParentFuture>(
+	block: B,
+	info: Info,
+	is_processed: Processed,
+	parent_by_hash: Parent,
+) -> Result<Vec<B>, ClientError>
+where
+	Info: Fn(&B) -> (SubstrateBlockNumber, SubstrateBlockHash, SubstrateBlockHash),
+	Processed: Fn(SubstrateBlockNumber, SubstrateBlockHash) -> ProcessedFuture,
+	ProcessedFuture: std::future::Future<Output = bool>,
+	Parent: Fn(SubstrateBlockHash) -> ParentFuture,
+	ParentFuture: std::future::Future<Output = Result<Option<B>, ClientError>>,
+{
+	let mut pending = vec![block];
+	loop {
+		let current = pending.last().ok_or(ClientError::BlockNotFound)?;
+		let (number, _, parent_hash) = info(current);
+		if number == 0 || is_processed(number - 1, parent_hash).await {
+			break;
+		}
+		if pending.len() == crate::receipt_provider::MAX_CACHED_BLOCKS {
+			return Err(ClientError::SyncBoundaryMismatch);
+		}
+		let parent = parent_by_hash(parent_hash).await?.ok_or(ClientError::BlockNotFound)?;
+		let (parent_number, hash, _) = info(&parent);
+		if parent_number.checked_add(1) != Some(number) || hash != parent_hash {
+			return Err(ClientError::SyncBoundaryMismatch);
+		}
+		pending.push(parent);
+	}
+	pending.reverse();
+	Ok(pending)
+}
+
 impl From<ClientError> for ErrorObjectOwned {
 	fn from(err: ClientError) -> Self {
 		match err {
@@ -783,6 +819,28 @@ impl Client {
 		Ok((eth_block, receipt_infos))
 	}
 
+	/// 补齐最佳链祖先，复用既有同高分叉清理与幂等收据写入。
+	pub(crate) async fn process_best_chain(
+		&self,
+		block: &SubstrateBlock,
+	) -> Result<Block, ClientError> {
+		let pending = collect_best_chain(
+			Arc::new(block.clone()),
+			|block| (block.number(), block.hash(), block.header().parent_hash),
+			|number, hash| async move {
+				self.receipt_provider.get_processed_eth_block_hash(number, hash).await.is_some()
+			},
+			|hash| async move { self.block_provider.block_by_hash(&hash).await },
+		)
+		.await?;
+		let mut latest = None;
+		for ancestor in pending {
+			let (eth_block, _) = self.process_block(&ancestor).await?;
+			latest = Some(eth_block);
+		}
+		latest.ok_or(ClientError::BlockNotFound)
+	}
+
 	/// Start the block subscription, and populate the block cache.
 	pub async fn subscribe_and_cache_new_blocks(
 		&self,
@@ -794,7 +852,8 @@ impl Client {
 
 			match subscription_type {
 				SubscriptionType::BestBlocks => {
-					let (eth_block, _) = self.process_block(&block).await?;
+					let eth_block = self.process_best_chain(&block).await?;
+					// 父链校验及全部索引写入成功后，才推进最佳块并发布通知。
 					self.block_provider.update_latest(Arc::new(block), subscription_type).await;
 
 					if let Some(sender) = &self.block_notifier {
@@ -1395,6 +1454,120 @@ mod in_process_tests {
 	use super::*;
 	use futures::StreamExt;
 	use subxt::ext::subxt_rpcs::client::RpcClientT;
+
+	type TestHeader = (SubstrateBlockNumber, H256, H256);
+
+	#[tokio::test]
+	async fn best_chain_includes_skipped_fork_parent_in_canonical_order() {
+		// 已索引 A1/A2，只收到 B3 通知；必须先写 B2，才能触发 A2 的同高分叉清理。
+		let a1 = H256::from_low_u64_be(1);
+		let a2 = H256::from_low_u64_be(2);
+		let b2 = (2, H256::from_low_u64_be(12), a1);
+		let b3 = (3, H256::from_low_u64_be(13), b2.1);
+		let fetched = std::sync::Mutex::new(Vec::new());
+		let pending = collect_best_chain(
+			b3,
+			|header: &TestHeader| *header,
+			|number, hash| {
+				std::future::ready((number == 1 && hash == a1) || (number == 2 && hash == a2))
+			},
+			|hash| {
+				fetched.lock().unwrap().push(hash);
+				std::future::ready(Ok((hash == b2.1).then_some(b2)))
+			},
+		)
+		.await
+		.unwrap();
+		assert_eq!(pending, vec![b2, b3]);
+		assert_eq!(*fetched.lock().unwrap(), vec![b2.1]);
+	}
+
+	#[tokio::test]
+	async fn best_chain_duplicate_tip_stops_at_indexed_parent() {
+		let parent = H256::from_low_u64_be(2);
+		let tip = (3, H256::from_low_u64_be(3), parent);
+		let pending = collect_best_chain(
+			tip,
+			|header: &TestHeader| *header,
+			|number, hash| std::future::ready(number == 2 && hash == parent),
+			|_| std::future::ready(Err::<Option<TestHeader>, _>(ClientError::BlockNotFound)),
+		)
+		.await
+		.unwrap();
+		assert_eq!(pending, vec![tip]);
+	}
+
+	#[tokio::test]
+	async fn best_chain_rejects_missing_or_invalid_parent_before_returning_a_plan() {
+		let parent_hash = H256::from_low_u64_be(2);
+		let tip = (3, H256::from_low_u64_be(3), parent_hash);
+		for parent in [None, Some((1, parent_hash, H256::zero())), Some((2, tip.1, H256::zero()))] {
+			let result = collect_best_chain(
+				tip,
+				|header: &TestHeader| *header,
+				|_, _| std::future::ready(false),
+				|_| std::future::ready(Ok(parent)),
+			)
+			.await;
+			if parent.is_none() {
+				assert!(matches!(result, Err(ClientError::BlockNotFound)));
+			} else {
+				assert!(matches!(result, Err(ClientError::SyncBoundaryMismatch)));
+			}
+		}
+		let result = collect_best_chain(
+			tip,
+			|header: &TestHeader| *header,
+			|_, _| std::future::ready(false),
+			|_| std::future::ready(Err::<Option<TestHeader>, _>(ClientError::ChainMismatch)),
+		)
+		.await;
+		assert!(matches!(result, Err(ClientError::ChainMismatch)));
+	}
+
+	#[tokio::test]
+	async fn best_chain_requires_a_verified_boundary_within_the_recent_window() {
+		// 窗口恰满时允许已索引父块；再多一块必须拒绝，不能返回残缺的写入计划。
+		let limit = crate::receipt_provider::MAX_CACHED_BLOCKS as u32;
+		let header = |number: u32| {
+			(
+				number,
+				H256::from_low_u64_be(number.into()),
+				H256::from_low_u64_be((number - 1).into()),
+			)
+		};
+		for (tip, succeeds) in [(limit + 1, true), (limit + 2, false)] {
+			let result = collect_best_chain(
+				header(tip),
+				|header: &TestHeader| *header,
+				|number, hash| std::future::ready(number == 1 && hash == H256::from_low_u64_be(1)),
+				|hash| std::future::ready(Ok(Some(header(hash.to_low_u64_be() as u32)))),
+			)
+			.await;
+			if succeeds {
+				let pending = result.unwrap();
+				assert_eq!(pending.len(), limit as usize);
+				assert_eq!(pending.first().unwrap().0, 2);
+				assert_eq!(pending.last().unwrap().0, tip);
+			} else {
+				assert!(matches!(result, Err(ClientError::SyncBoundaryMismatch)));
+			}
+		}
+	}
+
+	#[tokio::test]
+	async fn best_chain_genesis_does_not_underflow_or_fetch_a_parent() {
+		let genesis = (0, H256::from_low_u64_be(1), H256::zero());
+		let pending = collect_best_chain(
+			genesis,
+			|header: &TestHeader| *header,
+			|_, _| std::future::ready(false),
+			|_| std::future::ready(Err::<Option<TestHeader>, _>(ClientError::BlockNotFound)),
+		)
+		.await
+		.unwrap();
+		assert_eq!(pending, vec![genesis]);
+	}
 
 	#[test]
 	fn mixed_transactions_keep_native_positions_for_weight_and_tracing() {

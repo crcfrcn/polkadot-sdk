@@ -367,13 +367,24 @@ impl<B: BlockInfoProvider> ReceiptProvider<B> {
 	}
 
 	/// Deletes older records from the database.
+	#[cfg(test)]
 	async fn remove(&self, block_mappings: &[BlockHashMap]) -> Result<(), ClientError> {
+		let mut db_tx = self.db_ctx.pool.begin().await?;
+		self.remove_in_transaction(block_mappings, &mut db_tx).await?;
+		db_tx.commit().await?;
+		Ok(())
+	}
+
+	/// 在调用方事务中删除旧分支，确保删除与替换块的插入一起提交或回滚。
+	async fn remove_in_transaction(
+		&self,
+		block_mappings: &[BlockHashMap],
+		db_tx: &mut sqlx::Transaction<'_, Sqlite>,
+	) -> Result<(), ClientError> {
 		if block_mappings.is_empty() {
 			return Ok(());
 		}
 		log::debug!(target: LOG_TARGET, "Removing block hashes: {block_mappings:?}");
-
-		let mut db_tx = self.db_ctx.pool.begin().await?;
 
 		for chunk in block_mappings.chunks(self.db_ctx.max_variable_number) {
 			let placeholders = vec!["?"; chunk.len()].join(", ");
@@ -395,12 +406,11 @@ impl<B: BlockInfoProvider> ReceiptProvider<B> {
 					delete_mappings_query.bind(block_map.substrate_hash.as_ref());
 			}
 
-			delete_tx_query.execute(&mut *db_tx).await?;
-			delete_logs_query.execute(&mut *db_tx).await?;
-			delete_mappings_query.execute(&mut *db_tx).await?;
+			delete_tx_query.execute(&mut **db_tx).await?;
+			delete_logs_query.execute(&mut **db_tx).await?;
+			delete_mappings_query.execute(&mut **db_tx).await?;
 		}
 
-		db_tx.commit().await?;
 		Ok(())
 	}
 
@@ -563,19 +573,27 @@ impl<B: BlockInfoProvider> ReceiptProvider<B> {
 		ethereum_hash: &H256,
 	) -> Result<(), ClientError> {
 		let block_map = BlockHashMap::new(block.hash(), *ethereum_hash);
-		self.prune_blocks(block.number(), &block_map).await?;
-		self.insert_into_db(block, receipts, ethereum_hash).await?;
+		// 先在缓存副本计算变更，持锁期间仅在事务提交成功后替换。
+		// 任一删除或插入失败均保留旧索引，重试不能把未落盘块当作已处理祖先。
+		let mut indexed = self.block_number_to_hashes.lock().await;
+		let mut updated = indexed.clone();
+		let to_remove = self.prune_blocks(block.number(), &block_map, &mut updated);
+		let mut db_tx = self.db_ctx.pool.begin().await?;
+		self.remove_in_transaction(&to_remove, &mut db_tx).await?;
+		self.insert_into_transaction(block, receipts, ethereum_hash, &mut db_tx).await?;
+		db_tx.commit().await?;
+		*indexed = updated;
 		Ok(())
 	}
 
-	/// Handle fork detection (always) and DB pruning (temporary mode only).
-	async fn prune_blocks(
+	/// 只计算同高分叉及近期窗口裁剪；数据库和正式缓存由调用方在提交后更新。
+	fn prune_blocks(
 		&self,
 		block_number: SubstrateBlockNumber,
 		block_map: &BlockHashMap,
-	) -> Result<(), ClientError> {
+		block_number_to_hash: &mut BTreeMap<SubstrateBlockNumber, BlockHashMap>,
+	) -> Vec<BlockHashMap> {
 		let mut to_remove = Vec::new();
-		let mut block_number_to_hash = self.block_number_to_hashes.lock().await;
 
 		// Fork? - If inserting the same block number with a different hash, remove the old ones.
 		match block_number_to_hash.insert(block_number, block_map.clone()) {
@@ -610,15 +628,7 @@ impl<B: BlockInfoProvider> ReceiptProvider<B> {
 			}
 		}
 
-		// Release the lock.
-		drop(block_number_to_hash);
-
-		if !to_remove.is_empty() {
-			log::trace!(target: LOG_TARGET, "Pruning old blocks: {to_remove:?}");
-			self.remove(&to_remove).await?;
-		}
-
-		Ok(())
+		to_remove
 	}
 
 	/// Insert receipts into the database without updating the in-memory block cache.
@@ -627,6 +637,20 @@ impl<B: BlockInfoProvider> ReceiptProvider<B> {
 		block: &impl BlockInfo,
 		receipts: &[(TransactionSigned, ReceiptInfo)],
 		ethereum_hash: &H256,
+	) -> Result<(), ClientError> {
+		let mut db_tx = self.db_ctx.pool.begin().await?;
+		self.insert_into_transaction(block, receipts, ethereum_hash, &mut db_tx).await?;
+		db_tx.commit().await?;
+		Ok(())
+	}
+
+	/// 同一事务内核对幂等映射并写入收据，不能先单独提交旧分支删除。
+	async fn insert_into_transaction(
+		&self,
+		block: &impl BlockInfo,
+		receipts: &[(TransactionSigned, ReceiptInfo)],
+		ethereum_hash: &H256,
+		db_tx: &mut sqlx::Transaction<'_, Sqlite>,
 	) -> Result<(), ClientError> {
 		let block_number = block.number() as i64;
 		let substrate_block_hash = block.hash();
@@ -640,7 +664,7 @@ impl<B: BlockInfoProvider> ReceiptProvider<B> {
 		let result = sqlx::query!(
 			r#"SELECT EXISTS(SELECT 1 FROM eth_to_substrate_blocks WHERE substrate_block_hash = $1) AS "exists!:bool""#, substrate_hash_ref
 		)
-		.fetch_one(&self.db_ctx.pool)
+		.fetch_one(&mut **db_tx)
 		.await?;
 
 		// Assuming that if no mapping exists then no relevant entries in transaction_hashes and
@@ -654,8 +678,6 @@ impl<B: BlockInfoProvider> ReceiptProvider<B> {
 			return Ok(());
 		}
 
-		let mut db_tx = self.db_ctx.pool.begin().await?;
-
 		for chunk in receipts.chunks(self.db_ctx.tx_insert_chunk_size) {
 			let mut query_builder = QueryBuilder::<Sqlite>::new(
 				"INSERT OR REPLACE INTO transaction_hashes (transaction_hash, block_hash, transaction_index) ",
@@ -665,7 +687,7 @@ impl<B: BlockInfoProvider> ReceiptProvider<B> {
 					.push_bind(substrate_hash_ref)
 					.push_bind(receipt.transaction_index.as_u32() as i32);
 			});
-			query_builder.build().execute(&mut *db_tx).await?;
+			query_builder.build().execute(&mut **db_tx).await?;
 		}
 
 		let all_logs: Vec<(i32, &[u8], &Log)> = receipts
@@ -694,14 +716,13 @@ impl<B: BlockInfoProvider> ReceiptProvider<B> {
 					.push_bind(log.topics.get(3).map(|v| &v[..]))
 					.push_bind(log.data.as_ref().map(|v| &v.0[..]));
 			});
-			query_builder.build().execute(&mut *db_tx).await?;
+			query_builder.build().execute(&mut **db_tx).await?;
 		}
 
 		let block_map = BlockHashMap::new(substrate_block_hash, *ethereum_hash);
-		insert_block_mapping(&mut *db_tx, &block_map).await?;
+		insert_block_mapping(&mut **db_tx, &block_map).await?;
 
-		db_tx.commit().await?;
-		log::trace!(target: LOG_TARGET, "Inserted {} receipts for block #{block_number} ethereum: {ethereum_hash:?} substrate: {substrate_block_hash:?}", receipts.len());
+		log::trace!(target: LOG_TARGET, "Prepared {} receipts for block #{block_number} ethereum: {ethereum_hash:?} substrate: {substrate_block_hash:?}", receipts.len());
 
 		Ok(())
 	}
@@ -979,6 +1000,129 @@ mod tests {
 	use pretty_assertions::assert_eq;
 	use sp_core::{H160, H256};
 	use sqlx::SqlitePool;
+
+	fn event_receipt(
+		number: u32,
+		ethereum_hash: H256,
+		transaction_hash: H256,
+	) -> Vec<(TransactionSigned, ReceiptInfo)> {
+		vec![(
+			TransactionSigned::default(),
+			ReceiptInfo {
+				block_hash: ethereum_hash,
+				block_number: number.into(),
+				transaction_hash,
+				logs: vec![Log {
+					address: H160::repeat_byte(7),
+					block_hash: ethereum_hash,
+					block_number: number.into(),
+					transaction_hash,
+					..Default::default()
+				}],
+				..Default::default()
+			},
+		)]
+	}
+
+	#[sqlx::test]
+	async fn failed_fork_write_preserves_old_index_and_retries_without_duplicate_logs(
+		pool: SqlitePool,
+	) -> anyhow::Result<()> {
+		let provider = setup_sqlite_provider(pool).await;
+		let old = MockBlockInfo { hash: H256::repeat_byte(1), number: 1 };
+		let descendant = MockBlockInfo { hash: H256::repeat_byte(3), number: 3 };
+		let fork = MockBlockInfo { hash: H256::repeat_byte(9), number: 1 };
+		let old_eth = H256::repeat_byte(11);
+		let descendant_eth = H256::repeat_byte(13);
+		let fork_eth = H256::repeat_byte(19);
+		let replayed_transaction = H256::repeat_byte(21);
+		let receipts = event_receipt(1, fork_eth, replayed_transaction);
+		// 在真实SQLite删除、日志插入、最终映射写入阶段分别失败，验证整块替换回滚。
+		for (operation, table) in
+			[("DELETE", "logs"), ("INSERT", "logs"), ("INSERT", "eth_to_substrate_blocks")]
+		{
+			provider
+				.insert(&old, &event_receipt(1, old_eth, replayed_transaction), &old_eth)
+				.await?;
+			provider
+				.insert(
+					&descendant,
+					&event_receipt(3, descendant_eth, H256::repeat_byte(23)),
+					&descendant_eth,
+				)
+				.await?;
+			let before = provider.block_number_to_hashes.lock().await.clone();
+			sqlx::query(&format!("CREATE TRIGGER reject_index_change BEFORE {operation} ON {table} BEGIN SELECT RAISE(ABORT, 'injected index failure'); END"))
+				.execute(&provider.db_ctx.pool).await?;
+			assert!(matches!(
+				provider.insert(&fork, &receipts, &fork_eth).await,
+				Err(ClientError::SqlxError(_))
+			));
+			assert_eq!(*provider.block_number_to_hashes.lock().await, before);
+			assert!(provider.get_processed_eth_block_hash(1, fork.hash).await.is_none());
+			assert_eq!(provider.get_ethereum_hash(&old.hash).await, Some(old_eth));
+			assert_eq!(provider.get_ethereum_hash(&descendant.hash).await, Some(descendant_eth));
+			assert!(provider.get_ethereum_hash(&fork.hash).await.is_none());
+			for table in ["transaction_hashes", "logs", "eth_to_substrate_blocks"] {
+				assert_eq!(count(&provider.db_ctx.pool, table, None).await, 2);
+			}
+			assert_eq!(
+				provider.logs_by_block_number(1, old_eth).await?,
+				event_receipt(1, old_eth, replayed_transaction)[0].1.logs
+			);
+			assert!(provider.logs_by_block_number(1, fork_eth).await?.is_empty());
+			sqlx::query("DROP TRIGGER reject_index_change")
+				.execute(&provider.db_ctx.pool)
+				.await?;
+			provider.insert(&fork, &receipts, &fork_eth).await?;
+			provider.insert(&fork, &receipts, &fork_eth).await?;
+			assert_eq!(provider.get_processed_eth_block_hash(1, fork.hash).await, Some(fork_eth));
+			assert!(provider.get_ethereum_hash(&old.hash).await.is_none());
+			assert!(provider.get_ethereum_hash(&descendant.hash).await.is_none());
+			for table in ["transaction_hashes", "logs", "eth_to_substrate_blocks"] {
+				assert_eq!(count(&provider.db_ctx.pool, table, None).await, 1);
+			}
+			assert_eq!(provider.logs_by_block_number(1, fork_eth).await?, receipts[0].1.logs);
+		}
+		Ok(())
+	}
+
+	#[sqlx::test]
+	async fn failed_retention_write_keeps_the_previous_window_until_commit(
+		pool: SqlitePool,
+	) -> anyhow::Result<()> {
+		let provider = setup_sqlite_provider(pool).await.with_keep_latest(Some(1));
+		let old = MockBlockInfo { hash: H256::repeat_byte(1), number: 1 };
+		let new = MockBlockInfo { hash: H256::repeat_byte(2), number: 2 };
+		let old_eth = H256::repeat_byte(11);
+		let new_eth = H256::repeat_byte(12);
+		provider
+			.insert(&old, &event_receipt(1, old_eth, H256::repeat_byte(21)), &old_eth)
+			.await?;
+		let receipts = event_receipt(2, new_eth, H256::repeat_byte(22));
+		// 映射最后才写入；此处失败必须撤销此前的窗口删除、交易和日志插入。
+		sqlx::query("CREATE TRIGGER reject_index_change BEFORE INSERT ON eth_to_substrate_blocks BEGIN SELECT RAISE(ABORT, 'injected index failure'); END")
+			.execute(&provider.db_ctx.pool).await?;
+		assert!(matches!(
+			provider.insert(&new, &receipts, &new_eth).await,
+			Err(ClientError::SqlxError(_))
+		));
+		assert_eq!(provider.get_processed_eth_block_hash(1, old.hash).await, Some(old_eth));
+		assert!(provider.get_processed_eth_block_hash(2, new.hash).await.is_none());
+		assert_eq!(provider.get_ethereum_hash(&old.hash).await, Some(old_eth));
+		assert!(provider.get_ethereum_hash(&new.hash).await.is_none());
+		assert_eq!(count(&provider.db_ctx.pool, "logs", Some(old_eth)).await, 1);
+		assert_eq!(count(&provider.db_ctx.pool, "logs", Some(new_eth)).await, 0);
+		sqlx::query("DROP TRIGGER reject_index_change")
+			.execute(&provider.db_ctx.pool)
+			.await?;
+		provider.insert(&new, &receipts, &new_eth).await?;
+		assert!(provider.get_processed_eth_block_hash(1, old.hash).await.is_none());
+		assert_eq!(provider.get_processed_eth_block_hash(2, new.hash).await, Some(new_eth));
+		assert!(provider.get_ethereum_hash(&old.hash).await.is_none());
+		assert_eq!(provider.logs_by_block_number(2, new_eth).await?, receipts[0].1.logs);
+		Ok(())
+	}
 
 	#[sqlx::test]
 	async fn reorg_removes_descendants_across_missing_notifications(

@@ -457,6 +457,7 @@ async fn run_all_eth_rpc_tests_inner() -> anyhow::Result<()> {
 		test_state_override_balance_zero,
 		test_state_override_trace_call,
 		test_subscription_gap_filler_backfills_queued_range,
+		test_best_chain_backfills_nonempty_logs_and_is_idempotent,
 	);
 
 	log::debug!(target: LOG_TARGET, "All tests completed successfully!");
@@ -1981,6 +1982,12 @@ async fn create_sync_test_client() -> anyhow::Result<Client> {
 
 async fn create_sync_test_client_with_subscription_gap_queue()
 -> anyhow::Result<(Client, mpsc::Receiver<GapFillRequest>)> {
+	create_sync_test_client_with_retention(None).await
+}
+
+async fn create_sync_test_client_with_retention(
+	keep_latest_n_blocks: Option<usize>,
+) -> anyhow::Result<(Client, mpsc::Receiver<GapFillRequest>)> {
 	use sc_cli::{RPC_DEFAULT_MAX_REQUEST_SIZE_MB, RPC_DEFAULT_MAX_RESPONSE_SIZE_MB};
 
 	let node_url = SharedResources::node_rpc_url();
@@ -2001,7 +2008,7 @@ async fn create_sync_test_client_with_subscription_gap_queue()
 		DbContext::new(pool, DbContext::DEFAULT_MAX_VARIABLE_NUMBER),
 		block_provider.clone(),
 		receipt_extractor,
-		None,
+		keep_latest_n_blocks,
 	)
 	.await?;
 
@@ -3422,5 +3429,70 @@ async fn test_subscription_gap_filler_backfills_queued_range() -> anyhow::Result
 	// bg_client holds the channel sender, so abort instead of dropping.
 	subscription_gap_queue_handle.abort();
 
+	Ok(())
+}
+
+/// 仅处理末端最佳块时，真实事件所在的缺失祖先也必须进入索引；重复通知不能重复日志。
+async fn test_best_chain_backfills_nonempty_logs_and_is_idempotent() -> anyhow::Result<()> {
+	let rpc_client = Arc::new(SharedResources::client().await);
+	let (code, _) = pallet_revive_fixtures::compile_module_with_type(
+		"SimpleReceiver",
+		pallet_revive_fixtures::FixtureType::Solc,
+	)?;
+	let deployment = TransactionBuilder::new(rpc_client.clone())
+		.input(code)
+		.send()
+		.await?
+		.wait_for_receipt()
+		.await?;
+	let contract = deployment.contract_address.expect("事件合约必须部署成功");
+	let (sync_client, _gap_fill_rx) =
+		create_sync_test_client_with_retention(Some(crate::receipt_provider::MAX_CACHED_BLOCKS))
+			.await?;
+	let common = sync_client.api().blocks().at_latest().await?;
+	sync_client.process_block(&common).await?;
+
+	let mut expected_logs = Vec::new();
+	for value in [1_000_000_000_000u128, 2_000_000_000_000, 3_000_000_000_000] {
+		let receipt = TransactionBuilder::new(rpc_client.clone())
+			.to(contract)
+			.value(U256::from(value))
+			.send()
+			.await?
+			.wait_for_receipt()
+			.await?;
+		assert_eq!(receipt.status, Some(U256::one()), "事件交易必须成功");
+		assert_eq!(receipt.logs.len(), 1, "每笔交易必须产生真实日志，拒绝空集合验收");
+		assert!(receipt.block_number > U256::from(common.number()));
+		expected_logs.extend(receipt.logs);
+	}
+
+	// 测试客户端没有订阅，中间各块尚未写入；只给它最后一块模拟缺失最佳块通知。
+	let tip = sync_client.api().blocks().at_latest().await?;
+	assert!(U256::from(tip.number()) >= expected_logs.last().unwrap().block_number);
+	for number in common.number() + 1..=tip.number() {
+		let block = sync_client.block_provider().block_by_number(number).await?.unwrap();
+		assert!(sync_client.receipt_provider().get_ethereum_hash(&block.hash()).await.is_none());
+	}
+	let indexed_tip = sync_client.process_best_chain(&tip).await?;
+	// 与生产订阅一致，成功写入祖先后才推进最佳块，供范围查询核验上界。
+	sync_client
+		.block_provider()
+		.update_latest(Arc::new(tip.clone()), crate::client::SubscriptionType::BestBlocks)
+		.await;
+	for number in common.number() + 1..=tip.number() {
+		let block = sync_client.block_provider().block_by_number(number).await?.unwrap();
+		assert!(sync_client.receipt_provider().get_ethereum_hash(&block.hash()).await.is_some());
+	}
+	let filter = Filter {
+		from_block: Some(U256::from(common.number() + 1).into()),
+		to_block: Some(U256::from(tip.number()).into()),
+		..Default::default()
+	};
+	let logs = sync_client.logs(Some(filter.clone())).await?;
+	assert_eq!(logs.len(), 3);
+	assert_eq!(logs, expected_logs, "日志内容、交易哈希和块哈希须与真实收据逐项一致");
+	assert_eq!(sync_client.process_best_chain(&tip).await?.hash, indexed_tip.hash);
+	assert_eq!(sync_client.logs(Some(filter)).await?, logs, "重复最佳块通知不能重复日志");
 	Ok(())
 }
