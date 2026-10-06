@@ -17,20 +17,21 @@
 
 //! Contains the fee types that need to be configured for `pallet-transaction-payment`.
 
+use crate::weights::WeightInfo;
 use crate::{
-	BalanceOf, CallOf, Config, DispatchErrorWithPostInfo, DispatchResultWithPostInfo, Error,
-	LOG_TARGET, PostDispatchInfo,
 	evm::{
-		OnChargeTransactionBalanceOf,
 		runtime::{EthExtra, SetWeightLimit},
+		OnChargeTransactionBalanceOf,
 	},
+	BalanceOf, CallOf, Config, DispatchErrorWithPostInfo, DispatchResultWithPostInfo, Error,
+	PostDispatchInfo, LOG_TARGET,
 };
 use codec::Encode;
 use core::marker::PhantomData;
 use frame_support::{
 	dispatch::{DispatchClass, DispatchInfo, GetDispatchInfo},
 	pallet_prelude::Weight,
-	traits::{Get, SuppressedDrop, fungible::Credit, tokens::Balance},
+	traits::{fungible::Credit, tokens::Balance, Get, SuppressedDrop},
 	weights::WeightToFee,
 };
 use frame_system::Config as SysConfig;
@@ -40,11 +41,11 @@ use pallet_transaction_payment::{
 };
 use sp_arithmetic::{FixedPointOperand, SignedRounding};
 use sp_runtime::{
-	FixedPointNumber, FixedU128, SaturatedConversion, Saturating,
 	generic::UncheckedExtrinsic,
 	traits::{
 		Block as BlockT, Dispatchable, ExtensionPostDispatchWeightHandler, TransactionExtension,
 	},
+	FixedPointNumber, FixedU128, SaturatedConversion, Saturating,
 };
 
 type CreditOf<T> = Credit<<T as frame_system::Config>::AccountId, <T as Config>::Currency>;
@@ -62,16 +63,98 @@ type CreditOf<T> = Credit<<T as frame_system::Config>::AccountId, <T as Config>:
 /// If either `P` or `Q` is zero.
 pub struct BlockRatioFee<const P: u128, const Q: u128, T, B>(PhantomData<(T, B)>);
 
-/// The only [`InfoT`] implementation valid for [`Config::FeeInfo`].
+/// 按执行资源收费的 [`InfoT`] 实现；原生制度使用 [`NativeInfo`]。
 ///
 /// The reason for this type is to avoid coupling the rest of pallet_revive to
 /// pallet_transaction_payment. This way we bundle all the trait bounds in once place.
 pub struct Info<Address, Signature, Extra>(PhantomData<(Address, Signature, Extra)>);
 
+/// Runtime 提供的现有收费入口；SDK 不持有费率、分类、付款账户或分账公式。
+///
+/// 报价与余额校验必须只读，并与交易扩展实际调用的收费器使用同一条路由。
+/// 模拟扣款仅在调用方必定回滚的存储事务中执行，也必须复用该收费器。
+pub trait NativeFee<T: Config + TxConfig>
+where
+	<T as SysConfig>::RuntimeCall: Dispatchable<Info = DispatchInfo, PostInfo = PostDispatchInfo>,
+{
+	/// 必须与 Runtime 交易支付扩展的实际收费器为同一类型。
+	type Charger: pallet_transaction_payment::OnChargeTransaction<T, Balance = BalanceOf<T>>;
+	/// 返回现有路由决定的费用；免费为零，未知或未授权业务必须拒绝。
+	fn quote(
+		who: &T::AccountId,
+		call: &CallOf<T>,
+	) -> Result<BalanceOf<T>, sp_runtime::transaction_validity::InvalidTransaction>;
+	/// 检查现有路由指定的确切付款账户，不得默认改为 Ethereum 签名者。
+	fn validate(
+		who: &T::AccountId,
+		call: &CallOf<T>,
+	) -> Result<(), sp_runtime::transaction_validity::InvalidTransaction>;
+	/// 在模拟事务内复用现有扣款入口；不得铸币模拟费用。
+	fn simulate_charge(
+		who: &T::AccountId,
+		call: &CallOf<T>,
+	) -> Result<(), sp_runtime::transaction_validity::InvalidTransaction> {
+		use pallet_transaction_payment::OnChargeTransaction;
+		let info = call.get_dispatch_info();
+		let runtime_call: <T as SysConfig>::RuntimeCall = call.clone().into();
+		let error = |err| match err {
+			sp_runtime::transaction_validity::TransactionValidityError::Invalid(reason) => reason,
+			_ => sp_runtime::transaction_validity::InvalidTransaction::Payment,
+		};
+		let credit =
+			Self::Charger::withdraw_fee(who, &runtime_call, &info, Zero::zero(), Zero::zero())
+				.map_err(error)?;
+		Self::Charger::correct_and_deposit_fee(
+			who,
+			&info,
+			&Default::default(),
+			Zero::zero(),
+			Zero::zero(),
+			credit,
+		)
+		.map_err(error)
+	}
+}
+
+/// 使用 Runtime 原生费用路由的生产接口，不依赖按 Weight 定价或费用 hold。
+///
+/// `E` 的交易扩展必须包含 Runtime 现有收费器，实际扣款只发生在 pre_dispatch。
+pub struct NativeInfo<Address, Signature, Extra, Fee>(
+	PhantomData<(Address, Signature, Extra, Fee)>,
+);
+
 /// A trait that exposes all the transaction payment details to `pallet_revive`.
 ///
-/// This trait is sealed. Use [`Info`].
+/// This trait is sealed. Use [`Info`] or [`NativeInfo`].
 pub trait InfoT<T: Config>: seal::Sealed {
+	/// 是否已配置独立于执行资源的原生收费接口；空实现不能打开生产入口。
+	fn native_fee_enabled() -> bool {
+		false
+	}
+
+	/// 复用 Runtime 现有只读报价。
+	fn native_quote(
+		_who: &T::AccountId,
+		_call: &CallOf<T>,
+	) -> Result<BalanceOf<T>, sp_runtime::transaction_validity::InvalidTransaction> {
+		Err(sp_runtime::transaction_validity::InvalidTransaction::Payment)
+	}
+
+	/// 只读检查现有付款规则。
+	fn native_validate(
+		_who: &T::AccountId,
+		_call: &CallOf<T>,
+	) -> Result<(), sp_runtime::transaction_validity::InvalidTransaction> {
+		Err(sp_runtime::transaction_validity::InvalidTransaction::Payment)
+	}
+
+	/// 仅供必定回滚的模拟事务使用。
+	fn native_simulate_charge(
+		_who: &T::AccountId,
+		_call: &CallOf<T>,
+	) -> Result<(), sp_runtime::transaction_validity::InvalidTransaction> {
+		Err(sp_runtime::transaction_validity::InvalidTransaction::Payment)
+	}
 	/// Check that the fee configuration of the chain is valid.
 	///
 	/// This is being called by the pallets `integrity_check`.
@@ -381,9 +464,121 @@ where
 
 impl<T: Config> InfoT<T> for () {}
 
+impl<Address, Signature, E: EthExtra, F> InfoT<E::Config> for NativeInfo<Address, Signature, E, F>
+where
+	F: NativeFee<E::Config>,
+	E::Config: TxConfig<OnChargeTransaction = F::Charger>,
+	<E::Config as SysConfig>::RuntimeCall:
+		Dispatchable<Info = DispatchInfo, PostInfo = PostDispatchInfo>,
+	CallOf<E::Config>: SetWeightLimit,
+	<<E::Config as SysConfig>::Block as BlockT>::Extrinsic: From<
+		UncheckedExtrinsic<
+			Address,
+			CallOf<E::Config>,
+			Signature,
+			E::ExtensionV0,
+			E::ExtensionOtherVersions,
+		>,
+	>,
+{
+	fn integrity_test() {
+		assert!(
+			<E::Config as Config>::StrictNativeBalance::get(),
+			"NativeInfo requires exact native units"
+		);
+		assert!(<E::Config as Config>::DepositPerByte::get().is_zero());
+		assert!(<E::Config as Config>::DepositPerItem::get().is_zero());
+		assert!(<E::Config as Config>::DepositPerChildTrieItem::get().is_zero());
+		let max = <E::Config as SysConfig>::BlockWeights::get().max_block;
+		assert!(max.ref_time() > 0 && max.proof_size() > 0);
+		assert!(
+			<E::Config as Config>::WeightInfo::evm_opcode(1).ref_time()
+				> <E::Config as Config>::WeightInfo::evm_opcode(0).ref_time()
+		);
+	}
+	fn native_fee_enabled() -> bool {
+		true
+	}
+	fn native_quote(
+		who: &<E::Config as SysConfig>::AccountId,
+		call: &CallOf<E::Config>,
+	) -> Result<BalanceOf<E::Config>, sp_runtime::transaction_validity::InvalidTransaction> {
+		// 禁止把 SDK 存储押金作为第二套收费制度；动态配置变化也必须拒绝。
+		if !<E::Config as Config>::StrictNativeBalance::get()
+			|| !<E::Config as Config>::DepositPerByte::get().is_zero()
+			|| !<E::Config as Config>::DepositPerItem::get().is_zero()
+			|| !<E::Config as Config>::DepositPerChildTrieItem::get().is_zero()
+		{
+			return Err(sp_runtime::transaction_validity::InvalidTransaction::Payment);
+		}
+		F::quote(who, call)
+	}
+	fn native_validate(
+		who: &<E::Config as SysConfig>::AccountId,
+		call: &CallOf<E::Config>,
+	) -> Result<(), sp_runtime::transaction_validity::InvalidTransaction> {
+		F::validate(who, call)
+	}
+	fn native_simulate_charge(
+		who: &<E::Config as SysConfig>::AccountId,
+		call: &CallOf<E::Config>,
+	) -> Result<(), sp_runtime::transaction_validity::InvalidTransaction> {
+		F::simulate_charge(who, call)
+	}
+	fn dispatch_info(call: &CallOf<E::Config>) -> DispatchInfo {
+		let mut info = call.get_dispatch_info();
+		info.extension_weight = E::get_eth_extension(0u32.into(), 0u32.into()).weight(call);
+		info
+	}
+	fn base_dispatch_info(call: &mut CallOf<E::Config>) -> DispatchInfo {
+		let previous = call.set_weight_limit(Zero::zero());
+		let info = Self::dispatch_info(call);
+		call.set_weight_limit(previous);
+		info
+	}
+	fn encoded_len(call: CallOf<E::Config>) -> u32 {
+		let uxt: <<E::Config as SysConfig>::Block as BlockT>::Extrinsic =
+			UncheckedExtrinsic::new_bare(call).into();
+		u32::try_from(uxt.encoded_size()).unwrap_or(u32::MAX)
+	}
+}
+
+/// 仅把执行 Weight 换成资源 gas，不读取金额、费率或费用乘数。
+pub fn resource_weight_to_gas<T: Config>(weight: Weight) -> u64 {
+	use crate::weights::WeightInfo;
+	let unit = T::WeightInfo::evm_opcode(1)
+		.ref_time()
+		.saturating_sub(T::WeightInfo::evm_opcode(0).ref_time())
+		.max(1) as u128;
+	let max = T::BlockWeights::get().max_block;
+	let ref_gas = (weight.ref_time() as u128).div_ceil(unit);
+	let proof_gas = (weight.proof_size() as u128 * max.ref_time() as u128)
+		.div_ceil(max.proof_size().max(1) as u128)
+		.div_ceil(unit);
+	ref_gas.max(proof_gas).min(u64::MAX as u128) as u64
+}
+
+/// 由资源 gas 得到保守的双维 Weight 上限，存储证明也受区块预算约束。
+pub fn resource_gas_to_weight<T: Config>(gas: u64) -> Weight {
+	use crate::weights::WeightInfo;
+	let unit = T::WeightInfo::evm_opcode(1)
+		.ref_time()
+		.saturating_sub(T::WeightInfo::evm_opcode(0).ref_time())
+		.max(1) as u128;
+	let max = T::BlockWeights::get().max_block;
+	let time = (gas as u128 * unit).min(u64::MAX as u128);
+	let proof =
+		(time * max.proof_size() as u128 / max.ref_time().max(1) as u128).min(u64::MAX as u128);
+	Weight::from_parts(time as u64, proof as u64)
+}
+
 mod seal {
 	pub trait Sealed {}
 	impl<Address, Signature, E: super::EthExtra> Sealed for super::Info<Address, Signature, E> {}
+	impl<Address, Signature, E: super::EthExtra, F> Sealed
+		for super::NativeInfo<Address, Signature, E, F>
+	{
+	}
 	impl Sealed for () {}
 }
 

@@ -24,8 +24,8 @@ mod weight;
 mod tests;
 
 use crate::{
-	BalanceOf, Config, Error, ExecConfig, ExecOrigin as Origin, LOG_TARGET, StorageDeposit,
-	evm::fees::InfoT, exec::CallResources, storage::ContractInfo, vm::evm::Halt,
+	evm::fees::InfoT, exec::CallResources, storage::ContractInfo, vm::evm::Halt, BalanceOf, Config,
+	Error, ExecConfig, ExecOrigin as Origin, StorageDeposit, LOG_TARGET,
 };
 
 pub use gas::SignedGas;
@@ -36,6 +36,7 @@ use frame_support::{DebugNoBound, DefaultNoBound};
 use num_traits::Zero;
 
 use core::{fmt::Debug, marker::PhantomData, ops::ControlFlow};
+use sp_core::Get;
 use sp_runtime::{FixedPointNumber, Weight};
 use storage::{DepositOf, GenericMeter as GenericStorageMeter, Meter as RootStorageMeter};
 use weight::WeightMeter;
@@ -701,6 +702,13 @@ impl<T: Config> EthTxInfo<T> {
 		consumed_weight: &Weight,
 		consumed_deposit: &DepositOf<T>,
 	) -> SignedGas<T> {
+		if T::StrictNativeBalance::get() {
+			// 费用报价不参与资源消耗，也不因 ED 的扣回或退回改变 gas。
+			return SignedGas::from_weight(
+				&consumed_weight.saturating_add(self.extra_weight),
+				false,
+			);
+		}
 		let fixed_fee = T::FeeInfo::fixed_fee(self.encoded_len);
 		let deposit_and_fixed_fee =
 			consumed_deposit.saturating_add(&DepositOf::<T>::Charge(fixed_fee));
@@ -723,6 +731,11 @@ impl<T: Config> EthTxInfo<T> {
 		total_weight_consumption: &Weight,
 		total_deposit_consumption: &DepositOf<T>,
 	) -> Option<Weight> {
+		if T::StrictNativeBalance::get() {
+			let gas: u64 = max_total_gas.to_ethereum_gas()?.try_into().ok()?;
+			return crate::evm::fees::resource_gas_to_weight::<T>(gas)
+				.checked_sub(&total_weight_consumption.saturating_add(self.extra_weight));
+		}
 		let fixed_fee = T::FeeInfo::fixed_fee(self.encoded_len);
 		let deposit_and_fixed_fee =
 			total_deposit_consumption.saturating_add(&DepositOf::<T>::Charge(fixed_fee));

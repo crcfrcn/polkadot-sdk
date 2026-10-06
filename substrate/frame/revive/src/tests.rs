@@ -26,9 +26,7 @@ mod stipends;
 use std::collections::HashMap;
 
 use crate::{
-	self as pallet_revive, AccountId32Mapper, AddressMapper, BalanceOf, BalanceWithDust, Call,
-	CodeInfoOf, Config, DelegateInfo, ExecOrigin as Origin, ExecReturnValue, GenesisConfig,
-	OriginFor, Pallet, PristineCode,
+	self as pallet_revive,
 	deposit_payment::PGasDeposit,
 	evm::{
 		fees::{BlockRatioFee, Info as FeeInfo},
@@ -37,25 +35,29 @@ use crate::{
 	genesis::{Account, ContractData},
 	mock::MockHandler,
 	test_utils::*,
+	AccountId32Mapper, AddressMapper, BalanceOf, BalanceWithDust, Call, CodeInfoOf, Config,
+	DelegateInfo, ExecOrigin as Origin, ExecReturnValue, GenesisConfig, OriginFor, Pallet,
+	PristineCode,
 };
 use frame_support::{
-	DefaultNoBound, assert_ok, derive_impl,
+	assert_ok, derive_impl,
 	pallet_prelude::EnsureOrigin,
 	parameter_types,
 	traits::{
-		AsEnsureOriginWithArg, ConstU32, ConstU128, FindAuthor, OriginTrait, StorageVersion,
-		tokens::imbalance::ResolveTo,
+		tokens::imbalance::ResolveTo, AsEnsureOriginWithArg, ConstU128, ConstU32, FindAuthor,
+		OriginTrait, StorageVersion,
 	},
-	weights::{FixedFee, Weight, constants::WEIGHT_REF_TIME_PER_SECOND},
+	weights::{constants::WEIGHT_REF_TIME_PER_SECOND, FixedFee, Weight},
+	DefaultNoBound,
 };
 use pallet_revive_fixtures::compile_module;
 use pallet_transaction_payment::{ChargeTransactionPayment, ConstFeeMultiplier, Multiplier};
 use sp_core::{H160, U256};
-use sp_keystore::{KeystoreExt, testing::MemoryKeystore};
+use sp_keystore::{testing::MemoryKeystore, KeystoreExt};
 use sp_runtime::{
-	AccountId32, BuildStorage, FixedU128, MultiAddress, MultiSignature, Perbill, Storage,
 	generic::Header,
 	traits::{BlakeTwo256, Convert, IdentityLookup, One},
+	AccountId32, BuildStorage, FixedU128, MultiAddress, MultiSignature, Perbill, Storage,
 };
 
 pub type Address = MultiAddress<AccountId32, u32>;
@@ -124,8 +126,8 @@ pub mod test_utils {
 		Test,
 	};
 	use crate::{
-		AccountInfo, AccountInfoOf, BalanceOf, CodeInfo, CodeInfoOf, Config, ContractInfo,
-		PristineCode, address::AddressMapper, exec::AccountIdOf,
+		address::AddressMapper, exec::AccountIdOf, AccountInfo, AccountInfoOf, BalanceOf, CodeInfo,
+		CodeInfoOf, Config, ContractInfo, PristineCode,
 	};
 	use codec::{Encode, MaxEncodedLen};
 	use frame_support::traits::fungible::{InspectHold, Mutate};
@@ -187,8 +189,8 @@ pub mod test_utils {
 		let code_info_len = CodeInfo::<Test>::max_encoded_len() as u128;
 		// Calculate deposit to be reserved.
 		// We add 2 storage items: one for code, other for code_info
-		DepositPerByte::get().saturating_mul(code_len as u128 + code_info_len) +
-			DepositPerItem::get().saturating_mul(2)
+		DepositPerByte::get().saturating_mul(code_len as u128 + code_info_len)
+			+ DepositPerItem::get().saturating_mul(2)
 	}
 	pub fn ensure_stored(code_hash: sp_core::H256) -> usize {
 		// Assert that code_info is stored
@@ -224,9 +226,9 @@ pub mod test_utils {
 pub(crate) mod builder {
 	use super::Test;
 	use crate::{
-		Code,
-		test_utils::{ALICE, builder::*},
+		test_utils::{builder::*, ALICE},
 		tests::RuntimeOrigin,
+		Code,
 	};
 	use sp_core::{H160, H256};
 
@@ -468,8 +470,8 @@ impl SetWeightLimit for RuntimeCall {
 	fn set_weight_limit(&mut self, new_weight_limit: Weight) -> Weight {
 		match self {
 			Self::Contracts(
-				Call::eth_call { weight_limit, .. } |
-				Call::eth_instantiate_with_code { weight_limit, .. },
+				Call::eth_call { weight_limit, .. }
+				| Call::eth_instantiate_with_code { weight_limit, .. },
 			) => {
 				let old = *weight_limit;
 				*weight_limit = new_weight_limit;
@@ -651,7 +653,11 @@ impl<T: crate::pallet::Config> MockHandler<T> for MockHandlerImpl<T> {
 	}
 
 	fn mocked_code(&self, address: H160) -> Option<&[u8]> {
-		if self.mock_call.contains_key(&address) { Some(&MOCK_CODE) } else { None }
+		if self.mock_call.contains_key(&address) {
+			Some(&MOCK_CODE)
+		} else {
+			None
+		}
 	}
 }
 
@@ -734,6 +740,697 @@ fn ext_builder_with_genesis_config_works() {
 	});
 }
 
+/// 费用适配集成夹具：费用由独立 Runtime 路由决定，框架 Weight 费用为零、信用 hold 为 ()。
+/// 37 只是此 SDK 测试的任意费用，不定义任何产品的收费制度。
+mod native_fees {
+	use super::*;
+	use crate::evm::runtime::EthExtra;
+	use crate::{
+		evm::fees::{InfoT, NativeFee, NativeInfo},
+		ExecConfig, TransactionLimits,
+	};
+	use codec::{Decode, Encode};
+	use frame_support::{
+		dispatch::{DispatchInfo, GetDispatchInfo, PostDispatchInfo},
+		traits::{
+			fungible::{Balanced, Credit, Inspect, Mutate},
+			tokens::{Fortitude, Precision, Preservation},
+			ConstBool, ConstU64,
+		},
+	};
+	use pallet_transaction_payment::{OnChargeTransaction, TxCreditHold};
+	use sp_core::Get;
+	use sp_runtime::{
+		traits::{Checkable, DispatchTransaction, Dispatchable, TransactionExtension},
+		transaction_validity::{InvalidTransaction, TransactionValidityError},
+	};
+
+	const FEE: u128 = 37;
+	type Extra = (
+		frame_system::CheckNonce<NativeTest>,
+		ChargeTransactionPayment<NativeTest>,
+		crate::evm::tx_extension::SetOrigin<NativeTest>,
+	);
+	type Uxt = crate::evm::runtime::UncheckedExtrinsic<Address, Signature, NativeExtra>;
+	type NativeBlock = sp_runtime::generic::Block<Header<u64, BlakeTwo256>, Uxt>;
+
+	#[derive(Clone, PartialEq, Eq, Debug)]
+	pub struct NativeExtra;
+	impl EthExtra for NativeExtra {
+		type Config = NativeTest;
+		type ExtensionV0 = Extra;
+		type ExtensionOtherVersions = sp_runtime::traits::InvalidVersion;
+		fn get_eth_extension(nonce: u32, tip: u128) -> Extra {
+			(
+				frame_system::CheckNonce::from(nonce),
+				ChargeTransactionPayment::from(tip),
+				crate::evm::tx_extension::SetOrigin::new_from_eth_transaction(),
+			)
+		}
+	}
+	frame_support::construct_runtime!(
+		pub enum NativeTest {
+			System: frame_system,
+			Balances: pallet_balances,
+			Contracts: crate,
+			TransactionPayment: pallet_transaction_payment,
+		}
+	);
+	#[derive_impl(frame_system::config_preludes::TestDefaultConfig)]
+	impl frame_system::Config for NativeTest {
+		type Block = NativeBlock;
+		type AccountId = AccountId32;
+		type Lookup = sp_runtime::traits::AccountIdLookup<Self::AccountId, u32>;
+		type AccountData = pallet_balances::AccountData<u128>;
+		type BlockWeights = super::BlockWeights;
+	}
+	#[derive_impl(pallet_balances::config_preludes::TestDefaultConfig)]
+	impl pallet_balances::Config for NativeTest {
+		type Balance = u128;
+		type ExistentialDeposit = ConstU128<111>;
+		type AccountStore = System;
+		type RuntimeHoldReason = RuntimeHoldReason;
+		type RuntimeFreezeReason = RuntimeFreezeReason;
+		type MaxFreezes = frame_support::traits::VariantCountOf<RuntimeFreezeReason>;
+	}
+	#[derive_impl(pallet_transaction_payment::config_preludes::TestDefaultConfig)]
+	impl pallet_transaction_payment::Config for NativeTest {
+		type OnChargeTransaction = NativeCharge;
+		type WeightToFee = FixedFee<0, u128>;
+		type LengthToFee = FixedFee<0, u128>;
+	}
+	#[derive_impl(crate::config_preludes::TestDefaultConfig)]
+	impl Config for NativeTest {
+		type Balance = u128;
+		type Currency = Balances;
+		type AddressMapper = AccountId32Mapper<Self>;
+		type NativeToEthRatio = ConstU64<{ native_monetary::SCALE }>;
+		type StrictNativeBalance = ConstBool<true>;
+		type ChainId = ConstU64<2027>;
+		type Deposit = ();
+		type FeeInfo = NativeInfo<Address, Signature, NativeExtra, NativePolicy>;
+		type DepositPerItem = ConstU128<0>;
+		type DepositPerByte = ConstU128<0>;
+		type DepositPerChildTrieItem = ConstU128<0>;
+		type UploadOrigin = frame_system::EnsureSigned<AccountId32>;
+		type InstantiateOrigin = frame_system::EnsureSigned<AccountId32>;
+	}
+	impl SetWeightLimit for RuntimeCall {
+		fn set_weight_limit(&mut self, new: Weight) -> Weight {
+			match self {
+				Self::Contracts(
+					crate::Call::eth_call { weight_limit, .. }
+					| crate::Call::eth_instantiate_with_code { weight_limit, .. },
+				) => core::mem::replace(weight_limit, new),
+				_ => Weight::zero(),
+			}
+		}
+	}
+	/// 故意使用与签名者不同的付款账户，验证 SDK 没有重新指定付款人。
+	pub struct NativePolicy;
+	impl NativeFee<NativeTest> for NativePolicy {
+		type Charger = NativeCharge;
+		fn quote(_: &AccountId32, call: &RuntimeCall) -> Result<u128, InvalidTransaction> {
+			match call {
+				RuntimeCall::Contracts(
+					crate::Call::eth_call { .. } | crate::Call::eth_instantiate_with_code { .. },
+				) => Ok(FEE),
+				_ => Err(InvalidTransaction::Call),
+			}
+		}
+		fn validate(who: &AccountId32, call: &RuntimeCall) -> Result<(), InvalidTransaction> {
+			let amount = Self::quote(who, call)?;
+			if Balances::reducible_balance(&BOB, Preservation::Preserve, Fortitude::Polite) < amount
+			{
+				return Err(InvalidTransaction::Payment);
+			}
+			Ok(())
+		}
+	}
+	pub struct NativeCharge;
+	impl TxCreditHold<NativeTest> for NativeCharge {
+		type Credit = ();
+	}
+	impl OnChargeTransaction<NativeTest> for NativeCharge {
+		type Balance = u128;
+		type LiquidityInfo = Option<Credit<AccountId32, Balances>>;
+		fn withdraw_fee(
+			who: &AccountId32,
+			call: &RuntimeCall,
+			_: &DispatchInfo,
+			_: u128,
+			tip: u128,
+		) -> Result<Self::LiquidityInfo, TransactionValidityError> {
+			if tip != 0 {
+				return Err(InvalidTransaction::Payment.into());
+			}
+			let amount = NativePolicy::quote(who, call)?;
+			let credit = Balances::withdraw(
+				&BOB,
+				amount,
+				Precision::Exact,
+				Preservation::Preserve,
+				Fortitude::Polite,
+			)
+			.map_err(|_| InvalidTransaction::Payment)?;
+			Ok(Some(credit))
+		}
+		fn can_withdraw_fee(
+			who: &AccountId32,
+			call: &RuntimeCall,
+			_: &DispatchInfo,
+			_: u128,
+			tip: u128,
+		) -> Result<(), TransactionValidityError> {
+			if tip != 0 {
+				return Err(InvalidTransaction::Payment.into());
+			}
+			NativePolicy::validate(who, call).map_err(Into::into)
+		}
+		fn correct_and_deposit_fee(
+			_: &AccountId32,
+			_: &DispatchInfo,
+			_: &PostDispatchInfo,
+			_: u128,
+			_: u128,
+			credit: Self::LiquidityInfo,
+		) -> Result<(), TransactionValidityError> {
+			// 任意执行结果均保留既有已扣费用，不能以 corrected fee=0 退回。
+			drop(credit);
+			Ok(())
+		}
+		#[cfg(feature = "runtime-benchmarks")]
+		fn endow_account(who: &AccountId32, amount: u128) {
+			Balances::set_balance(who, amount);
+		}
+		#[cfg(feature = "runtime-benchmarks")]
+		fn minimum_balance() -> u128 {
+			111
+		}
+	}
+	fn ext() -> sp_io::TestExternalities {
+		let mut ext = sp_io::TestExternalities::new(
+			frame_system::GenesisConfig::<NativeTest>::default().build_storage().unwrap(),
+		);
+		ext.execute_with(|| {
+			System::set_block_number(1);
+			Balances::set_balance(&crate::evm::Account::default().substrate_account(), 1_000_000);
+			Balances::set_balance(&BOB, 10_000);
+			Balances::set_balance(&Contracts::account_id(), 111);
+		});
+		ext
+	}
+	fn tx(dest: Option<H160>, input: Vec<u8>, gas: u64) -> crate::GenericTransaction {
+		crate::GenericTransaction {
+			from: Some(crate::evm::Account::default().address()),
+			to: dest,
+			input: crate::evm::Bytes(input).into(),
+			chain_id: Some(<<NativeTest as Config>::ChainId as Get<u64>>::get().into()),
+			gas: Some(gas.into()),
+			gas_price: Some(U256::from(native_monetary::SCALE)),
+			nonce: Some(0.into()),
+			r#type: Some(crate::evm::TYPE_LEGACY.into()),
+			..Default::default()
+		}
+	}
+	fn checked(
+		tx: crate::GenericTransaction,
+	) -> sp_runtime::generic::CheckedExtrinsic<AccountId32, RuntimeCall, Extra> {
+		let signed =
+			crate::evm::Account::default().sign_transaction(tx.try_into_unsigned().unwrap());
+		checked_payload(signed.signed_payload()).unwrap()
+	}
+	/// 使用生产UncheckedExtrinsic包装器核验真实RLP签名，不直接跳到转换助手。
+	fn checked_payload(
+		payload: Vec<u8>,
+	) -> Result<
+		sp_runtime::generic::CheckedExtrinsic<AccountId32, RuntimeCall, Extra>,
+		TransactionValidityError,
+	> {
+		let unsigned: Uxt = sp_runtime::generic::UncheckedExtrinsic::new_bare(
+			RuntimeCall::Contracts(crate::Call::eth_transact { payload }),
+		)
+		.into();
+		unsigned.check(&frame_system::ChainContext::<NativeTest>::default())
+	}
+	fn execute(mut tx: crate::GenericTransaction) -> sp_runtime::DispatchResult {
+		tx.nonce =
+			Some(System::account_nonce(crate::evm::Account::default().substrate_account()).into());
+		let checked = checked(tx);
+		let sp_runtime::generic::ExtrinsicFormat::Signed(who, extra) = checked.format else {
+			panic!("signed");
+		};
+		let call = checked.function;
+		let info = call.get_dispatch_info();
+		let len = match &call {
+			RuntimeCall::Contracts(
+				crate::Call::eth_call { encoded_len, .. }
+				| crate::Call::eth_instantiate_with_code { encoded_len, .. },
+			) => *encoded_len as usize,
+			_ => panic!("Ethereum call"),
+		};
+		// 真实交易扩展先扣一次，随后真实 REVM 执行，再运行扩展的 post_dispatch。
+		let (pre, origin) = extra
+			.validate_and_prepare(RuntimeOrigin::signed(who), &call, &info, len, 0)
+			.unwrap();
+		let result = call.dispatch(origin);
+		let mut post = match &result {
+			Ok(info) => *info,
+			Err(err) => err.post_info,
+		};
+		let outcome = result.map(|_| ()).map_err(|err| err.error);
+		Extra::post_dispatch(pre, &info, &mut post, len, &outcome).unwrap();
+		outcome
+	}
+	/// 验签和报价不写状态；gas 与框架报价都不能改变 Runtime 指定费用或付款者。
+	#[test]
+	fn checking_is_read_only_and_quote_is_independent_of_resource_budget() {
+		ext().execute_with(|| {
+			<NativeTest as Config>::FeeInfo::integrity_test();
+			let before = sp_io::storage::root(sp_runtime::StateVersion::V1);
+			for gas in [5_000_000, 10_000_000] {
+				let generic = tx(Some(H160::repeat_byte(9)), vec![], gas);
+				let info = generic
+					.clone()
+					.into_call::<NativeTest>(crate::evm::CreateCallMode::ExtrinsicExecution(
+						1024,
+						vec![],
+					))
+					.unwrap();
+				assert_eq!(info.tx_fee, FEE);
+				assert_eq!(info.storage_deposit, 0);
+				assert!(ExecConfig::<NativeTest>::new_eth_tx(U256::one(), 1024, Weight::zero())
+					.collect_deposit_from_hold
+					.is_none());
+				let _ = checked(generic);
+				assert_eq!(sp_io::storage::root(sp_runtime::StateVersion::V1), before);
+			}
+		});
+	}
+	/// 正常调用真实扣一次，确切付款者为 BOB；收据与 post_dispatch 不再补扣或退款。
+	#[test]
+	fn actual_execution_charges_existing_payer_once() {
+		ext().execute_with(|| {
+			let signer = crate::evm::Account::default().substrate_account();
+			let before = Balances::balance(&signer);
+			execute(tx(Some(H160::repeat_byte(9)), vec![], 10_000_000)).unwrap();
+			assert_eq!(Balances::balance(&BOB), 10_000 - FEE);
+			assert_eq!(Balances::balance(&signer), before);
+		});
+	}
+	/// 模拟使用相同收费器，余额、发行量、nonce、事件和全部存储最后都回滚。
+	#[test]
+	fn simulation_has_no_persistent_state_or_issuance_change() {
+		ext().execute_with(|| {
+			let before = sp_io::storage::root(sp_runtime::StateVersion::V1);
+			let result = Contracts::dry_run_eth_transact(
+				tx(Some(H160::repeat_byte(9)), vec![], 10_000_000),
+				crate::evm::DryRunConfig {
+					perform_balance_checks: Some(true),
+					..Default::default()
+				},
+			);
+			assert!(result.is_ok(), "{result:?}");
+			assert_eq!(sp_io::storage::root(sp_runtime::StateVersion::V1), before);
+		});
+	}
+	/// 资源换算同时限制时间和证明大小，极小预算不能进入执行。
+	#[test]
+	fn resource_conversion_limits_both_weight_dimensions_without_changing_fee() {
+		ext().execute_with(|| {
+			use crate::evm::fees::{resource_gas_to_weight, resource_weight_to_gas};
+			assert_eq!(resource_weight_to_gas::<NativeTest>(Weight::zero()), 0);
+			for gas in [1, 100, 1_000_000, u64::MAX] {
+				let weight = resource_gas_to_weight::<NativeTest>(gas);
+				assert!(resource_weight_to_gas::<NativeTest>(weight) <= gas);
+			}
+			assert!(resource_weight_to_gas::<NativeTest>(Weight::from_parts(0, 1)) > 0);
+			let mut generic = tx(Some(H160::repeat_byte(9)), vec![], 10_000_000);
+			generic.gas = Some(1.into());
+			assert!(generic
+				.into_call::<NativeTest>(crate::evm::CreateCallMode::ExtrinsicExecution(
+					1024,
+					vec![]
+				))
+				.is_err());
+		});
+	}
+
+	/// 钱包上限不足、金额精度非法、资源超界、付款余额不足及未分类业务均拒绝。
+	#[test]
+	fn invalid_payment_amount_resource_and_native_business_are_rejected() {
+		ext().execute_with(|| {
+			let mode = crate::evm::CreateCallMode::ExtrinsicExecution(1024, vec![]);
+			let mut generic = tx(Some(H160::repeat_byte(9)), vec![], 10_000_000);
+			generic.gas_price = Some(U256::one());
+			assert!(generic.into_call::<NativeTest>(mode.clone()).is_err());
+			let mut generic = tx(Some(H160::repeat_byte(9)), vec![], 10_000_000);
+			generic.value = Some(U256::one());
+			assert!(generic.into_call::<NativeTest>(mode.clone()).is_err());
+			let mut generic = tx(Some(H160::repeat_byte(9)), vec![], 10_000_000);
+			generic.gas = Some(U256::MAX);
+			assert!(generic.into_call::<NativeTest>(mode.clone()).is_err());
+			let generic = tx(
+				Some(crate::RUNTIME_PALLETS_ADDR),
+				RuntimeCall::System(frame_system::Call::remark { remark: vec![] }).encode(),
+				10_000_000,
+			);
+			assert!(generic.into_call::<NativeTest>(mode).is_err());
+			Balances::set_balance(&BOB, 111);
+			let generic = tx(Some(H160::repeat_byte(9)), vec![], 10_000_000);
+			let signed = crate::evm::Account::default()
+				.sign_transaction(generic.try_into_unsigned().unwrap());
+			let before = sp_io::storage::root(sp_runtime::StateVersion::V1);
+			assert!(
+				NativeExtra::try_into_checked_extrinsic(&signed.signed_payload(), 1024).is_err()
+			);
+			assert_eq!(sp_io::storage::root(sp_runtime::StateVersion::V1), before);
+		});
+	}
+	/// Ethereum地址直接进入原32字节账本；查询不创建映射、账户或余额。
+	#[test]
+	fn ethereum_account_mapping_is_stateless_and_does_not_take_native_control() {
+		ext().execute_with(|| {
+			let before = sp_io::storage::root(sp_runtime::StateVersion::V1);
+			let address = H160::repeat_byte(0x2a);
+			let account = AccountId32Mapper::<NativeTest>::to_fallback_account_id(&address);
+			let bytes: &[u8; 32] = account.as_ref();
+			assert_eq!(&bytes[..20], address.as_bytes());
+			assert_eq!(&bytes[20..], &[0xee; 12]);
+			assert_eq!(AccountId32Mapper::<NativeTest>::to_address(&account), address);
+			assert_eq!(AccountId32Mapper::<NativeTest>::to_account_id(&address), account);
+			assert!(AccountId32Mapper::<NativeTest>::is_mapped(&account));
+			assert_eq!(Balances::balance(&account), 0);
+			assert!(crate::OriginalAccount::<NativeTest>::get(address).is_none());
+			let native_account = AccountId32::new([0x42; 32]);
+			let native_address = AccountId32Mapper::<NativeTest>::to_address(&native_account);
+			assert_ne!(
+				AccountId32Mapper::<NativeTest>::to_fallback_account_id(&native_address),
+				native_account
+			);
+			assert_eq!(sp_io::storage::root(sp_runtime::StateVersion::V1), before);
+		});
+	}
+
+	/// 三类真实签名均经生产包装器和交易扩展执行，不能用自报from接管账户。
+	#[test]
+	fn signed_transaction_types_use_recovered_sender_shared_nonce_and_one_fee() {
+		ext().execute_with(|| {
+			let signer = crate::evm::Account::default().substrate_account();
+			let dest = H160::repeat_byte(9);
+			let recipient = AccountId32Mapper::<NativeTest>::to_fallback_account_id(&dest);
+			Balances::set_balance(&recipient, 111);
+			for (nonce, kind) in
+				[crate::evm::TYPE_LEGACY, crate::evm::TYPE_EIP2930, crate::evm::TYPE_EIP1559]
+					.into_iter()
+					.enumerate()
+			{
+				let mut generic = tx(Some(dest), vec![], 10_000_000);
+				generic.r#type = Some(kind.into());
+				generic.max_fee_per_gas = Some(native_monetary::SCALE.into());
+				generic.max_priority_fee_per_gas = Some(U256::zero());
+				generic.value = Some(native_monetary::SCALE.into());
+				generic.from = Some(AccountId32Mapper::<NativeTest>::to_address(&BOB));
+				generic.nonce = Some((nonce as u32).into());
+				let before = sp_io::storage::root(sp_runtime::StateVersion::V1);
+				let converted = checked(generic.clone());
+				let sp_runtime::generic::ExtrinsicFormat::Signed(who, _) = converted.format else {
+					panic!("signed")
+				};
+				assert_eq!(who, signer);
+				assert_eq!(sp_io::storage::root(sp_runtime::StateVersion::V1), before);
+				execute(generic).unwrap();
+				assert_eq!(System::account_nonce(&signer), nonce as u32 + 1);
+				assert_eq!(Balances::balance(&BOB), 10_000 - FEE * (nonce as u128 + 1));
+				assert_eq!(Balances::balance(&recipient), 111 + nonce as u128 + 1);
+				assert_eq!(Balances::balance(&signer), 1_000_000 - nonce as u128 - 1);
+			}
+		});
+	}
+
+	/// 错链、无链、nonce超界及未授权原生业务在核验阶段拒绝，全部状态保持不变。
+	#[test]
+	fn invalid_chain_nonce_and_native_dispatch_leave_state_unchanged() {
+		ext().execute_with(|| {
+			let before = sp_io::storage::root(sp_runtime::StateVersion::V1);
+			let base = tx(Some(H160::repeat_byte(9)), vec![], 10_000_000);
+			let mut invalid = vec![];
+			for chain_id in [None, Some(U256::from(1)), Some(U256::from(2028))] {
+				let mut generic = base.clone();
+				generic.chain_id = chain_id;
+				invalid.push(generic);
+			}
+			for nonce in [U256::from(u32::MAX), U256::from(u32::MAX) + U256::one()] {
+				let mut generic = base.clone();
+				generic.nonce = Some(nonce);
+				invalid.push(generic);
+			}
+			invalid.push(tx(
+				Some(crate::RUNTIME_PALLETS_ADDR),
+				RuntimeCall::System(frame_system::Call::remark { remark: vec![] }).encode(),
+				10_000_000,
+			));
+			for generic in invalid {
+				let signed = crate::evm::Account::default()
+					.sign_transaction(generic.try_into_unsigned().unwrap());
+				assert!(checked_payload(signed.signed_payload()).is_err());
+				assert_eq!(sp_io::storage::root(sp_runtime::StateVersion::V1), before);
+			}
+		});
+	}
+
+	/// 高s变形仍能恢复同一地址，但交易入口必须拒绝；ECDSA恢复语义不变。
+	#[test]
+	fn invalid_signatures_encoding_and_unsupported_types_are_rejected() {
+		ext().execute_with(|| {
+			let mut generic = tx(Some(H160::repeat_byte(9)), vec![], 10_000_000);
+			generic.r#type = Some(crate::evm::TYPE_EIP1559.into());
+			generic.max_fee_per_gas = Some(native_monetary::SCALE.into());
+			let unsigned = generic.clone().try_into_unsigned().unwrap();
+			let signed = crate::evm::Account::default().sign_transaction(unsigned.clone());
+			assert!(checked_payload(signed.signed_payload()).is_ok());
+			let before = sp_io::storage::root(sp_runtime::StateVersion::V1);
+			let signature = signed.raw_signature().unwrap();
+			let mut bad_r = signature;
+			bad_r[..32].fill(0);
+			let mut bad_s = signature;
+			bad_s[32..64].fill(0);
+			let mut bad_parity = signature;
+			bad_parity[64] = 2;
+			let mut high_s = signature;
+			let order =
+				U256([0xbfd25e8cd0364141, 0xbaaedce6af48a03b, 0xfffffffffffffffe, u64::MAX]);
+			(order - U256::from_big_endian(&signature[32..64]))
+				.write_as_big_endian(&mut high_s[32..64]);
+			high_s[64] ^= 1;
+			let malleated = unsigned.clone().with_signature(high_s);
+			assert_eq!(malleated.recover_eth_address(), signed.recover_eth_address());
+			for signature in [bad_r, bad_s, bad_parity, high_s] {
+				assert!(checked_payload(
+					unsigned.clone().with_signature(signature).signed_payload()
+				)
+				.is_err());
+			}
+			let mut trailing = signed.signed_payload();
+			trailing.push(0);
+			assert!(checked_payload(trailing).is_err());
+			let payload = signed.signed_payload();
+			let encoded = rlp::Rlp::new(&payload[1..]);
+			let mut noncanonical = rlp::RlpStream::new_list(encoded.item_count().unwrap());
+			for index in 0..encoded.item_count().unwrap() {
+				if index == 1 {
+					noncanonical.append_raw(&[0x82, 0, 0], 1);
+				} else {
+					noncanonical.append_raw(encoded.at(index).unwrap().as_raw(), 1);
+				}
+			}
+			let mut payload = vec![crate::evm::TYPE_EIP1559];
+			payload.extend_from_slice(&noncanonical.out());
+			assert!(checked_payload(payload).is_err());
+			for kind in [crate::evm::TYPE_EIP4844, crate::evm::TYPE_EIP7702] {
+				generic.r#type = Some(kind.into());
+				let signed = crate::evm::Account::default()
+					.sign_transaction(generic.clone().try_into_unsigned().unwrap());
+				assert!(checked_payload(signed.signed_payload()).is_err());
+			}
+			assert_eq!(sp_io::storage::root(sp_runtime::StateVersion::V1), before);
+		});
+	}
+
+	/// 已执行nonce不能再次付款或执行；未来nonce也不能提前prepare。
+	#[test]
+	fn replay_and_future_nonce_cannot_enter_prepare_or_charge_again() {
+		ext().execute_with(|| {
+			let generic = tx(Some(H160::repeat_byte(9)), vec![], 10_000_000);
+			let future = checked({
+				let mut tx = generic.clone();
+				tx.nonce = Some(1.into());
+				tx
+			});
+			let sp_runtime::generic::ExtrinsicFormat::Signed(who, extra) = future.format else {
+				panic!("signed")
+			};
+			let call = future.function;
+			let before = sp_io::storage::root(sp_runtime::StateVersion::V1);
+			assert!(extra
+				.validate_and_prepare(
+					RuntimeOrigin::signed(who),
+					&call,
+					&call.get_dispatch_info(),
+					1024,
+					0
+				)
+				.is_err());
+			assert_eq!(sp_io::storage::root(sp_runtime::StateVersion::V1), before);
+			execute(generic.clone()).unwrap();
+			let stale = checked(generic);
+			let sp_runtime::generic::ExtrinsicFormat::Signed(who, extra) = stale.format else {
+				panic!("signed")
+			};
+			let call = stale.function;
+			let before = sp_io::storage::root(sp_runtime::StateVersion::V1);
+			assert!(extra
+				.validate_and_prepare(
+					RuntimeOrigin::signed(who),
+					&call,
+					&call.get_dispatch_info(),
+					1024,
+					0
+				)
+				.is_err());
+			assert_eq!(sp_io::storage::root(sp_runtime::StateVersion::V1), before);
+			assert_eq!(Balances::balance(&BOB), 10_000 - FEE);
+		});
+	}
+
+	/// 官方来源扩展零字节编码；现有原生签名载荷和完整交易字节必须保持一致。
+	#[test]
+	fn native_signed_payload_and_extrinsic_encoding_are_preserved() {
+		use sp_core::Pair;
+		ext().execute_with(|| {
+			type OriginalExtra =
+				(frame_system::CheckNonce<NativeTest>, ChargeTransactionPayment<NativeTest>);
+			let pair = sp_core::sr25519::Pair::from_seed(&[19; 32]);
+			let account = AccountId32::new(pair.public().0);
+			let call = RuntimeCall::System(frame_system::Call::remark { remark: vec![7; 3] });
+			let original_extra: OriginalExtra =
+				(frame_system::CheckNonce::from(0), ChargeTransactionPayment::from(0));
+			let extra: Extra =
+				(original_extra.0.clone(), original_extra.1.clone(), Default::default());
+			let original_payload = sp_runtime::generic::SignedPayload::from_raw(
+				call.clone(),
+				original_extra.clone(),
+				((), ()),
+			);
+			let payload = sp_runtime::generic::SignedPayload::from_raw(
+				call.clone(),
+				extra.clone(),
+				((), (), ()),
+			);
+			assert_eq!(original_payload.encode(), payload.encode());
+			let original_signing_bytes = original_payload.using_encoded(|bytes| bytes.to_vec());
+			let signing_bytes = payload.using_encoded(|bytes| bytes.to_vec());
+			assert_eq!(original_signing_bytes, signing_bytes);
+			let signature = MultiSignature::Sr25519(pair.sign(&signing_bytes));
+			let original = sp_runtime::generic::UncheckedExtrinsic::<
+				Address,
+				RuntimeCall,
+				Signature,
+				OriginalExtra,
+			>::new_signed(
+				call.clone(),
+				MultiAddress::Id(account.clone()),
+				signature.clone(),
+				original_extra,
+			);
+			let wrapped: Uxt = sp_runtime::generic::UncheckedExtrinsic::new_signed(
+				call,
+				MultiAddress::Id(account.clone()),
+				signature,
+				extra,
+			)
+			.into();
+			assert_eq!(original.encode(), wrapped.encode());
+			let before = sp_io::storage::root(sp_runtime::StateVersion::V1);
+			let decoded = Uxt::decode(&mut &wrapped.encode()[..]).unwrap();
+			let checked =
+				decoded.check(&frame_system::ChainContext::<NativeTest>::default()).unwrap();
+			let sp_runtime::generic::ExtrinsicFormat::Signed(who, _) = checked.format else {
+				panic!("signed")
+			};
+			assert_eq!(who, account);
+			assert_eq!(sp_io::storage::root(sp_runtime::StateVersion::V1), before);
+		});
+	}
+
+	/// 来源标记由Runtime代码设置，编码后重解码不能伪造EthTransaction权限。
+	#[test]
+	fn ethereum_origin_marker_cannot_be_forged_by_encoding() {
+		ext().execute_with(|| {
+			type Marker = crate::evm::tx_extension::SetOrigin<NativeTest>;
+			let encoded = Marker::new_from_eth_transaction().encode();
+			assert!(encoded.is_empty());
+			let decoded = Marker::decode(&mut &encoded[..]).unwrap();
+			let call = checked(tx(Some(H160::repeat_byte(9)), vec![], 10_000_000)).function;
+			let before = sp_io::storage::root(sp_runtime::StateVersion::V1);
+			let (_, _, origin) = decoded
+				.validate(
+					RuntimeOrigin::signed(BOB),
+					&call,
+					&call.get_dispatch_info(),
+					1024,
+					(),
+					&sp_runtime::traits::TxBaseImplication(&call),
+					frame_support::pallet_prelude::TransactionSource::External,
+				)
+				.unwrap();
+			assert_eq!(frame_system::ensure_signed(origin.clone()).unwrap(), BOB);
+			assert!(call.dispatch(origin).is_err());
+			assert_eq!(sp_io::storage::root(sp_runtime::StateVersion::V1), before);
+		});
+	}
+
+	/// 真实合约 REVERT 与耗尽资源均回滚业务状态，交易费用仍只扣一次。
+	#[test]
+	fn revert_and_resource_exhaustion_keep_one_fee() {
+		for (runtime, expected_error) in [
+			(vec![0x60, 0, 0x60, 0, 0xfd], crate::Error::<NativeTest>::ContractReverted),
+			(vec![0x5b, 0x60, 0, 0x56], crate::Error::<NativeTest>::OutOfGas),
+		] {
+			let expected_error: sp_runtime::DispatchError = expected_error.into();
+			ext().execute_with(|| {
+				let signer = crate::evm::Account::default().substrate_account();
+				let init = native_monetary::initcode(&runtime);
+				let deployed = Contracts::bare_instantiate(
+					RuntimeOrigin::signed(signer.clone()),
+					U256::zero(),
+					TransactionLimits::WeightAndDeposit {
+						weight_limit: Weight::from_parts(1_000_000_000_000, 10_000_000),
+						deposit_limit: 100_000,
+					},
+					crate::Code::Upload(init),
+					vec![],
+					Some([3; 32]),
+					&ExecConfig::new_substrate_tx(),
+				);
+				let dest = deployed.result.unwrap().addr;
+				let before = Balances::balance(&signer);
+				let mut generic = tx(Some(dest), vec![], 1_000_000);
+				generic.value = Some(native_monetary::SCALE.into());
+				// Ethereum外层保留成功以写收据，合约失败以确切事件记录；value必须回滚。
+				execute(generic).unwrap();
+				assert_eq!(Balances::balance(&BOB), 10_000 - FEE);
+				assert_eq!(Balances::balance(&signer), before);
+				assert!(System::events().iter().any(|event| matches!(
+					event.event,
+					RuntimeEvent::Contracts(crate::Event::EthExtrinsicRevert { dispatch_error })
+						if dispatch_error == expected_error
+				)));
+			});
+		}
+	}
+}
+
 /// 与上游 dust/PGAS 夹具隔离的 u128 整单位 Runtime；只测试金额，Ethereum 收费入口关闭。
 mod native_monetary {
 	use crate::{
@@ -743,9 +1440,9 @@ mod native_monetary {
 	use frame_support::{
 		assert_noop, assert_ok, derive_impl,
 		traits::{
-			ConstBool, ConstU64, ConstU128,
 			fungible::{Inspect, Mutate},
 			tokens::Preservation,
+			ConstBool, ConstU128, ConstU64,
 		},
 		weights::Weight,
 	};
@@ -1008,12 +1705,11 @@ mod native_monetary {
 				.into_iter()
 				.collect(),
 			);
-			assert!(
-				crate::state_overrides::with_state_overrides::<NativeTest, _>(override_set, || Ok(
-					()
-				))
-				.is_err()
-			);
+			assert!(crate::state_overrides::with_state_overrides::<NativeTest, _>(
+				override_set,
+				|| Ok(())
+			)
+			.is_err());
 			assert_eq!(root(), before);
 		});
 	}
@@ -1023,11 +1719,9 @@ mod native_monetary {
 	fn ethereum_execution_fails_closed_without_native_fee_adapter() {
 		externalities().execute_with(|| {
 			let before = root();
-			assert!(
-				crate::evm::GenericTransaction::default()
-					.into_call::<NativeTest>(crate::evm::CreateCallMode::DryRun)
-					.is_err()
-			);
+			assert!(crate::evm::GenericTransaction::default()
+				.into_call::<NativeTest>(crate::evm::CreateCallMode::DryRun)
+				.is_err());
 			let result = Contracts::eth_call(
 				crate::Origin::<NativeTest>::EthTransaction(super::ALICE).into(),
 				address(&super::BOB),

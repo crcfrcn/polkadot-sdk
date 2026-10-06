@@ -16,33 +16,33 @@
 // limitations under the License.
 //! Runtime types for integrating `pallet-revive` with the EVM.
 use crate::{
-	AccountIdOf, AddressMapper, BalanceOf, CallOf, Config, LOG_TARGET, Pallet, Zero,
 	evm::{
-		CreateCallMode,
 		api::{GenericTransaction, TransactionSigned},
 		fees::InfoT,
+		CreateCallMode,
 	},
+	AccountIdOf, AddressMapper, BalanceOf, CallOf, Config, Pallet, Zero, LOG_TARGET,
 };
 use codec::{Decode, DecodeWithMemTracking, Encode};
 use frame_support::{
 	dispatch::{DispatchInfo, GetDispatchInfo},
 	traits::{
-		InherentBuilder, IsSubType, SignedTransactionBuilder,
 		fungible::Balanced,
 		tokens::{Fortitude, Precision, Preservation},
+		InherentBuilder, IsSubType, SignedTransactionBuilder,
 	},
 };
 use pallet_transaction_payment::Config as TxConfig;
 use scale_info::{StaticTypeInfo, TypeInfo};
-use sp_core::U256;
+use sp_core::{Get, U256};
 use sp_runtime::{
-	Debug, OpaqueExtrinsic, Weight,
 	generic::{self, CheckedExtrinsic, ExtrinsicFormat},
 	traits::{
 		Checkable, ExtrinsicCall, ExtrinsicLike, ExtrinsicMetadata, LazyExtrinsic, Pipeline,
 		TransactionExtension,
 	},
 	transaction_validity::{InvalidTransaction, TransactionValidityError},
+	Debug, OpaqueExtrinsic, Weight,
 };
 
 /// Used to set the weight limit argument of a `eth_call` or `eth_instantiate_with_code` call.
@@ -170,14 +170,14 @@ where
 		E::ExtensionV0,
 		E::ExtensionOtherVersions,
 	>: Checkable<
-			Lookup,
-			Checked = CheckedExtrinsic<
-				AccountIdOf<E::Config>,
-				CallOf<E::Config>,
-				E::ExtensionV0,
-				E::ExtensionOtherVersions,
-			>,
+		Lookup,
+		Checked = CheckedExtrinsic<
+			AccountIdOf<E::Config>,
+			CallOf<E::Config>,
+			E::ExtensionV0,
+			E::ExtensionOtherVersions,
 		>,
+	>,
 {
 	type Checked = CheckedExtrinsic<
 		AccountIdOf<E::Config>,
@@ -358,9 +358,9 @@ pub trait EthExtra {
 
 		// Check transaction type and reject unsupported transaction types
 		match &tx {
-			crate::evm::api::TransactionSigned::Transaction1559Signed(_) |
-			crate::evm::api::TransactionSigned::Transaction2930Signed(_) |
-			crate::evm::api::TransactionSigned::TransactionLegacySigned(_) => {
+			crate::evm::api::TransactionSigned::Transaction1559Signed(_)
+			| crate::evm::api::TransactionSigned::Transaction2930Signed(_)
+			| crate::evm::api::TransactionSigned::TransactionLegacySigned(_) => {
 				// Supported transaction types, continue processing
 			},
 			crate::evm::api::TransactionSigned::Transaction7702Signed(_) => {
@@ -373,36 +373,81 @@ pub trait EthExtra {
 			},
 		}
 
+		if <Self::Config as Config>::StrictNativeBalance::get() {
+			// 已签交易必须使用唯一规范编码；解码器不能忽略尾随数据或非规范字段。
+			if tx.signed_payload() != payload {
+				return Err(InvalidTransaction::Call);
+			}
+			// Ethereum交易只接受合法r、低s及0/1恢复位；不改变ecrecover预编译语义。
+			const ORDER: U256 = U256([
+				0xbfd25e8cd0364141,
+				0xbaaedce6af48a03b,
+				0xfffffffffffffffe,
+				0xffffffffffffffff,
+			]);
+			const HALF_ORDER: U256 = U256([
+				0xdfe92f46681b20a0,
+				0x5d576e7357a4501d,
+				0xffffffffffffffff,
+				0x7fffffffffffffff,
+			]);
+			let signature = tx.raw_signature().map_err(|_| InvalidTransaction::BadProof)?;
+			let r = U256::from_big_endian(&signature[..32]);
+			let s = U256::from_big_endian(&signature[32..64]);
+			if r.is_zero() || r >= ORDER || s.is_zero() || s > HALF_ORDER || signature[64] > 1 {
+				return Err(InvalidTransaction::BadProof);
+			}
+		}
+
 		let signer_addr = tx.recover_eth_address().map_err(|err| {
 			log::debug!(target: LOG_TARGET, "Failed to recover signer: {err:?}");
 			InvalidTransaction::BadProof
 		})?;
 
 		let signer = <Self::Config as Config>::AddressMapper::to_fallback_account_id(&signer_addr);
-		let base_fee = <Pallet<Self::Config>>::evm_base_fee();
-		let tx = GenericTransaction::from_signed(tx, base_fee, None);
-		let nonce = tx.nonce.unwrap_or_default().try_into().map_err(|_| {
-			log::debug!(target: LOG_TARGET, "Failed to convert nonce");
-			InvalidTransaction::Call
-		})?;
+		// 原生路径保留签名中的金额上限，不能把展示用 base_fee 覆盖成授权上限。
+		let base_fee = if <Self::Config as Config>::StrictNativeBalance::get() {
+			U256::MAX
+		} else {
+			<Pallet<Self::Config>>::evm_base_fee()
+		};
+		// 原生报价只能使用已验签恢复的账户，不能信任交易自报付款者。
+		let tx = GenericTransaction::from_signed(tx, base_fee, Some(signer_addr));
+		let nonce: <Self::Config as frame_system::Config>::Nonce =
+			tx.nonce.unwrap_or_default().try_into().map_err(|_| {
+				log::debug!(target: LOG_TARGET, "Failed to convert nonce");
+				InvalidTransaction::Call
+			})?;
+		// CheckNonce上游在最大值会回绕到零；原生Ethereum入口先拒绝不可递增nonce。
+		if <Self::Config as Config>::StrictNativeBalance::get()
+			&& sp_runtime::traits::CheckedAdd::checked_add(&nonce, &sp_runtime::traits::One::one())
+				.is_none()
+		{
+			return Err(InvalidTransaction::ExhaustsResources);
+		}
 
 		log::debug!(target: LOG_TARGET, "Decoded Ethereum transaction with signer: {signer_addr:?} nonce: {nonce:?}");
 		log::trace!(target: LOG_TARGET, "Decoded Ethereum transaction was: {tx:?}");
 		let call_info = tx.into_call::<Self::Config>(CreateCallMode::ExtrinsicExecution(
-			encoded_len as u32,
+			u32::try_from(encoded_len).map_err(|_| InvalidTransaction::ExhaustsResources)?,
 			payload.to_vec(),
 		))?;
-		let storage_credit = <Self::Config as Config>::Currency::withdraw(
-			&signer,
-			call_info.storage_deposit,
-			Precision::Exact,
-			Preservation::Preserve,
-			Fortitude::Polite,
-		).map_err(|_| {
-			log::debug!(target: LOG_TARGET, "Not enough balance to hold additional storage deposit of {:?}", call_info.storage_deposit);
-			InvalidTransaction::Payment
-		})?;
-		<Self::Config as Config>::FeeInfo::deposit_txfee(storage_credit);
+		if <Self::Config as Config>::StrictNativeBalance::get() {
+			// 核验阶段只读，实际费用仍由 Runtime 现有交易扩展单次扣取。
+			<Self::Config as Config>::FeeInfo::native_validate(&signer, &call_info.call)?;
+		} else {
+			let storage_credit = <Self::Config as Config>::Currency::withdraw(
+				&signer,
+				call_info.storage_deposit,
+				Precision::Exact,
+				Preservation::Preserve,
+				Fortitude::Polite,
+			).map_err(|_| {
+				log::debug!(target: LOG_TARGET, "Not enough balance to hold additional storage deposit of {:?}", call_info.storage_deposit);
+				InvalidTransaction::Payment
+			})?;
+			<Self::Config as Config>::FeeInfo::deposit_txfee(storage_credit);
+		}
 
 		crate::tracing::if_tracing(|tracer| {
 			tracer.watch_address(&Pallet::<Self::Config>::block_author());
@@ -441,12 +486,12 @@ pub trait EthExtra {
 mod test {
 	use super::*;
 	use crate::{
-		EthTransactInfo, RUNTIME_PALLETS_ADDR, Weight,
 		evm::*,
 		test_utils::*,
 		tests::{
 			Address, ExtBuilder, RuntimeCall, RuntimeOrigin, SignedExtra, Test, UncheckedExtrinsic,
 		},
+		EthTransactInfo, Weight, RUNTIME_PALLETS_ADDR,
 	};
 	use frame_support::traits::fungible::Mutate;
 	use pallet_revive_fixtures::compile_module;
@@ -619,11 +664,11 @@ mod test {
 				effective_gas_price,
 				encoded_len,
 				..
-			}) if dest == tx.to.unwrap() &&
-				value == tx.value.unwrap_or_default().as_u64().into() &&
-				data == tx.input.to_vec() &&
-				transaction_encoded == signed_transaction.signed_payload() &&
-				effective_gas_price == expected_effective_gas_price =>
+			}) if dest == tx.to.unwrap()
+				&& value == tx.value.unwrap_or_default().as_u64().into()
+				&& data == tx.input.to_vec()
+				&& transaction_encoded == signed_transaction.signed_payload()
+				&& effective_gas_price == expected_effective_gas_price =>
 			{
 				assert_eq!(encoded_len, expected_encoded_len);
 				assert!(
@@ -659,11 +704,11 @@ mod test {
 				effective_gas_price,
 				encoded_len,
 				..
-			}) if value == expected_value &&
-				code == expected_code &&
-				data == expected_data &&
-				transaction_encoded == signed_transaction.signed_payload() &&
-				effective_gas_price == expected_effective_gas_price =>
+			}) if value == expected_value
+				&& code == expected_code
+				&& data == expected_data
+				&& transaction_encoded == signed_transaction.signed_payload()
+				&& effective_gas_price == expected_effective_gas_price =>
 			{
 				assert_eq!(encoded_len, expected_encoded_len);
 				assert!(

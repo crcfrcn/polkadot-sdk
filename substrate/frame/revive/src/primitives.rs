@@ -18,19 +18,19 @@
 //! A crate that hosts a common definitions that are relevant for the pallet-revive.
 
 use crate::{
-	BalanceOf, Config, H160, Time, U256, deposit_payment::Funds, evm::DryRunConfig,
-	mock::MockHandler, storage::WriteOutcome, transient_storage::TransientStorage,
+	deposit_payment::Funds, evm::DryRunConfig, mock::MockHandler, storage::WriteOutcome,
+	transient_storage::TransientStorage, BalanceOf, Config, Time, H160, U256,
 };
 use alloc::{boxed::Box, fmt::Debug, string::String, vec::Vec};
 use codec::{Decode, Encode, MaxEncodedLen};
 use core::cell::RefCell;
-use frame_support::{DefaultNoBound, traits::tokens::Balance, weights::Weight};
+use frame_support::{traits::tokens::Balance, weights::Weight, DefaultNoBound};
 use pallet_revive_uapi::ReturnFlags;
 use scale_info::TypeInfo;
 use sp_core::Get;
 use sp_runtime::{
-	DispatchError,
 	traits::{Saturating, Zero},
+	DispatchError,
 };
 
 /// Result type of a `bare_call` or `bare_instantiate` call as well as `ContractsApi::call` and
@@ -464,7 +464,14 @@ impl<T: Config> ExecConfig<T> {
 	pub fn new_eth_tx(effective_gas_price: U256, encoded_len: u32, base_weight: Weight) -> Self {
 		Self {
 			bump_nonce: false,
-			collect_deposit_from_hold: Some((encoded_len, base_weight)),
+			// 原生费用由交易扩展处理，不能挪用费用信用额支付存储或 ED。
+			collect_deposit_from_hold: if T::StrictNativeBalance::get()
+				&& <T::FeeInfo as crate::evm::fees::InfoT<T>>::native_fee_enabled()
+			{
+				None
+			} else {
+				Some((encoded_len, base_weight))
+			},
 			effective_gas_price: Some(effective_gas_price),
 			mock_handler: None,
 			is_dry_run: None,

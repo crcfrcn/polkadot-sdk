@@ -52,22 +52,21 @@ pub mod weights;
 
 use crate::{
 	evm::{
-		CallTracer, CreateCallMode, ExecutionTracer, GenericTransaction, PrestateTracer,
-		TYPE_EIP1559, Trace, Tracer, TracerType, block_hash::EthereumBlockBuilderIR, block_storage,
-		fees::InfoT as FeeInfo, runtime::SetWeightLimit,
+		block_hash::EthereumBlockBuilderIR, block_storage, fees::InfoT as FeeInfo,
+		runtime::SetWeightLimit, CallTracer, CreateCallMode, ExecutionTracer, GenericTransaction,
+		PrestateTracer, Trace, Tracer, TracerType, TYPE_EIP1559,
 	},
 	exec::{AccountIdOf, ExecError, ReentrancyProtection, Stack as ExecStack},
 	sp_runtime::TransactionOutcome,
 	storage::{AccountType, DeletionQueueManager},
 	tracing::if_tracing,
-	vm::{CodeInfo, RuntimeCosts, pvm::extract_code_and_data},
+	vm::{pvm::extract_code_and_data, CodeInfo, RuntimeCosts},
 	weightinfo_extension::OnFinalizeBlockParts,
 };
 use alloc::{boxed::Box, format, vec};
 use codec::{Codec, Decode, Encode};
 use environmental::*;
 use frame_support::{
-	BoundedVec,
 	dispatch::{
 		DispatchErrorWithPostInfo, DispatchResult, DispatchResultWithPostInfo, GetDispatchInfo,
 		Pays, PostDispatchInfo, RawOrigin,
@@ -76,33 +75,35 @@ use frame_support::{
 	pallet_prelude::DispatchClass,
 	storage::with_transaction,
 	traits::{
-		ConstU32, ConstU64, DefensiveResult, EnsureOrigin, Get, IsSubType, IsType, OnUnbalanced,
-		OriginTrait,
 		fungible::{Balanced, Credit, Inspect, Mutate, MutateHold},
 		tokens::Balance,
+		ConstU32, ConstU64, DefensiveResult, EnsureOrigin, Get, IsSubType, IsType, OnUnbalanced,
+		OriginTrait,
 	},
 	weights::WeightMeter,
+	BoundedVec,
 };
 use frame_system::{
-	Pallet as System, ensure_signed,
+	ensure_signed,
 	pallet_prelude::{BlockNumberFor, OriginFor},
+	Pallet as System,
 };
 use scale_info::TypeInfo;
 use sp_runtime::{
-	AccountId32, DispatchError, FixedPointNumber, FixedU128, SaturatedConversion,
 	traits::{
 		BadOrigin, Bounded, CheckedAdd, Convert, Dispatchable, Saturating, UniqueSaturatedFrom,
 		UniqueSaturatedInto, Zero,
 	},
+	AccountId32, DispatchError, FixedPointNumber, FixedU128, SaturatedConversion,
 };
 
 pub use crate::{
-	address::{AccountId32Mapper, AddressMapper, AutoMapper, TestAccountMapper, create1, create2},
+	address::{create1, create2, AccountId32Mapper, AddressMapper, AutoMapper, TestAccountMapper},
 	debug::DebugSettings,
 	deposit_payment::{Deposit, PGasDeposit},
 	evm::{
-		Address as EthAddress, Block as EthBlock, DryRunConfig, ReceiptInfo, TracingConfig,
-		block_hash::ReceiptGasInfo,
+		block_hash::ReceiptGasInfo, Address as EthAddress, Block as EthBlock, DryRunConfig,
+		ReceiptInfo, TracingConfig,
 	},
 	exec::{CallResources, DelegateInfo, Executable, Key, MomentOf, Origin as ExecOrigin},
 	limits::TRANSIENT_STORAGE_BYTES as TRANSIENT_STORAGE_LIMIT,
@@ -329,12 +330,13 @@ pub mod pallet {
 		#[pallet::constant]
 		type NativeToEthRatio: Get<u64>;
 
-		/// 原生整单位策略：禁止 dust、无来源 ED 和尚未适配制度费用的 Ethereum 执行。
+		/// 原生整单位策略：禁止 dust 和无来源 ED，Ethereum 执行必须绑定原生费用路由。
 		/// 此配置由 Runtime 类型固定，不能由交易、存储或治理临时切换。
 		#[pallet::constant]
 		type StrictNativeBalance: Get<bool>;
 
-		/// Set to [`crate::evm::fees::Info`] for a production runtime.
+		/// 生产接口按链制度选择：按资源收费使用 Info，现有原生制度使用 NativeInfo。
+		/// NativeInfo 的报价必须复用 Runtime 现有路由，实际收费器与交易扩展类型绑定。
 		///
 		/// For mock runtimes that do not need to interact with any eth compat functionality
 		/// the default value of `()` will suffice.
@@ -1221,8 +1223,8 @@ pub mod pallet {
 				&ExecConfig::new_substrate_tx(),
 			);
 
-			if let Ok(return_value) = &output.result &&
-				return_value.did_revert()
+			if let Ok(return_value) = &output.result
+				&& return_value.did_revert()
 			{
 				output.result = Err(<Error<T>>::ContractReverted.into());
 			}
@@ -1265,8 +1267,8 @@ pub mod pallet {
 				salt,
 				&ExecConfig::new_substrate_tx(),
 			);
-			if let Ok(retval) = &output.result &&
-				retval.result.did_revert()
+			if let Ok(retval) = &output.result
+				&& retval.result.did_revert()
 			{
 				output.result = Err(<Error<T>>::ContractReverted.into());
 			}
@@ -1333,8 +1335,8 @@ pub mod pallet {
 				salt,
 				&ExecConfig::new_substrate_tx(),
 			);
-			if let Ok(retval) = &output.result &&
-				retval.result.did_revert()
+			if let Ok(retval) = &output.result
+				&& retval.result.did_revert()
 			{
 				output.result = Err(<Error<T>>::ContractReverted.into());
 			}
@@ -1383,7 +1385,10 @@ pub mod pallet {
 			effective_gas_price: U256,
 			encoded_len: u32,
 		) -> DispatchResultWithPostInfo {
-			ensure!(!T::StrictNativeBalance::get(), Error::<T>::NativeFeeNotConfigured);
+			ensure!(
+				!T::StrictNativeBalance::get() || T::FeeInfo::native_fee_enabled(),
+				Error::<T>::NativeFeeNotConfigured
+			);
 			let signer = Self::ensure_eth_signed(origin)?;
 			let origin = OriginFor::<T>::signed(signer.clone());
 			Self::ensure_non_contract_if_signed(&origin)?;
@@ -1462,7 +1467,10 @@ pub mod pallet {
 			effective_gas_price: U256,
 			encoded_len: u32,
 		) -> DispatchResultWithPostInfo {
-			ensure!(!T::StrictNativeBalance::get(), Error::<T>::NativeFeeNotConfigured);
+			ensure!(
+				!T::StrictNativeBalance::get() || T::FeeInfo::native_fee_enabled(),
+				Error::<T>::NativeFeeNotConfigured
+			);
 			let signer = Self::ensure_eth_signed(origin)?;
 			let origin = OriginFor::<T>::signed(signer.clone());
 
@@ -2106,8 +2114,8 @@ impl<T: Config> Pallet<T> {
 					(gas_limit2, dry_run_result2)
 				}
 			},
-			[(gas_limit, Ok(dry_run_result)), (_, Err(_))] |
-			[(_, Err(_)), (gas_limit, Ok(dry_run_result))] => (gas_limit, dry_run_result),
+			[(gas_limit, Ok(dry_run_result)), (_, Err(_))]
+			| [(_, Err(_)), (gas_limit, Ok(dry_run_result))] => (gas_limit, dry_run_result),
 			[(_, Err(err)), (_, Err(..))] => return Err(err),
 		};
 		log::trace!(
@@ -2200,8 +2208,11 @@ impl<T: Config> Pallet<T> {
 		let signer_addr = signed_tx.recover_eth_address().map_err(|err| {
 			EthTransactError::Message(format!("Failed to recover signer: {err:?}"))
 		})?;
-		let tx =
-			GenericTransaction::from_signed(signed_tx, Self::evm_base_fee(), Some(signer_addr));
+		let tx = GenericTransaction::from_signed(
+			signed_tx,
+			if T::StrictNativeBalance::get() { U256::MAX } else { Self::evm_base_fee() },
+			Some(signer_addr),
+		);
 		let encoded_len = T::FeeInfo::encoded_len(
 			crate::Call::<T>::eth_transact { payload: transaction_encoded.clone() }.into(),
 		);
@@ -2230,7 +2241,7 @@ impl<T: Config> Pallet<T> {
 		T::Nonce: Into<U256> + TryFrom<U256>,
 		CallOf<T>: SetWeightLimit,
 	{
-		if T::StrictNativeBalance::get() {
+		if T::StrictNativeBalance::get() && !T::FeeInfo::native_fee_enabled() {
 			return Err(EthTransactError::Message("native fee adapter is not configured".into()));
 		}
 		with_transaction(|| {
@@ -2262,7 +2273,19 @@ impl<T: Config> Pallet<T> {
 		}
 
 		let base_fee = Self::evm_base_fee();
-		let effective_gas_price = tx.effective_gas_price(base_fee).unwrap_or(base_fee);
+		let effective_gas_price = if T::StrictNativeBalance::get() {
+			// 原生路径的价格字段只保留钱包授权上限，不代表单位资源收费。
+			let price = tx.max_fee_per_gas.or(tx.gas_price).unwrap_or_default();
+			if tx.max_fee_per_gas.is_none() {
+				tx.max_fee_per_gas = tx.gas_price;
+			}
+			if tx.from.is_none() {
+				tx.from = Some(H160::default());
+			}
+			price
+		} else {
+			tx.effective_gas_price(base_fee).unwrap_or(base_fee)
+		};
 
 		if effective_gas_price < base_fee {
 			Err(EthTransactError::Message(format!(
@@ -2282,7 +2305,7 @@ impl<T: Config> Pallet<T> {
 		// we don't support priority fee for now as the tipping system in pallet-transaction-payment
 		// works differently and the total tip needs to be known pre dispatch
 		tx.max_priority_fee_per_gas = Some(0.into());
-		if tx.max_fee_per_gas.is_none() {
+		if !T::StrictNativeBalance::get() && tx.max_fee_per_gas.is_none() {
 			tx.max_fee_per_gas = Some(effective_gas_price);
 		}
 
@@ -2318,7 +2341,16 @@ impl<T: Config> Pallet<T> {
 
 		// emulate transaction behavior
 		let fees = call_info.tx_fee.saturating_add(call_info.storage_deposit);
-		if let Some(from) = &from {
+		if T::StrictNativeBalance::get() {
+			// 模拟也复用真实付款入口，付款者可能与签名者不同；外层事务必定回滚。
+			if matches!(perform_balance_checks, Some(true)) {
+				T::FeeInfo::native_validate(&origin, &call_info.call)
+					.and_then(|_| T::FeeInfo::native_simulate_charge(&origin, &call_info.call))
+					.map_err(|err| {
+						EthTransactError::Message(format!("native payment rejected: {err:?}"))
+					})?;
+			}
+		} else if let Some(from) = &from {
 			let fees = if gas.is_some() && matches!(perform_balance_checks, Some(true)) {
 				fees
 			} else {
@@ -2334,7 +2366,9 @@ impl<T: Config> Pallet<T> {
 
 		// the deposit is done when the transaction is transformed from an `eth_transact`
 		// we emulate this behavior for the dry-run here
-		T::FeeInfo::deposit_txfee(T::Currency::issue(fees));
+		if !T::StrictNativeBalance::get() {
+			T::FeeInfo::deposit_txfee(T::Currency::issue(fees));
+		}
 
 		let extract_error = |err| {
 			if err == Error::<T>::StorageDepositNotEnoughFunds.into() {
@@ -2346,7 +2380,11 @@ impl<T: Config> Pallet<T> {
 
 		let transaction_limits = TransactionLimits::EthereumGas {
 			eth_gas_limit: call_info.eth_gas_limit.saturated_into(),
-			weight_limit: Self::evm_max_extrinsic_weight(),
+			weight_limit: if T::StrictNativeBalance::get() {
+				call_info.weight_limit
+			} else {
+				Self::evm_max_extrinsic_weight()
+			},
 			eth_tx_info: EthTxInfo::new(call_info.encoded_len, base_weight),
 		};
 
@@ -2470,6 +2508,16 @@ impl<T: Config> Pallet<T> {
 			)))?;
 		}
 
+		if T::StrictNativeBalance::get() {
+			// 估算只报告资源需求；费用已经由同一 Runtime 路由报价，不按实际执行量重算。
+			let info = T::FeeInfo::dispatch_info(&call_info.call);
+			let total = total_weight
+				.saturating_add(T::BlockWeights::get().get(info.class).base_extrinsic)
+				.saturating_add(Weight::from_parts(0, call_info.encoded_len as u64));
+			dry_run.eth_gas = evm::fees::resource_weight_to_gas::<T>(total).into();
+			return Ok(dry_run);
+		}
+
 		// not enough gas supplied to pay for both the tx fees and the storage deposit
 		let transaction_fee = T::FeeInfo::tx_fee(call_info.encoded_len, &call_info.call);
 		let available_fee = T::FeeInfo::remaining_txfee();
@@ -2532,7 +2580,11 @@ impl<T: Config> Pallet<T> {
 	pub fn eth_block_hash_from_number(number: U256) -> Option<H256> {
 		let number = BlockNumberFor::<T>::try_from(number).ok()?;
 		let hash = <BlockHash<T>>::get(number);
-		if hash == H256::zero() { None } else { Some(hash) }
+		if hash == H256::zero() {
+			None
+		} else {
+			Some(hash)
+		}
 	}
 
 	/// The details needed to reconstruct the receipt information offchain.
@@ -2599,6 +2651,9 @@ impl<T: Config> Pallet<T> {
 
 	/// Returns the maximum value of gas that can be represented in weights.
 	pub fn evm_max_extrinsic_weight_in_gas() -> U256 {
+		if T::StrictNativeBalance::get() {
+			return evm::fees::resource_weight_to_gas::<T>(Self::evm_max_extrinsic_weight()).into();
+		}
 		let max_extrinsic_fee = T::FeeInfo::weight_to_fee(&Self::evm_max_extrinsic_weight());
 		let gas_scale: BalanceOf<T> = T::GasScale::get().into();
 		(max_extrinsic_fee / gas_scale).into()
@@ -2619,6 +2674,10 @@ impl<T: Config> Pallet<T> {
 
 	/// Get the base gas price.
 	pub fn evm_base_fee() -> U256 {
+		// 原生费用按业务路由报价，没有按资源 gas 定价的 base_fee。
+		if T::StrictNativeBalance::get() {
+			return U256::zero();
+		}
 		let gas_scale = <T as Config>::GasScale::get();
 		let multiplier = T::FeeInfo::next_fee_multiplier();
 		multiplier
@@ -2966,8 +3025,8 @@ impl<T: Config> Pallet<T> {
 		else {
 			return Ok(());
 		};
-		if exec::is_precompile::<T, ContractBlob<T>>(&address) ||
-			<AccountInfo<T>>::is_contract(&address)
+		if exec::is_precompile::<T, ContractBlob<T>>(&address)
+			|| <AccountInfo<T>>::is_contract(&address)
 		{
 			log::debug!(
 				target: crate::LOG_TARGET,

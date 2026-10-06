@@ -18,20 +18,19 @@
 //! Functionality to decode an eth transaction into an dispatchable call.
 
 use crate::{
-	BalanceOf, CallOf, Config, GenericTransaction, LOG_TARGET, Pallet, RUNTIME_PALLETS_ADDR,
-	Weight, Zero,
 	evm::{
-		TYPE_LEGACY,
-		fees::{InfoT, compute_max_integer_quotient},
+		fees::{compute_max_integer_quotient, InfoT},
 		runtime::SetWeightLimit,
+		TYPE_LEGACY,
 	},
-	extract_code_and_data,
+	extract_code_and_data, BalanceOf, CallOf, Config, GenericTransaction, Pallet, Weight, Zero,
+	LOG_TARGET, RUNTIME_PALLETS_ADDR,
 };
 use alloc::{boxed::Box, vec::Vec};
 use codec::DecodeLimit;
 use frame_support::MAX_EXTRINSIC_DEPTH;
 use sp_core::{Get, U256};
-use sp_runtime::{SaturatedConversion, transaction_validity::InvalidTransaction};
+use sp_runtime::{transaction_validity::InvalidTransaction, SaturatedConversion};
 
 /// Result of decoding an eth transaction into a dispatchable call.
 pub struct CallInfo<T: Config> {
@@ -68,8 +67,8 @@ impl GenericTransaction {
 		T: Config,
 		CallOf<T>: SetWeightLimit,
 	{
-		// 制度费用适配未完成时拒绝执行，不能套用上游 gas 收费或测试空实现。
-		if T::StrictNativeBalance::get() {
+		// 原生路径必须绑定真实费用路由，测试空实现不能打开入口。
+		if T::StrictNativeBalance::get() && !T::FeeInfo::native_fee_enabled() {
 			return Err(InvalidTransaction::Payment);
 		}
 		crate::BalanceWithDust::<crate::BalanceOf<T>>::ensure_policy::<T>()
@@ -77,16 +76,10 @@ impl GenericTransaction {
 		let is_dry_run = matches!(mode, CreateCallMode::DryRun);
 		let base_fee = <Pallet<T>>::evm_base_fee();
 
-		// We would like to allow for transactions without a chain id to be executed through pallet
-		// revive. These are called unprotected transactions and they are transactions that predate
-		// EIP-155 which do not include a Chain ID. These transactions are still useful today in
-		// certain patterns in Ethereum such as "Nick's Method" for contract deployment which
-		// allows a contract to be deployed on all chains with the same address. This is only
-		// allowed for legacy transactions and isn't allowed for any other transaction type.
-		// * Here's a relevant EIP: https://eips.ethereum.org/EIPS/eip-2470
-		// * Here's Nick's article: https://weka.medium.com/how-to-send-ether-to-11-440-people-187e332566b7
+		// 原生整单位策略必须携带准确ChainId，禁止无链签名跨链重放。
+		// 其他SDK链仍保留上游允许未保护Legacy交易的原行为。
 		match (self.chain_id, self.r#type.as_ref()) {
-			(None, Some(super::Byte(TYPE_LEGACY))) => {},
+			(None, Some(super::Byte(TYPE_LEGACY))) if !T::StrictNativeBalance::get() => {},
 			(Some(chain_id), ..) => {
 				if chain_id != <T as Config>::ChainId::get().into() {
 					log::debug!(target: LOG_TARGET, "Invalid chain_id {chain_id:?}");
@@ -104,9 +97,7 @@ impl GenericTransaction {
 			return Err(InvalidTransaction::Call);
 		};
 
-		// Currently, effective_gas_price will always be the same as base_fee
-		// Because all callers of `into_call` will prepare `tx` that way. Some of the subsequent
-		// logic will not work correctly anymore if we change that assumption.
+		// 上游按资源收费路径使用 base_fee；原生路径仅保留签名金额上限。
 		let Some(effective_gas_price) = self.gas_price else {
 			log::debug!(target: LOG_TARGET, "No gas_price provided.");
 			return Err(InvalidTransaction::Payment);
@@ -127,10 +118,18 @@ impl GenericTransaction {
 				// For dry runs, we need to ensure that the RLP encoding length is at least the
 				// length of the encoding of the actual transaction submitted later
 				let mut maximized_tx = self.clone();
-				let maximized_base_fee = base_fee.saturating_mul(256.into());
+				// 原生 base_fee 为零，查询仍须为签名价格字段预留最大编码长度。
+				let maximized_base_fee = if T::StrictNativeBalance::get() {
+					U256::MAX
+				} else {
+					base_fee.saturating_mul(256.into())
+				};
 				maximized_tx.gas = Some(u64::MAX.into());
 				maximized_tx.gas_price = Some(maximized_base_fee);
 				maximized_tx.max_priority_fee_per_gas = Some(maximized_base_fee);
+				if T::StrictNativeBalance::get() {
+					maximized_tx.max_fee_per_gas = Some(U256::MAX);
+				}
 
 				let unsigned_tx = maximized_tx.try_into_unsigned().map_err(|_| {
 					log::debug!(target: LOG_TARGET, "Invalid transaction type.");
@@ -144,10 +143,26 @@ impl GenericTransaction {
 			};
 
 		let value = self.value.unwrap_or_default();
+		let native_signer = if T::StrictNativeBalance::get() {
+			crate::BalanceWithDust::<BalanceOf<T>>::from_value::<T>(value)
+				.map_err(|_| InvalidTransaction::Payment)?;
+			let from = self.from.ok_or(InvalidTransaction::BadSigner)?;
+			Some(if is_dry_run {
+				<T::AddressMapper as crate::AddressMapper<T>>::to_account_id(&from)
+			} else {
+				<T::AddressMapper as crate::AddressMapper<T>>::to_fallback_account_id(&from)
+			})
+		} else {
+			None
+		};
 		let data = self.input.to_vec();
 
 		let mut call = if let Some(dest) = self.to {
 			if dest == RUNTIME_PALLETS_ADDR {
+				// 原生制度禁止未经业务授权与唯一收费路由的包装派发。
+				if T::StrictNativeBalance::get() {
+					return Err(InvalidTransaction::Call);
+				}
 				let call =
 					CallOf::<T>::decode_all_with_depth_limit(MAX_EXTRINSIC_DEPTH, &mut &data[..])
 						.map_err(|_| {
@@ -201,6 +216,50 @@ impl GenericTransaction {
 
 			call
 		};
+
+		if let Some(who) = native_signer {
+			// gas 只规定资源上限，钱只查询 Runtime 现有路由；不预扣执行费或存储押金。
+			let resource_gas: u64 =
+				gas.try_into().map_err(|_| InvalidTransaction::ExhaustsResources)?;
+			let budget = super::fees::resource_gas_to_weight::<T>(resource_gas);
+			let info = T::FeeInfo::dispatch_info(&call);
+			let base = T::BlockWeights::get().get(info.class).base_extrinsic;
+			let overhead = info
+				.total_weight()
+				.saturating_add(base)
+				.saturating_add(Weight::from_parts(0, encoded_len as u64));
+			let available =
+				budget.checked_sub(&overhead).ok_or(InvalidTransaction::ExhaustsResources)?;
+			let max = Pallet::<T>::evm_max_extrinsic_weight()
+				.checked_sub(&overhead)
+				.ok_or(InvalidTransaction::ExhaustsResources)?;
+			let weight_limit = available.min(max);
+			call.set_weight_limit(weight_limit);
+			let tx_fee = T::FeeInfo::native_quote(&who, &call)?;
+			let ceiling = self
+				.max_fee_per_gas
+				.unwrap_or(effective_gas_price)
+				.checked_mul(gas)
+				.ok_or(InvalidTransaction::Payment)?;
+			let required: U256 = tx_fee.into();
+			let required = required
+				.checked_mul(T::NativeToEthRatio::get().into())
+				.ok_or(InvalidTransaction::Payment)?;
+			// 查询可省略金额上限；已签交易及明确提供上限的查询必须严格检查。
+			if (!is_dry_run || self.max_fee_per_gas.is_some() || !effective_gas_price.is_zero())
+				&& required > ceiling
+			{
+				return Err(InvalidTransaction::Payment);
+			}
+			return Ok(CallInfo {
+				call,
+				weight_limit,
+				encoded_len,
+				tx_fee,
+				storage_deposit: Zero::zero(),
+				eth_gas_limit: gas,
+			});
+		}
 
 		// the fee as signed off by the eth wallet. we cannot consume more.
 		let eth_fee = effective_gas_price.checked_mul(gas).ok_or(InvalidTransaction::Payment)?

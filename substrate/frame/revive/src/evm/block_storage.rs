@@ -15,9 +15,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 use crate::{
-	AccountIdOf, BalanceOf, BalanceWithDust, BlockHash, BlockNumberFor, Config, ContractResult,
-	Error, EthBlockBuilderIR, EthereumBlock, Event, ExecReturnValue, H160, H256, LOG_TARGET,
-	Pallet, ReceiptGasInfo, ReceiptInfoData, StorageDeposit, Weight, dispatch_result,
+	dispatch_result,
 	evm::{
 		block_hash::{AccumulateReceipt, EthereumBlockBuilder, LogsBloom},
 		burn_with_dust,
@@ -26,6 +24,9 @@ use crate::{
 	limits,
 	sp_runtime::traits::{One, Zero},
 	weights::WeightInfo,
+	AccountIdOf, BalanceOf, BalanceWithDust, BlockHash, BlockNumberFor, Config, ContractResult,
+	Error, EthBlockBuilderIR, EthereumBlock, Event, ExecReturnValue, Pallet, ReceiptGasInfo,
+	ReceiptInfoData, StorageDeposit, Weight, H160, H256, LOG_TARGET,
 };
 use alloc::vec::Vec;
 use environmental::environmental;
@@ -74,8 +75,8 @@ impl EthereumCallResult {
 		info: &DispatchInfo,
 		effective_gas_price: U256,
 	) -> Self {
-		// 原生整单位策略不允许收据舍入导致额外收费；生产收费接入前拒绝。
-		if T::StrictNativeBalance::get() {
+		// 未配置现有收费路由时仍拒绝，不能靠空费用接口开放执行。
+		if T::StrictNativeBalance::get() && !T::FeeInfo::native_fee_enabled() {
 			return Self {
 				receipt_gas_info: ReceiptGasInfo::default(),
 				result: Err(Error::<T>::NativeFeeNotConfigured.into()),
@@ -83,8 +84,8 @@ impl EthereumCallResult {
 		}
 		let effective_gas_price = effective_gas_price.max(Pallet::<T>::evm_base_fee());
 
-		if let Ok(retval) = &output.result &&
-			retval.did_revert()
+		if let Ok(retval) = &output.result
+			&& retval.did_revert()
 		{
 			output.result = Err(<Error<T>>::ContractReverted.into());
 		}
@@ -99,6 +100,23 @@ impl EthereumCallResult {
 		});
 
 		let result = dispatch_result(output.result, output.weight_consumed, base_call_weight);
+		if T::StrictNativeBalance::get() {
+			// 收据仅记录资源；实际费用以 Runtime 现有收费事件为准，失败也不退费。
+			// 不从存储资金推导费用，不做 gasPrice 舍入补扣。
+			let total = output
+				.weight_consumed
+				.saturating_add(base_call_weight)
+				.saturating_add(info.extension_weight)
+				.saturating_add(T::BlockWeights::get().get(info.class).base_extrinsic)
+				.saturating_add(Weight::from_parts(0, encoded_len as u64));
+			return Self {
+				receipt_gas_info: ReceiptGasInfo {
+					gas_used: super::fees::resource_weight_to_gas::<T>(total).into(),
+					effective_gas_price,
+				},
+				result,
+			};
+		}
 		let native_fee = T::FeeInfo::compute_actual_fee(encoded_len, &info, &result);
 		let result = T::FeeInfo::ensure_not_overdrawn(native_fee, result);
 

@@ -15,10 +15,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License
 
-use crate::{BalanceOf, Config, StorageDeposit, evm::fees::InfoT};
+use crate::{evm::fees::InfoT, BalanceOf, Config, StorageDeposit};
 use frame_support::DebugNoBound;
 use sp_core::Get;
-use sp_runtime::{FixedPointNumber, Saturating};
+use sp_runtime::{traits::Bounded, FixedPointNumber, SaturatedConversion, Saturating};
 
 /// The type for negative and positive gas amounts.
 ///
@@ -45,11 +45,27 @@ impl<T: Config> Default for SignedGas<T> {
 }
 
 impl<T: Config> SignedGas<T> {
+	/// 原生路径按纯资源 Weight 计量，其他链保留其既有计量方式。
+	pub fn from_weight(weight: &frame_support::weights::Weight, average: bool) -> Self {
+		if T::StrictNativeBalance::get() {
+			Self::Positive(crate::evm::fees::resource_weight_to_gas::<T>(*weight).saturated_into())
+		} else {
+			Self::from_weight_fee(if average {
+				T::FeeInfo::weight_to_fee_average(weight)
+			} else {
+				T::FeeInfo::weight_to_fee(weight)
+			})
+		}
+	}
 	/// Safely construct a negative `SignedGas` amount
 	///
 	/// Ensures the invariant that `Negative` must not be used for zero
 	pub fn safe_new_negative(amount: BalanceOf<T>) -> Self {
-		if amount == Default::default() { Positive(amount) } else { Negative(amount) }
+		if amount == Default::default() {
+			Positive(amount)
+		} else {
+			Negative(amount)
+		}
 	}
 
 	/// Transform a weight fee into a gas amount.
@@ -60,7 +76,8 @@ impl<T: Config> SignedGas<T> {
 	/// Transform an Ethereum gas amount coming from outside the metering system and transform into
 	/// the internally used SignedGas.
 	pub fn from_ethereum_gas(gas: BalanceOf<T>) -> Self {
-		let gas_scale = <T as Config>::GasScale::get();
+		let gas_scale =
+			if T::StrictNativeBalance::get() { 1 } else { <T as Config>::GasScale::get() };
 		Self::Positive(gas.saturating_mul(gas_scale.into()))
 	}
 
@@ -68,6 +85,10 @@ impl<T: Config> SignedGas<T> {
 	/// through the next fee multiplier. Charges are treated as a positive numbers and refunds as
 	/// negative numbers.
 	pub fn from_adjusted_deposit_charge(deposit: &StorageDeposit<BalanceOf<T>>) -> Self {
+		// 原生费用不随存储资金变化；ED 和余额转移仍由余额及存储计量器检查。
+		if T::StrictNativeBalance::get() {
+			return Self::default();
+		}
 		let multiplier = T::FeeInfo::next_fee_multiplier_reciprocal();
 
 		match deposit {
@@ -90,7 +111,11 @@ impl<T: Config> SignedGas<T> {
 	/// Transform the gas amount to an Ethereum gas amount usable for external purposes
 	/// Returns None if the gas amount is negative.
 	pub fn to_ethereum_gas(&self) -> Option<BalanceOf<T>> {
-		let gas_scale: BalanceOf<T> = <T as Config>::GasScale::get().into();
+		let gas_scale: BalanceOf<T> = if T::StrictNativeBalance::get() {
+			1u32.into()
+		} else {
+			<T as Config>::GasScale::get().into()
+		};
 
 		match self {
 			Positive(amount) => {
@@ -104,6 +129,13 @@ impl<T: Config> SignedGas<T> {
 	/// with the next fee multiplier.
 	/// Returns None if the gas amount is negative.
 	pub fn to_adjusted_deposit_charge(&self) -> Option<BalanceOf<T>> {
+		// 资源 gas 不转换成可收费金额；原生 ED 资金仍受实际可用余额限制。
+		if T::StrictNativeBalance::get() {
+			return match self {
+				Positive(_) => Some(BalanceOf::<T>::max_value()),
+				Negative(_) => None,
+			};
+		}
 		match self {
 			Positive(amount) => {
 				let multiplier = T::FeeInfo::next_fee_multiplier();
