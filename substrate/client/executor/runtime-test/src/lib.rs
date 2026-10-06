@@ -51,6 +51,8 @@ use sp_runtime::{
 	traits::{BlakeTwo256, Hash},
 };
 
+// 夹具故意调用缺失宿主函数；明确导入 env，保留执行器缺失函数 trap 的验收。
+#[cfg_attr(target_arch = "wasm32", link(wasm_import_module = "env"))]
 extern "C" {
 	#[allow(dead_code)]
 	fn missing_external();

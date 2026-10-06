@@ -1562,3 +1562,5 @@ zeroize = { opt-level = 3 }
 # rustls provider 校验 TLS 握手签名；节点身份仍由 Noise 固定 peer ID 验证。
 [patch.crates-io]
 libp2p-websocket = { path = "substrate/client/network/libp2p-websocket-patch" }
+# RISC-V 夹具与原生闭包共用上游固定原子能力补丁；来源由正式声明及锁文件控制。
+radium = { git = "https://github.com/paritytech/radium-0.7-fork.git", rev = "a5da15a15c90fd169d661d206cf0db592487f52b" }

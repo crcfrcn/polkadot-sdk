@@ -19448,8 +19448,7 @@ checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
 [[package]]
 name = "radium"
 version = "0.7.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dc33ff2d4973d518d823d61aa239014831e521c75da58e3df4840d3f47749d09"
+source = "git+https://github.com/paritytech/radium-0.7-fork.git?rev=a5da15a15c90fd169d661d206cf0db592487f52b#a5da15a15c90fd169d661d206cf0db592487f52b"
 
 [[package]]
 name = "rand"

@@ -91,6 +91,22 @@ struct BackwardSyncRange {
 }
 
 impl Client {
+	/// 重启后按最佳链重新建立有限近期索引，链状态不可用时停止初始化。
+	/// 不改变节点修剪策略，不在空索引上宣称历史交易不存在。
+	pub(crate) async fn rebuild_recent_index(&self, keep_latest: usize) -> Result<(), ClientError> {
+		let best = self.block_provider().latest_block_number().await;
+		let first = best.saturating_sub((keep_latest - 1) as u32);
+		for number in first..=best {
+			let block = self
+				.block_provider()
+				.block_by_number(number)
+				.await?
+				.ok_or(ClientError::BlockNotFound)?;
+			self.process_block(&block).await?;
+		}
+		Ok(())
+	}
+
 	/// Verify that the stored genesis hash matches the connected chain.
 	async fn validate_chain_identity(&self) -> Result<H256, ClientError> {
 		let genesis_hash: H256 = self.api().genesis_hash();

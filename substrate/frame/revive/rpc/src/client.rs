@@ -211,8 +211,8 @@ impl From<ClientError> for ErrorObjectOwned {
 		match err {
 			ClientError::SubxtError(subxt::Error::Rpc(subxt::error::RpcError::ClientError(
 				subxt::ext::subxt_rpcs::Error::User(err),
-			))) |
-			ClientError::RpcError(subxt::ext::subxt_rpcs::Error::User(err)) => {
+			)))
+			| ClientError::RpcError(subxt::ext::subxt_rpcs::Error::User(err)) => {
 				ErrorObjectOwned::owned::<Vec<u8>>(err.code, err.message, None)
 			},
 			ClientError::TransactError(EthTransactError::Data(data)) => {
@@ -388,7 +388,185 @@ pub async fn connect(
 	Ok((api, rpc_client, rpc))
 }
 
+/// 只在宿主内调用原生 RPC；此模块必须保持私有，禁止从外部直接访问 Unsafe 方法。
+struct InProcessRpc {
+	module: jsonrpsee::RpcModule<()>,
+}
+
+type RawRpcValue = Box<serde_json::value::RawValue>;
+type TransportError = subxt::ext::subxt_rpcs::Error;
+
+/// 保留原生位置后再筛选 Ethereum payload；原生交易和 inherent 不占 Ethereum 序号。
+fn ethereum_payload_positions(
+	payloads: impl IntoIterator<Item = Option<Vec<u8>>>,
+) -> Vec<(usize, H256)> {
+	payloads
+		.into_iter()
+		.enumerate()
+		.filter_map(|(index, payload)| {
+			payload.map(|payload| (index, H256::from(sp_crypto_hashing::keccak_256(&payload))))
+		})
+		.collect()
+}
+
+fn decode_in_process_response(response: &str) -> Result<RawRpcValue, TransportError> {
+	// 官方响应逐字段解析原始 JSON，保留 null、大整数及错误 data；untagged 会丢失 RawValue 的原始输入。
+	let response: jsonrpsee::types::Response<'_, RawRpcValue> =
+		serde_json::from_str(response).map_err(TransportError::Deserialization)?;
+	match response.payload {
+		jsonrpsee::types::ResponsePayload::Error(error) => Err(subxt::ext::subxt_rpcs::UserError {
+			code: error.code(),
+			message: error.message().into(),
+			data: error.data().map(ToOwned::to_owned),
+		}
+		.into()),
+		jsonrpsee::types::ResponsePayload::Success(result) => Ok(result.into_owned()),
+	}
+}
+
+/// 接收器退出时注销官方原生订阅，避免每次重启泄漏服务端订阅任务。
+struct InProcessSubscription {
+	receiver: tokio::sync::mpsc::Receiver<String>,
+	module: jsonrpsee::RpcModule<()>,
+	unsubscribe: String,
+	id: RawRpcValue,
+}
+
+impl Drop for InProcessSubscription {
+	fn drop(&mut self) {
+		let module = self.module.clone();
+		let request = serde_json::json!({
+			"jsonrpc": "2.0", "id": 1, "method": self.unsubscribe, "params": [&self.id],
+		})
+		.to_string();
+		if let Ok(handle) = tokio::runtime::Handle::try_current() {
+			handle.spawn(async move {
+				let _ = module.raw_json_request(&request, 1).await;
+			});
+		}
+	}
+}
+
+impl subxt::ext::subxt_rpcs::client::RpcClientT for InProcessRpc {
+	fn request_raw<'a>(
+		&'a self,
+		method: &'a str,
+		params: Option<RawRpcValue>,
+	) -> subxt::ext::subxt_rpcs::client::RawRpcFuture<'a, RawRpcValue> {
+		Box::pin(async move {
+			let request = serde_json::json!({"jsonrpc":"2.0", "id":1, "method":method, "params":params.unwrap_or_else(|| serde_json::value::RawValue::from_string("[]".into()).expect("合法 JSON"))}).to_string();
+			let (response, _) = self
+				.module
+				.raw_json_request(&request, 1)
+				.await
+				.map_err(TransportError::Deserialization)?;
+			decode_in_process_response(&response)
+		})
+	}
+
+	fn subscribe_raw<'a>(
+		&'a self,
+		method: &'a str,
+		params: Option<RawRpcValue>,
+		unsubscribe: &'a str,
+	) -> subxt::ext::subxt_rpcs::client::RawRpcFuture<
+		'a,
+		subxt::ext::subxt_rpcs::client::RawRpcSubscription,
+	> {
+		Box::pin(async move {
+			let request = serde_json::json!({"jsonrpc":"2.0", "id":1, "method":method, "params":params.unwrap_or_else(|| serde_json::value::RawValue::from_string("[]".into()).expect("合法 JSON"))}).to_string();
+			let (response, receiver) = self
+				.module
+				.raw_json_request(&request, 256)
+				.await
+				.map_err(TransportError::Deserialization)?;
+			let id = decode_in_process_response(&response)?;
+			let id_text = id.get().to_string();
+			let state = InProcessSubscription {
+				receiver,
+				module: self.module.clone(),
+				unsubscribe: unsubscribe.into(),
+				id,
+			};
+			let stream = futures::stream::unfold(state, |mut state| async move {
+				let notification = state.receiver.recv().await?;
+				#[derive(serde::Deserialize)]
+				struct Notification {
+					params: NotificationParams,
+				}
+				#[derive(serde::Deserialize)]
+				struct NotificationParams {
+					result: RawRpcValue,
+				}
+				let result = serde_json::from_str::<Notification>(&notification)
+					.map(|n| n.params.result)
+					.map_err(TransportError::Deserialization);
+				Some((result, state))
+			});
+			Ok(subxt::ext::subxt_rpcs::client::RawRpcSubscription {
+				stream: Box::pin(stream),
+				id: Some(id_text),
+			})
+		})
+	}
+}
+
 impl Client {
+	/// 在宿主节点进程内初始化官方 RPC，不创建网络连接、监听器或额外 Runtime。
+	/// SQLite 只保留近期块；宿主必须持有并运行返回的同步 Future，退出时一并取消。
+	pub async fn from_in_process_rpc(
+		module: jsonrpsee::RpcModule<()>,
+		keep_latest: usize,
+	) -> Result<(Self, futures::future::BoxFuture<'static, Result<(), ClientError>>), ClientError>
+	{
+		if keep_latest == 0 || keep_latest > crate::MAX_CACHED_BLOCKS {
+			return Err(ClientError::ConversionFailed);
+		}
+		let rpc_client = RpcClient::new(InProcessRpc { module });
+		let api = OnlineClient::<SrcChainConfig>::from_rpc_client(rpc_client.clone()).await?;
+		let rpc = LegacyRpcMethods::<SrcChainConfig>::new(rpc_client.clone());
+		let block_provider = SubxtBlockInfoProvider::new(api.clone(), rpc.clone()).await?;
+		// 初始化时 safe/finalized 必须从真实最终链取得，不能暂时冒充 best。
+		let finalized = rpc.chain_get_finalized_head().await?;
+		block_provider
+			.update_latest(
+				Arc::new(api.blocks().at(finalized).await?),
+				SubscriptionType::FinalizedBlocks,
+			)
+			.await;
+		let pool = sqlx::sqlite::SqlitePoolOptions::new()
+			.max_connections(1)
+			.idle_timeout(None)
+			.max_lifetime(None)
+			.connect("sqlite::memory:")
+			.await?;
+		let extractor = crate::ReceiptExtractor::new(api.clone()).await?;
+		let receipts = ReceiptProvider::new(
+			crate::DbContext::new(pool, crate::DbContext::DEFAULT_MAX_VARIABLE_NUMBER),
+			block_provider.clone(),
+			extractor,
+			Some(keep_latest),
+		)
+		.await?;
+		let (gap_queue, gap_rx) = SubscriptionGapQueue::new();
+		let client =
+			Self::new(api, rpc_client, rpc, block_provider, receipts, false, gap_queue).await?;
+		client.rebuild_recent_index(keep_latest).await?;
+		let task_client = client.clone();
+		let synchronization = Box::pin(async move {
+			tokio::try_join!(
+				task_client.subscribe_and_cache_new_blocks(SubscriptionType::BestBlocks),
+				task_client.subscribe_and_cache_new_blocks(SubscriptionType::FinalizedBlocks),
+				async {
+					task_client.run_subscription_gap_filler(gap_rx).await;
+					Ok::<_, ClientError>(())
+				},
+			)?;
+			Err(ClientError::BlockNotFound)
+		});
+		Ok((client, synchronization))
+	}
+
 	/// Create a new client instance.
 	pub(crate) async fn new(
 		api: OnlineClient<SrcChainConfig>,
@@ -451,9 +629,9 @@ impl Client {
 	/// Advance the sync_state head label if safe to do so.
 	/// Requires: archive mode, historic backfill complete, and no pending gap fills.
 	async fn advance_sync_head(&self, block_number: SubstrateBlockNumber, hash: H256) {
-		if !self.is_archive ||
-			!self.backfill_complete.load(Ordering::Acquire) ||
-			self.subscription_gap_queue.has_pending()
+		if !self.is_archive
+			|| !self.backfill_complete.load(Ordering::Acquire)
+			|| self.subscription_gap_queue.has_pending()
 		{
 			return;
 		}
@@ -567,7 +745,7 @@ impl Client {
 	}
 
 	/// Extract receipts from a block, persist them and update fee history.
-	async fn process_block(
+	pub(crate) async fn process_block(
 		&self,
 		block: &SubstrateBlock,
 	) -> Result<(Block, Vec<ReceiptInfo>), ClientError> {
@@ -797,12 +975,36 @@ impl Client {
 	/// Get The post dispatch weight associated with this Ethereum transaction hash.
 	pub async fn post_dispatch_weight(&self, tx_hash: &H256) -> Option<Weight> {
 		use crate::subxt_client::system::events::ExtrinsicSuccess;
-		let ReceiptInfo { block_hash, transaction_index, .. } = self.receipt(tx_hash).await?;
+		let ReceiptInfo { block_hash, .. } = self.receipt(tx_hash).await?;
 		let block_hash = self.resolve_substrate_hash(&block_hash).await?;
+		let native_index = self
+			.ethereum_extrinsic_positions(block_hash)
+			.await
+			.ok()?
+			.into_iter()
+			.find(|(_, hash)| hash == tx_hash)?
+			.0;
 		let block = self.block_provider.block_by_hash(&block_hash).await.ok()??;
-		let ext = block.extrinsics().await.ok()?.iter().nth(transaction_index.as_u32() as _)?;
+		let ext = block.extrinsics().await.ok()?.iter().nth(native_index)?;
 		let event = ext.events().await.ok()?.find_first::<ExtrinsicSuccess>().ok()??;
 		Some(event.dispatch_info.weight.0)
+	}
+
+	/// Ethereum 回执序号与原生执行序号不同；权重及追踪按原生位置绑定同一已签名 payload。
+	async fn ethereum_extrinsic_positions(
+		&self,
+		block_hash: H256,
+	) -> Result<Vec<(usize, H256)>, ClientError> {
+		let block = self
+			.block_provider
+			.block_by_hash(&block_hash)
+			.await?
+			.ok_or(ClientError::BlockNotFound)?;
+		Ok(ethereum_payload_positions(
+			block.extrinsics().await?.iter().map(|ext| {
+				ext.as_extrinsic::<EthTransact>().ok().flatten().map(|call| call.payload)
+			}),
+		))
 	}
 
 	pub async fn sync_state(
@@ -1003,11 +1205,8 @@ impl Client {
 		let runtime_api = RuntimeApi::new(self.api.runtime_api().at(parent_hash));
 		let traces = runtime_api.trace_block(block, config.clone()).await?;
 
-		let mut hashes = self
-			.receipt_provider
-			.block_transaction_hashes(&block_hash)
-			.await
-			.ok_or(ClientError::EthExtrinsicNotFound)?;
+		let mut hashes: std::collections::HashMap<_, _> =
+			self.ethereum_extrinsic_positions(block_hash).await?.into_iter().collect();
 
 		let traces = traces.into_iter().filter_map(|(index, trace)| {
 			Some(TransactionTrace { tx_hash: hashes.remove(&(index as usize))?, trace })
@@ -1022,17 +1221,30 @@ impl Client {
 		transaction_hash: H256,
 		config: TracerType,
 	) -> Result<Trace, ClientError> {
-		let (block_hash, transaction_index) = self
+		let (block_hash, _) = self
 			.receipt_provider
 			.find_transaction(&transaction_hash)
 			.await
 			.ok_or(ClientError::EthExtrinsicNotFound)?;
+		let native_index = self
+			.ethereum_extrinsic_positions(block_hash)
+			.await?
+			.into_iter()
+			.find(|(_, hash)| *hash == transaction_hash)
+			.ok_or(ClientError::EthExtrinsicNotFound)?
+			.0;
 
 		let block = self.tracing_block(block_hash).await?;
 		let parent_hash = block.header.parent_hash;
 		let runtime_api = self.runtime_api(parent_hash);
 
-		runtime_api.trace_tx(block, transaction_index as u32, config).await
+		runtime_api
+			.trace_tx(
+				block,
+				u32::try_from(native_index).map_err(|_| ClientError::ConversionFailed)?,
+				config,
+			)
+			.await
 	}
 
 	/// Get the transaction traces for the given block.
@@ -1121,11 +1333,12 @@ impl Client {
 	pub async fn logs(&self, filter: Option<Filter>) -> Result<Vec<Log>, ClientError> {
 		let earliest = U256::from(self.earliest_block_number());
 		let latest = U256::from(self.latest_block().await.number());
+		let finalized = U256::from(self.latest_finalized_block().await.number());
 		let resolve_block_number = |block: BlockNumberOrTag| match block {
 			BlockNumberOrTag::U256(v) => Ok(v),
 			BlockNumberOrTag::BlockTag(BlockTag::Earliest) => Ok(earliest),
-			BlockNumberOrTag::BlockTag(BlockTag::Latest) => Ok(latest),
-			BlockNumberOrTag::BlockTag(tag) => anyhow::bail!("Unsupported tag: {tag:?}"),
+			BlockNumberOrTag::BlockTag(BlockTag::Latest | BlockTag::Pending) => Ok(latest),
+			BlockNumberOrTag::BlockTag(BlockTag::Safe | BlockTag::Finalized) => Ok(finalized),
 		};
 
 		let logs = self
@@ -1175,4 +1388,104 @@ impl Client {
 
 fn to_hex(bytes: impl AsRef<[u8]>) -> String {
 	format!("0x{}", hex::encode(bytes.as_ref()))
+}
+
+#[cfg(test)]
+mod in_process_tests {
+	use super::*;
+	use futures::StreamExt;
+	use subxt::ext::subxt_rpcs::client::RpcClientT;
+
+	#[test]
+	fn mixed_transactions_keep_native_positions_for_weight_and_tracing() {
+		// 固定 Keccak 向量验证 payload 哈希，并证明筛选后不能把原生位置 1、3 改成 0、1。
+		let positions =
+			ethereum_payload_positions([None, Some(b"abc".to_vec()), None, Some(vec![])]);
+		let abc: H256 = "0x4e03657aea45a94fc7d47ba826c8d667c0d1e6e33a64a036ec44f58fa12d6c45"
+			.parse()
+			.unwrap();
+		let empty: H256 = "0xc5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470"
+			.parse()
+			.unwrap();
+		assert_eq!(positions, vec![(1, abc), (3, empty)]);
+		assert!(ethereum_payload_positions([None, None]).is_empty());
+		assert!(ethereum_payload_positions([]).is_empty());
+	}
+
+	#[test]
+	fn response_decoder_preserves_raw_payload_and_error_data() {
+		// 数值不经过浮点或 Value 转换；缺项、重复字段和互斥字段继续拒绝。
+		for raw in ["null", "18446744073709551616", "1e400", r#"{"items":[true,null,"x"]}"#] {
+			let response = format!(r#"{{"jsonrpc":"2.0","id":1,"result":{raw}}}"#);
+			assert_eq!(decode_in_process_response(&response).unwrap().get(), raw);
+		}
+		let Err(TransportError::User(error)) = decode_in_process_response(
+			r#"{"jsonrpc":"2.0","id":1,"error":{"code":3,"message":"reverted","data":"0xdead"}}"#,
+		) else {
+			panic!("应保留官方 RPC 错误");
+		};
+		assert_eq!(error.code, 3);
+		assert_eq!(error.message, "reverted");
+		assert_eq!(error.data.unwrap().get(), r#""0xdead""#);
+		for response in [
+			r#"{"jsonrpc":"2.0","id":1}"#,
+			r#"{"jsonrpc":"2.0","id":1,"result":1,"result":2}"#,
+			r#"{"jsonrpc":"2.0","id":1,"result":null,"error":{"code":3,"message":"reverted"}}"#,
+		] {
+			assert!(decode_in_process_response(response).is_err());
+		}
+	}
+
+	#[tokio::test]
+	async fn transport_preserves_values_null_and_errors_without_a_listener() {
+		let mut module = jsonrpsee::RpcModule::new(());
+		module
+			.register_method("sum", |params, _, _| {
+				let values: Vec<u64> = params.parse()?;
+				Ok::<_, jsonrpsee::types::ErrorObjectOwned>(values.into_iter().sum::<u64>())
+			})
+			.unwrap();
+		module.register_method("empty", |_, _, _| Option::<u64>::None).unwrap();
+		let transport = InProcessRpc { module };
+		let params = serde_json::value::RawValue::from_string("[2,3]".into()).unwrap();
+		assert_eq!(transport.request_raw("sum", Some(params)).await.unwrap().get(), "5");
+		assert_eq!(transport.request_raw("empty", None).await.unwrap().get(), "null");
+		assert!(matches!(
+			transport.request_raw("unknown", None).await,
+			Err(TransportError::User(_))
+		));
+		assert!(decode_in_process_response(r#"{"jsonrpc":"2.0","id":1}"#).is_err());
+	}
+
+	#[tokio::test]
+	async fn transport_subscription_forwards_results_and_releases_the_server_sink() {
+		let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+		let active_server = active.clone();
+		let mut module = jsonrpsee::RpcModule::new(());
+		module
+			.register_subscription("heads", "heads", "unheads", move |_, pending, _, _| {
+				let active = active_server.clone();
+				async move {
+					let sink = pending.accept().await?;
+					active.fetch_add(1, Ordering::SeqCst);
+					sink.send(jsonrpsee::SubscriptionMessage::from_json(&42u64).unwrap()).await?;
+					sink.closed().await;
+					active.fetch_sub(1, Ordering::SeqCst);
+					Ok::<_, jsonrpsee::core::StringError>(())
+				}
+			})
+			.unwrap();
+		let transport = InProcessRpc { module };
+		let mut subscription = transport.subscribe_raw("heads", None, "unheads").await.unwrap();
+		assert_eq!(subscription.stream.next().await.unwrap().unwrap().get(), "42");
+		assert_eq!(active.load(Ordering::SeqCst), 1);
+		drop(subscription);
+		tokio::time::timeout(Duration::from_secs(1), async {
+			while active.load(Ordering::SeqCst) != 0 {
+				tokio::task::yield_now().await;
+			}
+		})
+		.await
+		.unwrap();
+	}
 }

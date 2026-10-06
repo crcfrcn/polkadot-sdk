@@ -2,8 +2,8 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { gateContract, gatePath, gateRange, gateEnvironment, lockedPackages, lockedUnion, remoteContext,
-  remoteTools, prepareOffline, verifyVendor, hostChecks, remoteRange } from './index.mjs';
-import { readFileSync, mkdtempSync, mkdirSync, writeFileSync, realpathSync, rmSync, symlinkSync, renameSync, linkSync } from 'node:fs';
+  remoteTools, prepareOffline, verifyVendor, verifyGitCache, lockedGitSource, hostChecks, remoteRange } from './index.mjs';
+import { readFileSync, mkdtempSync, mkdirSync, writeFileSync, realpathSync, rmSync, symlinkSync, renameSync, linkSync, cpSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -293,4 +293,99 @@ test('完整门禁使用同一Rust对象和独立离线环境，拒绝跳过及�
   assert.throws(() => gateEnvironment(root, work, { ...input, CARGO_HOME: join(directory, 'home-link') }, { execute }));
   writeFileSync(join(home, 'config.toml'), config.replace('offline = true', 'offline = false'));
   assert.throws(() => gateEnvironment(root, work, input, { execute }), /目录源/u);
+});
+
+// Git正例使用已登记工具创建真实对象；来源字符串只是隔离夹具，不联网。
+function gitFixture(context) {
+  const f = fixture(context), home = join(f.work, 'git-home'), checkout = join(home, 'git/checkouts/fixture/revision');
+  mkdirSync(join(home, 'git/db'), { recursive: true }); mkdirSync(checkout, { recursive: true });
+  const git = process.env.PRODUCT_GIT_BIN;
+  assert.ok(git?.startsWith('/'), '门禁测试必须传入已登记Git绝对入口');
+  const execute = (tool, args, cwd, env) => {
+    const result = spawnSync(tool, args, { cwd, env, encoding: 'utf8' });
+    if (result.error || result.status !== 0) throw new Error(result.error?.message ?? result.stderr);
+    return result.stdout.trim();
+  };
+  const input = { ...process.env, PRODUCT_GIT_BIN: git, CARGO: '/fixture/cargo', RUSTC: '/fixture/rustc',
+    GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null', GIT_NO_REPLACE_OBJECTS: '1' };
+  const run = args => execute(git, ['-C', checkout, ...args], f.root, input);
+  run(['init', '--template=']);
+  const manifest = join(checkout, 'Cargo.toml');
+  writeFileSync(manifest, '[package]\nname = "fixture"\nversion = "1.0.0"\n');
+  run(['add', 'Cargo.toml']);
+  run(['-c', 'user.name=SDK Test', '-c', 'user.email=sdk-test@example.invalid', 'commit', '-m', 'fixture']);
+  const revision = run(['rev-parse', 'HEAD']);
+  const source = 'git+https://github.com/example/fixture.git?rev=' + revision + '#' + revision;
+  const union = new Map([['fixture-1.0.0', { name: 'fixture', version: '1.0.0', source }]]);
+  const metadata = { packages: [{ name: 'fixture', version: '1.0.0', source, manifest_path: manifest }] };
+  return { ...f, home, checkout, manifest, revision, source, union, metadata, input, execute, run };
+}
+test('固定Git锁只接受准确HTTPS来源和同一40位提交，异源及伪造摘要失败', () => {
+  const revision = 'a'.repeat(40), source = 'git+https://github.com/example/fixture.git?rev=' + revision + '#' + revision;
+  assert.deepEqual(lockedGitSource(source), { repository: 'https://github.com/example/fixture.git', revision });
+  const gitLock = header + '[[package]]\nname = "fixture"\nversion = "1.0.0"\nsource = ' + JSON.stringify(source) + '\n\n';
+  assert.equal(lockedUnion(gitLock, gitLock).size, 1);
+  assert.equal(lockedPackages(gitLock).get('fixture-1.0.0').source, source);
+  for (const invalid of [source.replace('https:', 'http:'), source.replace('github.com', 'user@github.com'),
+    source.replace('github.com', 'github.com:443'), source.replace('?rev=', '?branch='), source.replace('#' + revision, '#' + 'b'.repeat(40)),
+    source.replace(revision, 'main'), source.replace('.git?', '?'), source.replace('example/', 'example/../')]) {
+    assert.throws(() => lockedGitSource(invalid));
+  }
+  assert.throws(() => lockedPackages(gitLock + 'checksum = "' + 'a'.repeat(64) + '"\n'), /伪造/u);
+  assert.throws(() => lockedUnion(gitLock, lock([['fixture', '1.0.0', 'a'.repeat(64)]])), /异源/u);
+});
+test('真实固定Git检出接受Cargo标记，拒绝污染、错误HEAD、metadata及目录越界', context => {
+  const f = gitFixture(context), options = { execute: f.execute, metadata: f.metadata };
+  verifyGitCache(f.root, f.home, f.union, f.input, options);
+  writeFileSync(join(f.checkout, '.cargo-ok'), '');
+  verifyGitCache(f.root, f.home, f.union, f.input, options);
+  writeFileSync(join(f.checkout, 'extra.rs'), 'untracked');
+  assert.throws(() => verifyGitCache(f.root, f.home, f.union, f.input, options), /额外文件/u);
+  rmSync(join(f.checkout, 'extra.rs'));
+  const original = readFileSync(f.manifest);
+  writeFileSync(f.manifest, 'dirty');
+  assert.throws(() => verifyGitCache(f.root, f.home, f.union, f.input, options));
+  writeFileSync(f.manifest, original);
+  for (const change of [{ version: '2.0.0' }, { source: f.source.replaceAll(f.revision, 'b'.repeat(40)) },
+    { manifest_path: join(f.root, 'Cargo.toml') }]) {
+    assert.throws(() => verifyGitCache(f.root, f.home, f.union, f.input,
+      { ...options, metadata: { packages: [{ ...f.metadata.packages[0], ...change }] } }));
+  }
+  assert.throws(() => verifyGitCache(f.root, f.home, f.union, f.input,
+    { ...options, metadata: { packages: [f.metadata.packages[0], f.metadata.packages[0]] } }), /坐标/u);
+  renameSync(f.manifest, f.manifest + '-saved'); symlinkSync(f.manifest + '-saved', f.manifest);
+  assert.throws(() => verifyGitCache(f.root, f.home, f.union, f.input, options));
+  rmSync(f.manifest); renameSync(f.manifest + '-saved', f.manifest);
+  f.run(['-c', 'user.name=SDK Test', '-c', 'user.email=sdk-test@example.invalid', 'commit', '--allow-empty', '-m', 'wrong head']);
+  assert.throws(() => verifyGitCache(f.root, f.home, f.union, f.input, options), /提交不符/u);
+});
+
+test('Git与registry同次准备后仍从原锁Git检出消费，复制缓存和移除冗余vendor包均受验真', context => {
+  const f = gitFixture(context);
+  const sdk = f.sdk + '[[package]]\nname = "fixture"\nversion = "1.0.0"\nsource = ' + JSON.stringify(f.source) + '\n\n';
+  writeFileSync(join(f.root, 'Cargo.lock'), sdk);
+  let metadataCalls = 0;
+  const execute = (tool, args, cwd, environment) => {
+    if (tool === f.input.CARGO && args[0] === 'vendor') {
+      f.vendor(tool, args, cwd, environment);
+      cpSync(join(f.home, 'git'), join(environment.CARGO_HOME, 'git'), { recursive: true });
+      mkdirSync(join(f.work, 'cargo/packages/fixture-1.0.0'));
+      return '';
+    }
+    if (tool === f.input.CARGO && args[0] === 'metadata') {
+      metadataCalls++;
+      assert.deepEqual(args, ['metadata', '--locked', '--offline', '--format-version', '1']);
+      assert.equal(environment.CARGO_NET_OFFLINE, 'true');
+      return JSON.stringify({ packages: [{ ...f.metadata.packages[0],
+        manifest_path: join(environment.CARGO_HOME, 'git/checkouts/fixture/revision/Cargo.toml') }] });
+    }
+    return f.execute(tool, args, cwd, environment);
+  };
+  const result = prepareOffline(f.root, f.work, f.input, f.library,
+    { ...f.options, expectedSDK: hash(sdk), expectedCount: 3, execute });
+  assert.equal(metadataCalls, 2);
+  assert.deepEqual(readFileSync(join(result.CARGO_HOME, 'git/checkouts/fixture/revision/Cargo.toml')), readFileSync(f.manifest));
+  assert.throws(() => readFileSync(join(f.work, 'cargo/packages/fixture-1.0.0/Cargo.toml')), /ENOENT/u);
+  assert.equal(readFileSync(join(f.root, 'Cargo.lock'), 'utf8'), sdk);
+  assert.doesNotMatch(readFileSync(join(result.CARGO_HOME, 'config.toml'), 'utf8'), /source[.]git|patch|fixture/u);
 });

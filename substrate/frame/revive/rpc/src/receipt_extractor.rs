@@ -314,7 +314,8 @@ impl ReceiptExtractor {
 			Some(from),
 		);
 
-		let contract_address = if tx_info.to.is_none() {
+		// 失败部署没有合约地址；不能把可预测地址当作已经创建的合约。
+		let contract_address = if tx_info.to.is_none() && !reverted {
 			Some(create1(
 				&from,
 				tx_info
@@ -392,7 +393,7 @@ impl ReceiptExtractor {
 			|idx| eth_tx_by_index.get(&idx).map(|(_, hash, _)| *hash),
 		);
 
-		eth_tx_by_index
+		let mut receipts: Vec<_> = eth_tx_by_index
 			.into_iter()
 			.map(|(transaction_index, (call, transaction_hash, receipt_gas_info))| {
 				let reverted = reverted_extrinsics.contains(&transaction_index);
@@ -411,7 +412,10 @@ impl ReceiptExtractor {
 					log::warn!(target: LOG_TARGET, "Error extracting extrinsic: {err:?}");
 				})
 			})
-			.collect()
+			.collect::<Result<_, _>>()?;
+		// Ethereum 序号只计算 Ethereum 交易和日志，原生 extrinsic 与事件不占位。
+		normalize_receipts(&mut receipts)?;
+		Ok(receipts)
 	}
 
 	/// Return the ETH extrinsics of the block grouped with reconstruction receipt info and
@@ -457,56 +461,17 @@ impl ReceiptExtractor {
 		}
 	}
 
-	/// Extract a [`TransactionSigned`] and a [`ReceiptInfo`] for a specific transaction in a
-	/// [`SubstrateBlock`]
+	/// 按 Ethereum 交易序号取回执，完整重建该块以保留累计 gas 和块内日志序号。
 	pub async fn extract_from_transaction(
 		&self,
 		block: &SubstrateBlock,
 		transaction_index: usize,
 	) -> Result<(TransactionSigned, ReceiptInfo), ClientError> {
-		let (eth_call, receipt_gas_info, transaction_hash) = self
-			.get_block_extrinsics(block)
+		self.extract_from_block(block)
 			.await?
-			.find_map(|(call, receipt_gas_info, extrinsic_index)| {
-				(extrinsic_index == transaction_index).then(|| {
-					let hash = H256(keccak_256(&call.payload));
-					(call, receipt_gas_info, hash)
-				})
-			})
-			.ok_or_else(|| {
-				log::trace!(target: LOG_TARGET,
-					"extract_from_transaction: no EVM extrinsic at tx_index {transaction_index} \
-					 in block #{} ({:?})", block.number(), block.hash());
-				ClientError::EthExtrinsicNotFound
-			})?;
-
-		let substrate_block_number = block.number();
-		let eth_block_number: U256 = substrate_block_number.into();
-		let eth_block_hash =
-			self.resolve_eth_block_hash(block.hash(), substrate_block_number as u64).await;
-		let block_events = block.events().await.inspect_err(|err| {
-			log::debug!(target: LOG_TARGET, "Error fetching events for block #{substrate_block_number}: {err:?}");
-		})?;
-		let (reverted_extrinsics, mut logs_by_extrinsic) = extract_revive_events(
-			&block_events,
-			substrate_block_number,
-			eth_block_number,
-			eth_block_hash,
-			|idx| (idx == transaction_index).then_some(transaction_hash),
-		);
-
-		let reverted = reverted_extrinsics.contains(&transaction_index);
-		let logs = logs_by_extrinsic.remove(&transaction_index).unwrap_or_default();
-		self.decode_transaction_and_build_receipt(
-			eth_block_hash,
-			eth_block_number,
-			eth_call,
-			transaction_hash,
-			transaction_index,
-			receipt_gas_info,
-			reverted,
-			logs,
-		)
+			.into_iter()
+			.nth(transaction_index)
+			.ok_or(ClientError::EthExtrinsicNotFound)
 	}
 
 	/// Get the Ethereum block hash for the Substrate block with specific hash.
@@ -517,6 +482,31 @@ impl ReceiptExtractor {
 	) -> Option<H256> {
 		(self.fetch_eth_block_hash)(*block_hash, block_number).await
 	}
+}
+
+/// 统一块回执口径，累计 gas 仅描述执行资源，不能参与原生制度收费。
+fn normalize_receipts(
+	receipts: &mut [(TransactionSigned, ReceiptInfo)],
+) -> Result<(), ClientError> {
+	let mut cumulative_gas = U256::zero();
+	let mut log_index = 0usize;
+	for (transaction_index, (_, receipt)) in receipts.iter_mut().enumerate() {
+		receipt.transaction_index = transaction_index.into();
+		cumulative_gas = cumulative_gas
+			.checked_add(receipt.gas_used)
+			.ok_or(ClientError::ConversionFailed)?;
+		receipt.cumulative_gas_used = cumulative_gas;
+		if !receipt.is_success() {
+			receipt.logs.clear();
+			receipt.logs_bloom = Default::default();
+		}
+		for log in &mut receipt.logs {
+			log.transaction_index = transaction_index.into();
+			log.log_index = log_index.into();
+			log_index = log_index.checked_add(1).ok_or(ClientError::ConversionFailed)?;
+		}
+	}
+	Ok(())
 }
 
 #[cfg(test)]
@@ -628,6 +618,78 @@ mod tests {
 		assert_eq!(receipt.to, None);
 		assert_eq!(receipt.contract_address, Some(create1(&account.address(), 0)));
 		assert_eq!(receipt.from, account.address());
+	}
+
+	#[test]
+	fn reverted_deployment_has_no_contract_address() {
+		let extractor = ReceiptExtractor::new_mock();
+		let account = Account::default();
+		let (call, hash) = signed_call(
+			&account,
+			TransactionLegacyUnsigned {
+				chain_id: Some(1.into()),
+				gas: 100_000.into(),
+				..Default::default()
+			}
+			.into(),
+		);
+		let (_, receipt) = extractor
+			.decode_transaction_and_build_receipt(
+				H256::zero(),
+				1.into(),
+				call,
+				hash,
+				0,
+				gas_info(),
+				true,
+				vec![],
+			)
+			.unwrap();
+		assert!(!receipt.is_success());
+		assert_eq!(receipt.contract_address, None);
+	}
+
+	#[test]
+	fn ethereum_indices_cumulative_gas_and_failed_logs_ignore_native_positions() {
+		let extractor = ReceiptExtractor::new_mock();
+		let account = Account::default();
+		let mut receipts = [2usize, 5, 9]
+			.into_iter()
+			.map(|native_index| {
+				let (call, hash) = signed_call(&account, legacy_call_tx(account.address()));
+				extractor
+					.decode_transaction_and_build_receipt(
+						H256::zero(),
+						1.into(),
+						call,
+						hash,
+						native_index,
+						gas_info(),
+						native_index == 5,
+						vec![Log {
+							transaction_index: native_index.into(),
+							log_index: 99.into(),
+							..Default::default()
+						}],
+					)
+					.unwrap()
+			})
+			.collect::<Vec<_>>();
+		normalize_receipts(&mut receipts).unwrap();
+		assert_eq!(
+			receipts.iter().map(|(_, r)| r.transaction_index).collect::<Vec<_>>(),
+			vec![0.into(), 1.into(), 2.into()]
+		);
+		assert_eq!(
+			receipts.iter().map(|(_, r)| r.cumulative_gas_used).collect::<Vec<_>>(),
+			vec![21_000.into(), 42_000.into(), 63_000.into()]
+		);
+		assert!(receipts[1].1.logs.is_empty());
+		assert_eq!(receipts[0].1.logs[0].log_index, U256::zero());
+		assert_eq!(receipts[2].1.logs[0].log_index, U256::one());
+		assert_eq!(receipts[2].1.logs[0].transaction_index, U256::from(2));
+		receipts[0].1.gas_used = U256::MAX;
+		assert!(normalize_receipts(&mut receipts).is_err());
 	}
 
 	#[test]

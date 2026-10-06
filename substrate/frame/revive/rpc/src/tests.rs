@@ -252,8 +252,8 @@ async fn submit_substrate_transactions(
 					log::trace!(target: LOG_TARGET, "Substrate tx {i} submitted");
 					while let Some(status) = progress.next().await {
 						match status {
-							Ok(TxStatus::InFinalizedBlock(block)) |
-							Ok(TxStatus::InBestBlock(block)) => {
+							Ok(TxStatus::InFinalizedBlock(block))
+							| Ok(TxStatus::InBestBlock(block)) => {
 								log::trace!(target: LOG_TARGET,
 									"Substrate tx {i} included in block {:?}",
 									block.block_hash()
@@ -304,6 +304,61 @@ async fn verify_transactions_in_single_block(
 		return Err(anyhow!("Transaction {missing_hash:?} not found in block {block_number}"));
 	}
 
+	Ok(())
+}
+
+/// 在真实混合区块中核对权重与追踪：Ethereum 哈希必须绑定原生执行位置，而非回执序号。
+async fn verify_native_positions_for_ethereum_receipts(
+	client: &Arc<WsClient>,
+	block_number: U256,
+	expected_hashes: &[H256],
+	verify_traces: bool,
+) -> anyhow::Result<()> {
+	use crate::subxt_client::{
+		revive::calls::types::EthTransact, system::events::ExtrinsicSuccess,
+	};
+	let node_rpc = RpcClient::from_url(SharedResources::node_rpc_url()).await?;
+	let native_hash: H256 =
+		node_rpc.request("chain_getBlockHash", rpc_params![block_number]).await?;
+	let node = SharedResources::node_client().await;
+	let block = node.blocks().at(native_hash).await?;
+	let extrinsics = block.extrinsics().await?;
+	let mut positions = Vec::new();
+	for (native_index, ext) in extrinsics.iter().enumerate() {
+		let Some(call) = ext.as_extrinsic::<EthTransact>()? else {
+			continue;
+		};
+		let hash = H256(sp_crypto_hashing::keccak_256(&call.payload));
+		let event = ext.events().await?.find_first::<ExtrinsicSuccess>()?;
+		let expected_weight = event.map(|event| event.dispatch_info.weight.0);
+		assert_eq!(
+			crate::PolkadotRpcClient::post_dispatch_weight(&**client, hash).await?,
+			expected_weight
+		);
+		positions.push((native_index, hash));
+	}
+	assert!(
+		positions
+			.iter()
+			.enumerate()
+			.any(|(eth_index, (native_index, _))| eth_index != *native_index)
+	);
+	for hash in expected_hashes {
+		assert!(positions.iter().any(|(_, actual)| actual == hash));
+	}
+	if verify_traces {
+		let traces =
+			DebugRpcClient::trace_block_by_number(&**client, block_number.into(), None).await?;
+		for hash in expected_hashes {
+			let block_trace = traces
+				.iter()
+				.find(|trace| trace.tx_hash == *hash)
+				.expect("块追踪须保留同一 Ethereum 哈希");
+			let transaction_trace =
+				DebugRpcClient::trace_transaction(&**client, *hash, None).await?;
+			assert_eq!(transaction_trace, block_trace.trace);
+		}
+	}
 	Ok(())
 }
 
@@ -645,6 +700,13 @@ async fn test_receipt_mixed_revert_and_logs_same_block() -> anyhow::Result<()> {
 		)
 		.await?;
 	assert_eq!(tx1.unwrap().hash, revert_receipt.transaction_hash);
+	verify_native_positions_for_ethereum_receipts(
+		&client,
+		block_number,
+		&[emit_receipt.transaction_hash, revert_receipt.transaction_hash],
+		true,
+	)
+	.await?;
 
 	Ok(())
 }
@@ -1064,6 +1126,13 @@ async fn test_mixed_evm_substrate_transactions() -> anyhow::Result<()> {
 	// Fetch and verify block contains all transactions
 	verify_transactions_in_single_block(&client, evm_first_receipt.block_number, &evm_tx_hashes)
 		.await?;
+	verify_native_positions_for_ethereum_receipts(
+		&client,
+		evm_first_receipt.block_number,
+		&evm_tx_hashes,
+		false,
+	)
+	.await?;
 
 	Ok(())
 }

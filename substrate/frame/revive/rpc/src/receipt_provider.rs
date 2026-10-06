@@ -15,14 +15,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 use crate::{
-	Address, AddressOrAddresses, BlockInfoProvider, BlockNumberOrTag, Bytes, ChainMetadata,
-	ClientError, FilterTopic, ReceiptExtractor, SubxtBlockInfoProvider, SyncLabel, SyncStateKey,
 	block_sync::SyncCheckpoint,
 	client::{SubstrateBlock, SubstrateBlockNumber},
+	Address, AddressOrAddresses, BlockInfoProvider, BlockNumberOrTag, Bytes, ChainMetadata,
+	ClientError, FilterTopic, ReceiptExtractor, SubxtBlockInfoProvider, SyncLabel, SyncStateKey,
 };
 use pallet_revive::evm::{Filter, Log, ReceiptInfo, TransactionSigned};
 use sp_core::{H256, U256};
-use sqlx::{QueryBuilder, Row, Sqlite, SqlitePool, query};
+use sqlx::{query, QueryBuilder, Row, Sqlite, SqlitePool};
 use std::{
 	collections::{BTreeMap, HashMap},
 	sync::Arc,
@@ -161,8 +161,8 @@ macro_rules! upsert_sync_label {
 			VALUES ($1, $2, $3)
 			ON CONFLICT(label) DO UPDATE
 				SET block_number = excluded.block_number, block_hash = excluded.block_hash
-			WHERE sync_state.block_number " +
-				$op + " excluded.block_number
+			WHERE sync_state.block_number "
+				+ $op + " excluded.block_number
 			",
 			label_str,
 			block_number,
@@ -584,10 +584,10 @@ impl<B: BlockInfoProvider> ReceiptProvider<B> {
 
 				// Now loop through the blocks that were building on top of the old fork and remove
 				// them.
-				let mut next_block_number = block_number.saturating_add(1);
-				while let Some(old_block_map) = block_number_to_hash.remove(&next_block_number) {
-					to_remove.push(old_block_map);
-					next_block_number = next_block_number.saturating_add(1);
+				// 区块通知可能有缺口；不能在第一个缺口停止并留下旧分叉后代。
+				if let Some(next_block_number) = block_number.checked_add(1) {
+					to_remove
+						.extend(block_number_to_hash.split_off(&next_block_number).into_values());
 				}
 			},
 			_ => {},
@@ -720,6 +720,32 @@ impl<B: BlockInfoProvider> ReceiptProvider<B> {
 		let from_block = filter.from_block.map(&resolve_block_number).transpose()?;
 		let to_block = filter.to_block.map(&resolve_block_number).transpose()?;
 		let latest_block = U256::from(self.block_provider.latest_block_number().await);
+		if self.keep_latest_n_blocks.is_some() {
+			let indexed = self.block_number_to_hashes.lock().await;
+			// 哈希查询也必须命中近期索引，不能把已裁剪或未知块伪装成无日志。
+			if let Some(hash) = filter.block_hash {
+				if !indexed.values().any(|block| block.ethereum_hash == hash) {
+					anyhow::bail!("Requested blockHash is outside the retained Ethereum index");
+				}
+			}
+			let first = indexed
+				.first_key_value()
+				.map(|(number, _)| U256::from(*number))
+				.unwrap_or_else(|| {
+					latest_block.saturating_sub(U256::from(
+						self.keep_latest_n_blocks.unwrap_or(1).saturating_sub(1),
+					))
+				});
+			// 最近索引以外的范围必须显式失败，不能将缺少历史索引伪装成空日志。
+			if from_block.unwrap_or(latest_block) < first
+				|| to_block.unwrap_or(latest_block) < first
+			{
+				anyhow::bail!("Requested logs are outside the retained Ethereum index");
+			}
+			if from_block.is_none() && to_block.is_some() && !first.is_zero() {
+				anyhow::bail!("Specify fromBlock inside the retained Ethereum index");
+			}
+		}
 
 		match (from_block, to_block, filter.block_hash) {
 			(Some(_), _, Some(_)) | (_, Some(_), Some(_)) => {
@@ -793,15 +819,13 @@ impl<B: BlockInfoProvider> ReceiptProvider<B> {
 			}
 		}
 
-		qb.push(" LIMIT ").push_bind(MAX_LOG_RESULTS as i64);
+		qb.push(" ORDER BY block_number, transaction_index, log_index LIMIT ")
+			.push_bind((MAX_LOG_RESULTS + 1) as i64);
 
 		let logs = qb.build().try_map(parse_log_row).fetch_all(&self.db_ctx.pool).await?;
 
-		if logs.len() == MAX_LOG_RESULTS {
-			log::warn!(
-				target: LOG_TARGET,
-				"Log query hit limit of {MAX_LOG_RESULTS}; results may be truncated",
-			);
+		if logs.len() > MAX_LOG_RESULTS {
+			anyhow::bail!("Log query exceeds {MAX_LOG_RESULTS} results; narrow the block range");
 		}
 
 		Ok(logs)
@@ -819,8 +843,7 @@ impl<B: BlockInfoProvider> ReceiptProvider<B> {
 			.push_bind(block_number as i64)
 			.push(" AND block_hash = ")
 			.push_bind(ethereum_hash.as_bytes().to_vec())
-			.push(" ORDER BY log_index LIMIT ")
-			.push_bind(MAX_LOG_RESULTS as i64);
+			.push(" ORDER BY transaction_index, log_index");
 
 		let logs = query_builder
 			.build()
@@ -828,13 +851,7 @@ impl<B: BlockInfoProvider> ReceiptProvider<B> {
 			.fetch_all(&self.db_ctx.pool)
 			.await?;
 
-		if logs.len() == MAX_LOG_RESULTS {
-			log::warn!(
-				target: LOG_TARGET,
-				"Log query for block {block_number} hit limit of {MAX_LOG_RESULTS}; results may be truncated",
-			);
-		}
-
+		// 单块订阅必须完整交付；Runtime 的块限额约束其大小，查询的范围限额不截断订阅。
 		Ok(logs)
 	}
 
@@ -915,6 +932,11 @@ impl<B: BlockInfoProvider> ReceiptProvider<B> {
 				return None;
 			},
 		};
+		// 按交易哈希查询只返回当前规范链回执，通知尚未处理时也不泄漏旧分叉结果。
+		let canonical = self.block_provider.block_by_number(block.number()).await.ok()??;
+		if canonical.hash() != block.hash() {
+			return None;
+		}
 
 		match self.receipt_extractor.extract_from_transaction(&block, transaction_index).await {
 			Ok((_, receipt)) => Some(receipt),
@@ -931,6 +953,10 @@ impl<B: BlockInfoProvider> ReceiptProvider<B> {
 		let (block_hash, transaction_index) = self.find_transaction(transaction_hash).await?;
 
 		let block = self.block_provider.block_by_hash(&block_hash).await.ok()??;
+		let canonical = self.block_provider.block_by_number(block.number()).await.ok()??;
+		if canonical.hash() != block.hash() {
+			return None;
+		}
 		let (signed_tx, _) = self
 			.receipt_extractor
 			.extract_from_transaction(&block, transaction_index)
@@ -953,6 +979,103 @@ mod tests {
 	use pretty_assertions::assert_eq;
 	use sp_core::{H160, H256};
 	use sqlx::SqlitePool;
+
+	#[sqlx::test]
+	async fn reorg_removes_descendants_across_missing_notifications(
+		pool: SqlitePool,
+	) -> anyhow::Result<()> {
+		let provider = setup_sqlite_provider(pool).await;
+		for number in [0u32, 2, 4] {
+			let block = MockBlockInfo { hash: H256::from_low_u64_be(number as u64 + 1), number };
+			let ethereum_hash = H256::from_low_u64_be(number as u64 + 101);
+			let receipts = vec![(
+				TransactionSigned::default(),
+				ReceiptInfo {
+					transaction_hash: H256::from_low_u64_be(number as u64 + 201),
+					..Default::default()
+				},
+			)];
+			provider.insert(&block, &receipts, &ethereum_hash).await?;
+		}
+		let fork = MockBlockInfo { hash: H256::repeat_byte(0xee), number: 0 };
+		provider.insert(&fork, &[], &H256::repeat_byte(0xff)).await?;
+		assert_eq!(provider.block_number_to_hashes.lock().await.len(), 1);
+		assert_eq!(count(&provider.db_ctx.pool, "transaction_hashes", None).await, 0);
+		assert_eq!(count(&provider.db_ctx.pool, "eth_to_substrate_blocks", None).await, 1);
+		Ok(())
+	}
+
+	#[sqlx::test]
+	async fn logs_outside_retained_window_are_explicit_errors(
+		pool: SqlitePool,
+	) -> anyhow::Result<()> {
+		let provider = setup_sqlite_provider(pool).await.with_keep_latest(Some(1));
+		let old_hash = H256::repeat_byte(3);
+		let old_block = MockBlockInfo { hash: H256::repeat_byte(4), number: 1 };
+		provider.insert(&old_block, &[], &old_hash).await?;
+		let block = MockBlockInfo { hash: H256::repeat_byte(1), number: 2 };
+		let retained_hash = H256::repeat_byte(2);
+		provider.insert(&block, &[], &retained_hash).await?;
+		assert_eq!(provider.block_number_to_hashes.lock().await.len(), 1);
+		let filter =
+			Filter { from_block: Some(BlockNumberOrTag::U256(1.into())), ..Default::default() };
+		assert!(provider
+			.logs(Some(filter), mock_resolve_block_number_with_latest(2))
+			.await
+			.is_err());
+		assert!(provider.logs(None, mock_resolve_block_number_with_latest(2)).await?.is_empty());
+		// 只给终点会隐含完整历史；裁剪后必须明确给出仍被保留的起点。
+		assert!(provider
+			.logs(
+				Some(Filter {
+					to_block: Some(BlockNumberOrTag::U256(2.into())),
+					..Default::default()
+				}),
+				mock_resolve_block_number_with_latest(2)
+			)
+			.await
+			.is_err());
+		assert!(provider
+			.logs(
+				Some(Filter {
+					from_block: Some(BlockNumberOrTag::U256(2.into())),
+					to_block: Some(BlockNumberOrTag::U256(2.into())),
+					..Default::default()
+				}),
+				mock_resolve_block_number_with_latest(2)
+			)
+			.await?
+			.is_empty());
+		// 真实裁剪和从未登记的哈希均明确失败；保留的空日志块仍是成功查询。
+		let unknown_hash = H256::repeat_byte(5);
+		for hash in [old_hash, unknown_hash] {
+			let error = provider
+				.logs(
+					Some(Filter { block_hash: Some(hash), ..Default::default() }),
+					mock_resolve_block_number_with_latest(2),
+				)
+				.await
+				.unwrap_err();
+			assert!(error.to_string().contains("outside the retained Ethereum index"));
+		}
+		assert!(provider
+			.logs(
+				Some(Filter { block_hash: Some(retained_hash), ..Default::default() }),
+				mock_resolve_block_number_with_latest(2),
+			)
+			.await?
+			.is_empty());
+		// 未启用近期裁剪的归档模式保留原有空结果合同。
+		let archive = provider.with_keep_latest(None);
+		assert!(archive
+			.logs(
+				Some(Filter { block_hash: Some(unknown_hash), ..Default::default() }),
+				mock_resolve_block_number_with_latest(2),
+			)
+			.await?
+			.is_empty());
+		Ok(())
+	}
 
 	async fn count(pool: &SqlitePool, table: &str, block_hash: Option<H256>) -> usize {
 		let count: i64 = match block_hash {
@@ -1221,6 +1344,14 @@ mod tests {
 	#[sqlx::test]
 	async fn test_query_logs(pool: SqlitePool) -> anyhow::Result<()> {
 		let provider = setup_sqlite_provider(pool).await;
+		// 此查询夹具保留完整历史含创世块；历史裁剪拒绝由独立边界测试覆盖。
+		provider
+			.insert(
+				&MockBlockInfo { hash: H256::repeat_byte(0xff), number: 0 },
+				&[],
+				&H256::repeat_byte(0xfe),
+			)
+			.await?;
 		let block1 = MockBlockInfo { hash: H256::from([1u8; 32]), number: 1 };
 		let block2 = MockBlockInfo { hash: H256::from([2u8; 32]), number: 2 };
 		let ethereum_hash1 = H256::from([3u8; 32]);
@@ -1894,12 +2025,10 @@ mod tests {
 		);
 
 		// Wrong hash for same block number
-		assert!(
-			provider
-				.get_processed_eth_block_hash(10, H256::from([0xCC; 32]))
-				.await
-				.is_none()
-		);
+		assert!(provider
+			.get_processed_eth_block_hash(10, H256::from([0xCC; 32]))
+			.await
+			.is_none());
 
 		// Wrong block number
 		assert!(provider.get_processed_eth_block_hash(11, block.hash).await.is_none());
