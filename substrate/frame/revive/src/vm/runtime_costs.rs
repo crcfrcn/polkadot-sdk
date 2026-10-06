@@ -16,10 +16,14 @@
 // limitations under the License.
 
 use crate::{
-	Config, limits, metering::Token, weightinfo_extension::OnFinalizeBlockParts,
-	weights::WeightInfo,
+	limits, metering::Token, weightinfo_extension::OnFinalizeBlockParts, weights::WeightInfo,
+	Config,
 };
-use frame_support::weights::{Weight, constants::WEIGHT_REF_TIME_PER_SECOND};
+use codec::MaxEncodedLen;
+use frame_support::{
+	traits::Get,
+	weights::{constants::WEIGHT_REF_TIME_PER_SECOND, Weight},
+};
 
 /// Current approximation of the gas/s consumption considering
 /// EVM execution over compiled WASM (on 4.4Ghz CPU).
@@ -276,7 +280,13 @@ impl<T: Config> Token<T> for RuntimeCosts {
 				.saturating_add(Weight::from_parts(
 					limits::EXTRA_EVENT_CHARGE_PER_BYTE.saturating_mul(len.into()).into(),
 					0,
-				)),
+				))
+				// 整分链日志占用状态空间，计入资源上限；不进入制度费用公式。
+				.saturating_add(if T::StrictNativeBalance::get() {
+					Weight::from_parts(0, u64::from(len).saturating_add(256))
+				} else {
+					Weight::zero()
+				}),
 			SetStorage { new_bytes, old_bytes } => {
 				cost_storage!(write, seal_set_storage, new_bytes, old_bytes)
 			},
@@ -333,7 +343,16 @@ impl<T: Config> Token<T> for RuntimeCosts {
 			Precompile(weight) => weight,
 			EcdsaToEthAddress => T::WeightInfo::seal_ecdsa_to_eth_address(),
 			GetImmutableData(len) => T::WeightInfo::seal_get_immutable_data(len),
-			SetImmutableData(len) => T::WeightInfo::seal_set_immutable_data(len),
+			SetImmutableData(len) => T::WeightInfo::seal_set_immutable_data(len)
+				// 新数据与账户键同受空间预算约束；既有计时权重及非整分链保持原值。
+				.saturating_add(if T::StrictNativeBalance::get() {
+					Weight::from_parts(
+						0,
+						u64::from(len).saturating_add(T::AccountId::max_encoded_len() as u64),
+					)
+				} else {
+					Weight::zero()
+				}),
 			Bn128Add => T::WeightInfo::bn128_add(),
 			Bn128Mul => T::WeightInfo::bn128_mul(),
 			Bn128Pairing(len) => T::WeightInfo::bn128_pairing(len),

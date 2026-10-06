@@ -1429,6 +1429,74 @@ mod native_fees {
 			});
 		}
 	}
+	/// 计时充足时，日志及不可变数据也必须受空间预算约束，拒绝不能留下状态或扣款。
+	#[test]
+	fn state_growth_exhausts_space_before_time() {
+		use crate::{
+			metering::{Token, TransactionMeter},
+			vm::RuntimeCosts,
+		};
+		ext().execute_with(|| {
+			for token in [
+				RuntimeCosts::DepositEvent { num_topic: 0, len: 0 },
+				RuntimeCosts::DepositEvent { num_topic: 4, len: crate::limits::EVENT_BYTES },
+				RuntimeCosts::SetImmutableData(0),
+				RuntimeCosts::SetImmutableData(crate::limits::IMMUTABLE_BYTES),
+			] {
+				let cost = <RuntimeCosts as Token<NativeTest>>::weight(&token);
+				assert!(cost.proof_size() > 0);
+				let root = sp_io::storage::root(sp_runtime::StateVersion::V1);
+				let mut meter =
+					TransactionMeter::<NativeTest>::new(TransactionLimits::WeightAndDeposit {
+						weight_limit: Weight::from_parts(u64::MAX, cost.proof_size()),
+						deposit_limit: 0,
+					})
+					.unwrap();
+				assert_ok!(meter.charge_weight_token(token));
+				assert_eq!(
+					meter.charge_weight_token(token),
+					Err(crate::Error::<NativeTest>::OutOfGas.into())
+				);
+				let mut too_small =
+					TransactionMeter::<NativeTest>::new(TransactionLimits::WeightAndDeposit {
+						weight_limit: Weight::from_parts(u64::MAX, cost.proof_size() - 1),
+						deposit_limit: 0,
+					})
+					.unwrap();
+				assert_eq!(
+					too_small.charge_weight_token(token),
+					Err(crate::Error::<NativeTest>::OutOfGas.into())
+				);
+				assert_eq!(sp_io::storage::root(sp_runtime::StateVersion::V1), root);
+			}
+		});
+	}
+
+	/// 空间限额随真实数据增长；上游非严格模式的资源值与时间测量值均保持原样。
+	#[test]
+	fn native_space_meter_preserves_non_native_and_measured_time() {
+		use crate::{metering::Token, vm::RuntimeCosts};
+		for (small, large) in [
+			(
+				RuntimeCosts::DepositEvent { num_topic: 0, len: 0 },
+				RuntimeCosts::DepositEvent { num_topic: 0, len: crate::limits::EVENT_BYTES },
+			),
+			(
+				RuntimeCosts::SetImmutableData(0),
+				RuntimeCosts::SetImmutableData(crate::limits::IMMUTABLE_BYTES),
+			),
+		] {
+			let native_small = <RuntimeCosts as Token<NativeTest>>::weight(&small);
+			let native_large = <RuntimeCosts as Token<NativeTest>>::weight(&large);
+			let standard_small = <RuntimeCosts as Token<super::Test>>::weight(&small);
+			let standard_large = <RuntimeCosts as Token<super::Test>>::weight(&large);
+			assert_eq!(native_small.ref_time(), standard_small.ref_time());
+			assert_eq!(native_large.ref_time(), standard_large.ref_time());
+			assert_eq!(standard_small.proof_size(), 0);
+			assert_eq!(standard_large.proof_size(), 0);
+			assert!(native_large.proof_size() > native_small.proof_size());
+		}
+	}
 }
 
 /// 与上游 dust/PGAS 夹具隔离的 u128 整单位 Runtime；只测试金额，Ethereum 收费入口关闭。
