@@ -26,7 +26,9 @@ mod stipends;
 use std::collections::HashMap;
 
 use crate::{
-	self as pallet_revive,
+	self as pallet_revive, AccountId32Mapper, AddressMapper, BalanceOf, BalanceWithDust, Call,
+	CodeInfoOf, Config, DelegateInfo, ExecOrigin as Origin, ExecReturnValue, GenesisConfig,
+	OriginFor, Pallet, PristineCode,
 	deposit_payment::PGasDeposit,
 	evm::{
 		fees::{BlockRatioFee, Info as FeeInfo},
@@ -35,29 +37,25 @@ use crate::{
 	genesis::{Account, ContractData},
 	mock::MockHandler,
 	test_utils::*,
-	AccountId32Mapper, AddressMapper, BalanceOf, BalanceWithDust, Call, CodeInfoOf, Config,
-	DelegateInfo, ExecOrigin as Origin, ExecReturnValue, GenesisConfig, OriginFor, Pallet,
-	PristineCode,
 };
 use frame_support::{
-	assert_ok, derive_impl,
+	DefaultNoBound, assert_ok, derive_impl,
 	pallet_prelude::EnsureOrigin,
 	parameter_types,
 	traits::{
-		tokens::imbalance::ResolveTo, AsEnsureOriginWithArg, ConstU128, ConstU32, FindAuthor,
-		OriginTrait, StorageVersion,
+		AsEnsureOriginWithArg, ConstU32, ConstU128, FindAuthor, OriginTrait, StorageVersion,
+		tokens::imbalance::ResolveTo,
 	},
-	weights::{constants::WEIGHT_REF_TIME_PER_SECOND, FixedFee, Weight},
-	DefaultNoBound,
+	weights::{FixedFee, Weight, constants::WEIGHT_REF_TIME_PER_SECOND},
 };
 use pallet_revive_fixtures::compile_module;
 use pallet_transaction_payment::{ChargeTransactionPayment, ConstFeeMultiplier, Multiplier};
 use sp_core::{H160, U256};
-use sp_keystore::{testing::MemoryKeystore, KeystoreExt};
+use sp_keystore::{KeystoreExt, testing::MemoryKeystore};
 use sp_runtime::{
+	AccountId32, BuildStorage, FixedU128, MultiAddress, MultiSignature, Perbill, Storage,
 	generic::Header,
 	traits::{BlakeTwo256, Convert, IdentityLookup, One},
-	AccountId32, BuildStorage, FixedU128, MultiAddress, MultiSignature, Perbill, Storage,
 };
 
 pub type Address = MultiAddress<AccountId32, u32>;
@@ -126,8 +124,8 @@ pub mod test_utils {
 		Test,
 	};
 	use crate::{
-		address::AddressMapper, exec::AccountIdOf, AccountInfo, AccountInfoOf, BalanceOf, CodeInfo,
-		CodeInfoOf, Config, ContractInfo, PristineCode,
+		AccountInfo, AccountInfoOf, BalanceOf, CodeInfo, CodeInfoOf, Config, ContractInfo,
+		PristineCode, address::AddressMapper, exec::AccountIdOf,
 	};
 	use codec::{Encode, MaxEncodedLen};
 	use frame_support::traits::fungible::{InspectHold, Mutate};
@@ -226,9 +224,9 @@ pub mod test_utils {
 pub(crate) mod builder {
 	use super::Test;
 	use crate::{
-		test_utils::{builder::*, ALICE},
-		tests::RuntimeOrigin,
 		Code,
+		test_utils::{ALICE, builder::*},
+		tests::RuntimeOrigin,
 	};
 	use sp_core::{H160, H256};
 
@@ -746,16 +744,16 @@ mod native_fees {
 	use super::*;
 	use crate::evm::runtime::EthExtra;
 	use crate::{
-		evm::fees::{InfoT, NativeFee, NativeInfo},
 		ExecConfig, TransactionLimits,
+		evm::fees::{InfoT, NativeFee, NativeInfo},
 	};
 	use codec::{Decode, Encode};
 	use frame_support::{
 		dispatch::{DispatchInfo, GetDispatchInfo, PostDispatchInfo},
 		traits::{
+			ConstBool, ConstU64,
 			fungible::{Balanced, Credit, Inspect, Mutate},
 			tokens::{Fortitude, Precision, Preservation},
-			ConstBool, ConstU64,
 		},
 	};
 	use pallet_transaction_payment::{OnChargeTransaction, TxCreditHold};
@@ -947,7 +945,7 @@ mod native_fees {
 			input: crate::evm::Bytes(input).into(),
 			chain_id: Some(<<NativeTest as Config>::ChainId as Get<u64>>::get().into()),
 			gas: Some(gas.into()),
-			gas_price: Some(U256::from(native_monetary::SCALE)),
+			gas_price: Some(crate::evm::fees::native_gas_price::<NativeTest>()),
 			nonce: Some(0.into()),
 			r#type: Some(crate::evm::TYPE_LEGACY.into()),
 			..Default::default()
@@ -1008,7 +1006,7 @@ mod native_fees {
 		ext().execute_with(|| {
 			<NativeTest as Config>::FeeInfo::integrity_test();
 			let before = sp_io::storage::root(sp_runtime::StateVersion::V1);
-			for gas in [5_000_000, 10_000_000] {
+			for gas in [500_000_000, 1_000_000_000] {
 				let generic = tx(Some(H160::repeat_byte(9)), vec![], gas);
 				let info = generic
 					.clone()
@@ -1033,9 +1031,93 @@ mod native_fees {
 		ext().execute_with(|| {
 			let signer = crate::evm::Account::default().substrate_account();
 			let before = Balances::balance(&signer);
-			execute(tx(Some(H160::repeat_byte(9)), vec![], 10_000_000)).unwrap();
+			execute(tx(Some(H160::repeat_byte(9)), vec![], 1_000_000_000)).unwrap();
 			assert_eq!(Balances::balance(&BOB), 10_000 - FEE);
 			assert_eq!(Balances::balance(&signer), before);
+			crate::block_storage::on_finalize_build_eth_block::<NativeTest>(1);
+			let receipt = crate::ReceiptInfoData::<NativeTest>::get().pop().unwrap();
+			assert_eq!(receipt.effective_gas_price, U256::from(1_000_000_000u64));
+			assert_eq!(receipt.gas_used, U256::from(FEE * 10_000_000));
+			assert_eq!(
+				receipt.gas_used * receipt.effective_gas_price,
+				U256::from(FEE) * U256::from(native_monetary::SCALE)
+			);
+		});
+	}
+
+	/// 钱包默认估算覆盖业务费；修改 gas 缓冲与 EIP-1559 上限不改变实际费。
+	#[test]
+	fn native_fee_estimate_and_eip1559_receipt_use_the_same_fixed_price() {
+		ext().execute_with(|| {
+			let price = crate::evm::fees::native_gas_price::<NativeTest>();
+			assert_eq!(Contracts::evm_base_fee(), price);
+			let mut generic = tx(Some(H160::repeat_byte(9)), vec![], 1_000_000_000);
+			generic.gas = None;
+			generic.gas_price = None;
+			generic.r#type = Some(crate::evm::TYPE_EIP1559.into());
+			let before = sp_io::storage::root(sp_runtime::StateVersion::V1);
+			let estimate =
+				Contracts::eth_estimate_gas(generic.clone(), Default::default()).unwrap();
+			assert!(estimate >= U256::from(FEE * 10_000_000));
+			assert_eq!(sp_io::storage::root(sp_runtime::StateVersion::V1), before);
+			generic.gas = Some(estimate * 2);
+			generic.max_fee_per_gas = Some(price * 2);
+			generic.max_priority_fee_per_gas = Some(U256::zero());
+			execute(generic.clone()).unwrap();
+			execute(generic).unwrap();
+			crate::block_storage::on_finalize_build_eth_block::<NativeTest>(1);
+			let receipts = crate::ReceiptInfoData::<NativeTest>::get();
+			assert_eq!(receipts.len(), 2);
+			for receipt in receipts {
+				assert_eq!(receipt.effective_gas_price, price);
+				assert_eq!(
+					receipt.gas_used * price,
+					U256::from(FEE) * U256::from(native_monetary::SCALE)
+				);
+			}
+			let block = crate::EthereumBlock::<NativeTest>::get();
+			assert_eq!(block.base_fee_per_gas, price);
+			assert_eq!(block.gas_used, U256::from(FEE * 20_000_000));
+			assert_eq!(Balances::balance(&BOB), 10_000 - 2 * FEE);
+		});
+	}
+
+	/// 费用限额、价格、优先费及转换边界在验签阶段拒绝，不能先扣费再失败。
+	#[test]
+	fn native_fee_gas_price_and_signed_limit_boundaries_are_enforced() {
+		ext().execute_with(|| {
+			let price = crate::evm::fees::native_gas_price::<NativeTest>();
+			assert_eq!(crate::evm::fees::native_fee_to_gas::<NativeTest>(0).unwrap(), 0);
+			let largest = u64::MAX as u128 / 10_000_000;
+			assert!(crate::evm::fees::native_fee_to_gas::<NativeTest>(largest).is_ok());
+			assert_eq!(
+				crate::evm::fees::native_fee_to_gas::<NativeTest>(largest + 1),
+				Err(InvalidTransaction::ExhaustsResources)
+			);
+			let before = sp_io::storage::root(sp_runtime::StateVersion::V1);
+			let mut invalid = vec![];
+			for value in [U256::zero(), price - 1, price + 1] {
+				let mut generic = tx(Some(H160::repeat_byte(9)), vec![], 1_000_000_000);
+				generic.gas_price = Some(value);
+				invalid.push(generic);
+			}
+			for (cap, tip, gas) in [
+				(price - 1, U256::zero(), 1_000_000_000u64),
+				(price * 2, U256::one(), 1_000_000_000),
+				(price * 2, U256::zero(), (FEE * 10_000_000 - 1) as u64),
+			] {
+				let mut generic = tx(Some(H160::repeat_byte(9)), vec![], gas);
+				generic.r#type = Some(crate::evm::TYPE_EIP1559.into());
+				generic.max_fee_per_gas = Some(cap);
+				generic.max_priority_fee_per_gas = Some(tip);
+				invalid.push(generic);
+			}
+			for generic in invalid {
+				let signed = crate::evm::Account::default()
+					.sign_transaction(generic.try_into_unsigned().unwrap());
+				assert!(checked_payload(signed.signed_payload()).is_err());
+				assert_eq!(sp_io::storage::root(sp_runtime::StateVersion::V1), before);
+			}
 		});
 	}
 	/// 模拟使用相同收费器，余额、发行量、nonce、事件和全部存储最后都回滚。
@@ -1044,7 +1126,7 @@ mod native_fees {
 		ext().execute_with(|| {
 			let before = sp_io::storage::root(sp_runtime::StateVersion::V1);
 			let result = Contracts::dry_run_eth_transact(
-				tx(Some(H160::repeat_byte(9)), vec![], 10_000_000),
+				tx(Some(H160::repeat_byte(9)), vec![], 1_000_000_000),
 				crate::evm::DryRunConfig {
 					perform_balance_checks: Some(true),
 					..Default::default()
@@ -1065,7 +1147,7 @@ mod native_fees {
 				assert!(resource_weight_to_gas::<NativeTest>(weight) <= gas);
 			}
 			assert!(resource_weight_to_gas::<NativeTest>(Weight::from_parts(0, 1)) > 0);
-			let mut generic = tx(Some(H160::repeat_byte(9)), vec![], 10_000_000);
+			let mut generic = tx(Some(H160::repeat_byte(9)), vec![], 1_000_000_000);
 			generic.gas = Some(1.into());
 			assert!(generic
 				.into_call::<NativeTest>(crate::evm::CreateCallMode::ExtrinsicExecution(
@@ -1081,23 +1163,23 @@ mod native_fees {
 	fn invalid_payment_amount_resource_and_native_business_are_rejected() {
 		ext().execute_with(|| {
 			let mode = crate::evm::CreateCallMode::ExtrinsicExecution(1024, vec![]);
-			let mut generic = tx(Some(H160::repeat_byte(9)), vec![], 10_000_000);
+			let mut generic = tx(Some(H160::repeat_byte(9)), vec![], 1_000_000_000);
 			generic.gas_price = Some(U256::one());
 			assert!(generic.into_call::<NativeTest>(mode.clone()).is_err());
-			let mut generic = tx(Some(H160::repeat_byte(9)), vec![], 10_000_000);
+			let mut generic = tx(Some(H160::repeat_byte(9)), vec![], 1_000_000_000);
 			generic.value = Some(U256::one());
 			assert!(generic.into_call::<NativeTest>(mode.clone()).is_err());
-			let mut generic = tx(Some(H160::repeat_byte(9)), vec![], 10_000_000);
+			let mut generic = tx(Some(H160::repeat_byte(9)), vec![], 1_000_000_000);
 			generic.gas = Some(U256::MAX);
 			assert!(generic.into_call::<NativeTest>(mode.clone()).is_err());
 			let generic = tx(
 				Some(crate::RUNTIME_PALLETS_ADDR),
 				RuntimeCall::System(frame_system::Call::remark { remark: vec![] }).encode(),
-				10_000_000,
+				1_000_000_000,
 			);
 			assert!(generic.into_call::<NativeTest>(mode).is_err());
 			Balances::set_balance(&BOB, 111);
-			let generic = tx(Some(H160::repeat_byte(9)), vec![], 10_000_000);
+			let generic = tx(Some(H160::repeat_byte(9)), vec![], 1_000_000_000);
 			let signed = crate::evm::Account::default()
 				.sign_transaction(generic.try_into_unsigned().unwrap());
 			let before = sp_io::storage::root(sp_runtime::StateVersion::V1);
@@ -1145,9 +1227,10 @@ mod native_fees {
 					.into_iter()
 					.enumerate()
 			{
-				let mut generic = tx(Some(dest), vec![], 10_000_000);
+				let mut generic = tx(Some(dest), vec![], 1_000_000_000);
 				generic.r#type = Some(kind.into());
-				generic.max_fee_per_gas = Some(native_monetary::SCALE.into());
+				generic.max_fee_per_gas =
+					Some(crate::evm::fees::native_gas_price::<NativeTest>() * 2);
 				generic.max_priority_fee_per_gas = Some(U256::zero());
 				generic.value = Some(native_monetary::SCALE.into());
 				generic.from = Some(AccountId32Mapper::<NativeTest>::to_address(&BOB));
@@ -1173,7 +1256,7 @@ mod native_fees {
 	fn invalid_chain_nonce_and_native_dispatch_leave_state_unchanged() {
 		ext().execute_with(|| {
 			let before = sp_io::storage::root(sp_runtime::StateVersion::V1);
-			let base = tx(Some(H160::repeat_byte(9)), vec![], 10_000_000);
+			let base = tx(Some(H160::repeat_byte(9)), vec![], 1_000_000_000);
 			let mut invalid = vec![];
 			for chain_id in [None, Some(U256::from(1)), Some(U256::from(2028))] {
 				let mut generic = base.clone();
@@ -1188,7 +1271,7 @@ mod native_fees {
 			invalid.push(tx(
 				Some(crate::RUNTIME_PALLETS_ADDR),
 				RuntimeCall::System(frame_system::Call::remark { remark: vec![] }).encode(),
-				10_000_000,
+				1_000_000_000,
 			));
 			for generic in invalid {
 				let signed = crate::evm::Account::default()
@@ -1203,9 +1286,9 @@ mod native_fees {
 	#[test]
 	fn invalid_signatures_encoding_and_unsupported_types_are_rejected() {
 		ext().execute_with(|| {
-			let mut generic = tx(Some(H160::repeat_byte(9)), vec![], 10_000_000);
+			let mut generic = tx(Some(H160::repeat_byte(9)), vec![], 1_000_000_000);
 			generic.r#type = Some(crate::evm::TYPE_EIP1559.into());
-			generic.max_fee_per_gas = Some(native_monetary::SCALE.into());
+			generic.max_fee_per_gas = Some(crate::evm::fees::native_gas_price::<NativeTest>() * 2);
 			let unsigned = generic.clone().try_into_unsigned().unwrap();
 			let signed = crate::evm::Account::default().sign_transaction(unsigned.clone());
 			assert!(checked_payload(signed.signed_payload()).is_ok());
@@ -1261,7 +1344,7 @@ mod native_fees {
 	#[test]
 	fn replay_and_future_nonce_cannot_enter_prepare_or_charge_again() {
 		ext().execute_with(|| {
-			let generic = tx(Some(H160::repeat_byte(9)), vec![], 10_000_000);
+			let generic = tx(Some(H160::repeat_byte(9)), vec![], 1_000_000_000);
 			let future = checked({
 				let mut tx = generic.clone();
 				tx.nonce = Some(1.into());
@@ -1371,7 +1454,7 @@ mod native_fees {
 			let encoded = Marker::new_from_eth_transaction().encode();
 			assert!(encoded.is_empty());
 			let decoded = Marker::decode(&mut &encoded[..]).unwrap();
-			let call = checked(tx(Some(H160::repeat_byte(9)), vec![], 10_000_000)).function;
+			let call = checked(tx(Some(H160::repeat_byte(9)), vec![], 1_000_000_000)).function;
 			let before = sp_io::storage::root(sp_runtime::StateVersion::V1);
 			let (_, _, origin) = decoded
 				.validate(
@@ -1415,12 +1498,18 @@ mod native_fees {
 				);
 				let dest = deployed.result.unwrap().addr;
 				let before = Balances::balance(&signer);
-				let mut generic = tx(Some(dest), vec![], 1_000_000);
+				let mut generic = tx(Some(dest), vec![], 1_000_000_000);
 				generic.value = Some(native_monetary::SCALE.into());
 				// Ethereum外层保留成功以写收据，合约失败以确切事件记录；value必须回滚。
 				execute(generic).unwrap();
 				assert_eq!(Balances::balance(&BOB), 10_000 - FEE);
 				assert_eq!(Balances::balance(&signer), before);
+				crate::block_storage::on_finalize_build_eth_block::<NativeTest>(1);
+				let receipt = crate::ReceiptInfoData::<NativeTest>::get().pop().unwrap();
+				assert_eq!(
+					receipt.gas_used * receipt.effective_gas_price,
+					U256::from(FEE) * U256::from(native_monetary::SCALE)
+				);
 				assert!(System::events().iter().any(|event| matches!(
 					event.event,
 					RuntimeEvent::Contracts(crate::Event::EthExtrinsicRevert { dispatch_error })
@@ -1825,6 +1914,7 @@ mod native_monetary {
 				0,
 				&Default::default(),
 				U256::from(3),
+				None,
 			);
 			assert_eq!(
 				result.result.unwrap_err().error,

@@ -198,3 +198,27 @@ async fn test_update_fee_history() {
 	};
 	assert_eq!(fee_history_result, expected_result);
 }
+
+/// 原生回执使用同一固定价格，业务费对应的 gas 汇总不能产生虚构优先费。
+#[tokio::test]
+async fn native_receipts_keep_fee_history_base_price_and_zero_rewards() {
+	let price = U256::from(1_000_000_000u64);
+	let block = Block {
+		number: U256::from(200),
+		base_fee_per_gas: price,
+		gas_used: U256::from(470_000_000u64),
+		gas_limit: U256::from(940_000_000u64),
+		..Default::default()
+	};
+	let receipts = [100_000_000u64, 370_000_000].map(|gas| ReceiptInfo {
+		gas_used: gas.into(),
+		effective_gas_price: price,
+		..Default::default()
+	});
+	let provider = FeeHistoryProvider::default();
+	provider.update_fee_history(&block, &receipts).await;
+	let result = provider.fee_history(1, 200, Some(vec![0.0, 50.0, 100.0])).await.unwrap();
+	assert_eq!(result.base_fee_per_gas, vec![price, price]);
+	assert_eq!(result.gas_used_ratio, vec![0.5]);
+	assert_eq!(result.reward, vec![vec![U256::zero(); 3]]);
+}

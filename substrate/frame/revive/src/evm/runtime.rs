@@ -16,33 +16,33 @@
 // limitations under the License.
 //! Runtime types for integrating `pallet-revive` with the EVM.
 use crate::{
+	AccountIdOf, AddressMapper, BalanceOf, CallOf, Config, LOG_TARGET, Pallet, Zero,
 	evm::{
+		CreateCallMode,
 		api::{GenericTransaction, TransactionSigned},
 		fees::InfoT,
-		CreateCallMode,
 	},
-	AccountIdOf, AddressMapper, BalanceOf, CallOf, Config, Pallet, Zero, LOG_TARGET,
 };
 use codec::{Decode, DecodeWithMemTracking, Encode};
 use frame_support::{
 	dispatch::{DispatchInfo, GetDispatchInfo},
 	traits::{
+		InherentBuilder, IsSubType, SignedTransactionBuilder,
 		fungible::Balanced,
 		tokens::{Fortitude, Precision, Preservation},
-		InherentBuilder, IsSubType, SignedTransactionBuilder,
 	},
 };
 use pallet_transaction_payment::Config as TxConfig;
 use scale_info::{StaticTypeInfo, TypeInfo};
 use sp_core::{Get, U256};
 use sp_runtime::{
+	Debug, OpaqueExtrinsic, Weight,
 	generic::{self, CheckedExtrinsic, ExtrinsicFormat},
 	traits::{
 		Checkable, ExtrinsicCall, ExtrinsicLike, ExtrinsicMetadata, LazyExtrinsic, Pipeline,
 		TransactionExtension,
 	},
 	transaction_validity::{InvalidTransaction, TransactionValidityError},
-	Debug, OpaqueExtrinsic, Weight,
 };
 
 /// Used to set the weight limit argument of a `eth_call` or `eth_instantiate_with_code` call.
@@ -170,14 +170,14 @@ where
 		E::ExtensionV0,
 		E::ExtensionOtherVersions,
 	>: Checkable<
-		Lookup,
-		Checked = CheckedExtrinsic<
-			AccountIdOf<E::Config>,
-			CallOf<E::Config>,
-			E::ExtensionV0,
-			E::ExtensionOtherVersions,
+			Lookup,
+			Checked = CheckedExtrinsic<
+				AccountIdOf<E::Config>,
+				CallOf<E::Config>,
+				E::ExtensionV0,
+				E::ExtensionOtherVersions,
+			>,
 		>,
-	>,
 {
 	type Checked = CheckedExtrinsic<
 		AccountIdOf<E::Config>,
@@ -412,7 +412,11 @@ pub trait EthExtra {
 			<Pallet<Self::Config>>::evm_base_fee()
 		};
 		// 原生报价只能使用已验签恢复的账户，不能信任交易自报付款者。
-		let tx = GenericTransaction::from_signed(tx, base_fee, Some(signer_addr));
+		let mut tx = GenericTransaction::from_signed(tx, base_fee, Some(signer_addr));
+		if <Self::Config as Config>::StrictNativeBalance::get() {
+			// 先检查签名原价和上限，再写入固定实际价格，不能静默接受错误 Legacy 原价。
+			tx.gas_price = Some(tx.native_gas_price::<Self::Config>()?);
+		}
 		let nonce: <Self::Config as frame_system::Config>::Nonce =
 			tx.nonce.unwrap_or_default().try_into().map_err(|_| {
 				log::debug!(target: LOG_TARGET, "Failed to convert nonce");
@@ -486,12 +490,12 @@ pub trait EthExtra {
 mod test {
 	use super::*;
 	use crate::{
+		EthTransactInfo, RUNTIME_PALLETS_ADDR, Weight,
 		evm::*,
 		test_utils::*,
 		tests::{
 			Address, ExtBuilder, RuntimeCall, RuntimeOrigin, SignedExtra, Test, UncheckedExtrinsic,
 		},
-		EthTransactInfo, Weight, RUNTIME_PALLETS_ADDR,
 	};
 	use frame_support::traits::fungible::Mutate;
 	use pallet_revive_fixtures::compile_module;

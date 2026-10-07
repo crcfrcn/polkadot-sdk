@@ -19,19 +19,19 @@
 
 use crate::weights::WeightInfo;
 use crate::{
-	evm::{
-		runtime::{EthExtra, SetWeightLimit},
-		OnChargeTransactionBalanceOf,
-	},
 	BalanceOf, CallOf, Config, DispatchErrorWithPostInfo, DispatchResultWithPostInfo, Error,
-	PostDispatchInfo, LOG_TARGET,
+	LOG_TARGET, PostDispatchInfo,
+	evm::{
+		OnChargeTransactionBalanceOf,
+		runtime::{EthExtra, SetWeightLimit},
+	},
 };
 use codec::Encode;
 use core::marker::PhantomData;
 use frame_support::{
 	dispatch::{DispatchClass, DispatchInfo, GetDispatchInfo},
 	pallet_prelude::Weight,
-	traits::{fungible::Credit, tokens::Balance, Get, SuppressedDrop},
+	traits::{Get, SuppressedDrop, fungible::Credit, tokens::Balance},
 	weights::WeightToFee,
 };
 use frame_system::Config as SysConfig;
@@ -41,11 +41,11 @@ use pallet_transaction_payment::{
 };
 use sp_arithmetic::{FixedPointOperand, SignedRounding};
 use sp_runtime::{
+	FixedPointNumber, FixedU128, SaturatedConversion, Saturating,
 	generic::UncheckedExtrinsic,
 	traits::{
 		Block as BlockT, Dispatchable, ExtensionPostDispatchWeightHandler, TransactionExtension,
 	},
-	FixedPointNumber, FixedU128, SaturatedConversion, Saturating,
 };
 
 type CreditOf<T> = Credit<<T as frame_system::Config>::AccountId, <T as Config>::Currency>;
@@ -489,6 +489,9 @@ where
 		assert!(<E::Config as Config>::DepositPerByte::get().is_zero());
 		assert!(<E::Config as Config>::DepositPerItem::get().is_zero());
 		assert!(<E::Config as Config>::DepositPerChildTrieItem::get().is_zero());
+		let ratio: sp_core::U256 = <E::Config as Config>::NativeToEthRatio::get().into();
+		assert!(!ratio.is_zero());
+		assert!((ratio % native_gas_price::<E::Config>()).is_zero());
 		let max = <E::Config as SysConfig>::BlockWeights::get().max_block;
 		assert!(max.ref_time() > 0 && max.proof_size() > 0);
 		assert!(
@@ -541,6 +544,28 @@ where
 			UncheckedExtrinsic::new_bare(call).into();
 		u32::try_from(uxt.encoded_size()).unwrap_or(u32::MAX)
 	}
+}
+
+/// Ethereum 钱包使用的固定费用刻度；公民链为 1 gwei，不改变 Runtime 收费制度。
+pub fn native_gas_price<T: Config>() -> sp_core::U256 {
+	let ratio: sp_core::U256 = T::NativeToEthRatio::get().into();
+	(ratio / sp_core::U256::from(10_000_000u64)).max(sp_core::U256::one())
+}
+
+/// 把既有原生报价准确转换为回执 gas，拒绝余数、溢出及超出 Ethereum 限额。
+pub fn native_fee_to_gas<T: Config>(
+	fee: BalanceOf<T>,
+) -> Result<u64, sp_runtime::transaction_validity::InvalidTransaction> {
+	use sp_runtime::transaction_validity::InvalidTransaction;
+	let fee: sp_core::U256 = fee.into();
+	let wei = fee
+		.checked_mul(T::NativeToEthRatio::get().into())
+		.ok_or(InvalidTransaction::Payment)?;
+	let (gas, remainder) = wei.div_mod(native_gas_price::<T>());
+	if !remainder.is_zero() {
+		return Err(InvalidTransaction::Payment);
+	}
+	gas.try_into().map_err(|_| InvalidTransaction::ExhaustsResources)
 }
 
 /// 仅把执行 Weight 换成资源 gas，不读取金额、费率或费用乘数。

@@ -18,19 +18,20 @@
 //! Functionality to decode an eth transaction into an dispatchable call.
 
 use crate::{
+	BalanceOf, CallOf, Config, GenericTransaction, LOG_TARGET, Pallet, RUNTIME_PALLETS_ADDR,
+	Weight, Zero,
 	evm::{
-		fees::{compute_max_integer_quotient, InfoT},
-		runtime::SetWeightLimit,
 		TYPE_LEGACY,
+		fees::{InfoT, compute_max_integer_quotient},
+		runtime::SetWeightLimit,
 	},
-	extract_code_and_data, BalanceOf, CallOf, Config, GenericTransaction, Pallet, Weight, Zero,
-	LOG_TARGET, RUNTIME_PALLETS_ADDR,
+	extract_code_and_data,
 };
 use alloc::{boxed::Box, vec::Vec};
 use codec::DecodeLimit;
 use frame_support::MAX_EXTRINSIC_DEPTH;
 use sp_core::{Get, U256};
-use sp_runtime::{transaction_validity::InvalidTransaction, SaturatedConversion};
+use sp_runtime::{SaturatedConversion, transaction_validity::InvalidTransaction};
 
 /// Result of decoding an eth transaction into a dispatchable call.
 pub struct CallInfo<T: Config> {
@@ -61,6 +62,22 @@ pub enum CreateCallMode {
 }
 
 impl GenericTransaction {
+	/// 固定兼容价格只用于钱包费用刻度；优先费为零，Legacy 必须使用准确价格。
+	pub(crate) fn native_gas_price<T: Config>(&self) -> Result<U256, InvalidTransaction> {
+		let price = super::fees::native_gas_price::<T>();
+		if self.max_priority_fee_per_gas.is_some_and(|tip| !tip.is_zero()) {
+			return Err(InvalidTransaction::Payment);
+		}
+		if let Some(cap) = self.max_fee_per_gas {
+			if cap < price {
+				return Err(InvalidTransaction::Payment);
+			}
+		} else if self.gas_price.is_some_and(|value| value != price) {
+			return Err(InvalidTransaction::Payment);
+		}
+		Ok(price)
+	}
+
 	/// Decode `tx` into a dispatchable call.
 	pub fn into_call<T>(self, mode: CreateCallMode) -> Result<CallInfo<T>, InvalidTransaction>
 	where
@@ -75,6 +92,9 @@ impl GenericTransaction {
 			.map_err(|_| InvalidTransaction::Payment)?;
 		let is_dry_run = matches!(mode, CreateCallMode::DryRun);
 		let base_fee = <Pallet<T>>::evm_base_fee();
+		if T::StrictNativeBalance::get() {
+			self.native_gas_price::<T>()?;
+		}
 
 		// 原生整单位策略必须携带准确ChainId，禁止无链签名跨链重放。
 		// 其他SDK链仍保留上游允许未保护Legacy交易的原行为。
@@ -97,7 +117,7 @@ impl GenericTransaction {
 			return Err(InvalidTransaction::Call);
 		};
 
-		// 上游按资源收费路径使用 base_fee；原生路径仅保留签名金额上限。
+		// 两种收费路径都提供非零价格；原生路径使用固定钱包费用刻度。
 		let Some(effective_gas_price) = self.gas_price else {
 			log::debug!(target: LOG_TARGET, "No gas_price provided.");
 			return Err(InvalidTransaction::Payment);
@@ -118,7 +138,7 @@ impl GenericTransaction {
 				// For dry runs, we need to ensure that the RLP encoding length is at least the
 				// length of the encoding of the actual transaction submitted later
 				let mut maximized_tx = self.clone();
-				// 原生 base_fee 为零，查询仍须为签名价格字段预留最大编码长度。
+				// 原生查询也为签名费用上限字段预留最大编码长度。
 				let maximized_base_fee = if T::StrictNativeBalance::get() {
 					U256::MAX
 				} else {
@@ -218,7 +238,7 @@ impl GenericTransaction {
 		};
 
 		if let Some(who) = native_signer {
-			// gas 只规定资源上限，钱只查询 Runtime 现有路由；不预扣执行费或存储押金。
+			// 资源预算仍受双维 Weight 约束；费用只由 Runtime 现有路由报价。
 			let resource_gas: u64 =
 				gas.try_into().map_err(|_| InvalidTransaction::ExhaustsResources)?;
 			let budget = super::fees::resource_gas_to_weight::<T>(resource_gas);
@@ -236,6 +256,10 @@ impl GenericTransaction {
 			let weight_limit = available.min(max);
 			call.set_weight_limit(weight_limit);
 			let tx_fee = T::FeeInfo::native_quote(&who, &call)?;
+			let fee_gas = super::fees::native_fee_to_gas::<T>(tx_fee)?;
+			if U256::from(fee_gas) > gas {
+				return Err(InvalidTransaction::Payment);
+			}
 			let ceiling = self
 				.max_fee_per_gas
 				.unwrap_or(effective_gas_price)
@@ -245,10 +269,8 @@ impl GenericTransaction {
 			let required = required
 				.checked_mul(T::NativeToEthRatio::get().into())
 				.ok_or(InvalidTransaction::Payment)?;
-			// 查询可省略金额上限；已签交易及明确提供上限的查询必须严格检查。
-			if (!is_dry_run || self.max_fee_per_gas.is_some() || !effective_gas_price.is_zero())
-				&& required > ceiling
-			{
+			// 签名费用上限不能被估算或查询路径绕过。
+			if required > ceiling {
 				return Err(InvalidTransaction::Payment);
 			}
 			return Ok(CallInfo {

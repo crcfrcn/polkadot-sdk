@@ -52,21 +52,22 @@ pub mod weights;
 
 use crate::{
 	evm::{
-		block_hash::EthereumBlockBuilderIR, block_storage, fees::InfoT as FeeInfo,
-		runtime::SetWeightLimit, CallTracer, CreateCallMode, ExecutionTracer, GenericTransaction,
-		PrestateTracer, Trace, Tracer, TracerType, TYPE_EIP1559,
+		CallTracer, CreateCallMode, ExecutionTracer, GenericTransaction, PrestateTracer,
+		TYPE_EIP1559, Trace, Tracer, TracerType, block_hash::EthereumBlockBuilderIR, block_storage,
+		fees::InfoT as FeeInfo, runtime::SetWeightLimit,
 	},
 	exec::{AccountIdOf, ExecError, ReentrancyProtection, Stack as ExecStack},
 	sp_runtime::TransactionOutcome,
 	storage::{AccountType, DeletionQueueManager},
 	tracing::if_tracing,
-	vm::{pvm::extract_code_and_data, CodeInfo, RuntimeCosts},
+	vm::{CodeInfo, RuntimeCosts, pvm::extract_code_and_data},
 	weightinfo_extension::OnFinalizeBlockParts,
 };
 use alloc::{boxed::Box, format, vec};
 use codec::{Codec, Decode, Encode};
 use environmental::*;
 use frame_support::{
+	BoundedVec,
 	dispatch::{
 		DispatchErrorWithPostInfo, DispatchResult, DispatchResultWithPostInfo, GetDispatchInfo,
 		Pays, PostDispatchInfo, RawOrigin,
@@ -75,35 +76,33 @@ use frame_support::{
 	pallet_prelude::DispatchClass,
 	storage::with_transaction,
 	traits::{
-		fungible::{Balanced, Credit, Inspect, Mutate, MutateHold},
-		tokens::Balance,
 		ConstU32, ConstU64, DefensiveResult, EnsureOrigin, Get, IsSubType, IsType, OnUnbalanced,
 		OriginTrait,
+		fungible::{Balanced, Credit, Inspect, Mutate, MutateHold},
+		tokens::Balance,
 	},
 	weights::WeightMeter,
-	BoundedVec,
 };
 use frame_system::{
-	ensure_signed,
+	Pallet as System, ensure_signed,
 	pallet_prelude::{BlockNumberFor, OriginFor},
-	Pallet as System,
 };
 use scale_info::TypeInfo;
 use sp_runtime::{
+	AccountId32, DispatchError, FixedPointNumber, FixedU128, SaturatedConversion,
 	traits::{
 		BadOrigin, Bounded, CheckedAdd, Convert, Dispatchable, Saturating, UniqueSaturatedFrom,
 		UniqueSaturatedInto, Zero,
 	},
-	AccountId32, DispatchError, FixedPointNumber, FixedU128, SaturatedConversion,
 };
 
 pub use crate::{
-	address::{create1, create2, AccountId32Mapper, AddressMapper, AutoMapper, TestAccountMapper},
+	address::{AccountId32Mapper, AddressMapper, AutoMapper, TestAccountMapper, create1, create2},
 	debug::DebugSettings,
 	deposit_payment::{Deposit, PGasDeposit},
 	evm::{
-		block_hash::ReceiptGasInfo, Address as EthAddress, Block as EthBlock, DryRunConfig,
-		ReceiptInfo, TracingConfig,
+		Address as EthAddress, Block as EthBlock, DryRunConfig, ReceiptInfo, TracingConfig,
+		block_hash::ReceiptGasInfo,
 	},
 	exec::{CallResources, DelegateInfo, Executable, Key, MomentOf, Origin as ExecOrigin},
 	limits::TRANSIENT_STORAGE_BYTES as TRANSIENT_STORAGE_LIMIT,
@@ -1405,6 +1404,15 @@ pub mod pallet {
 			.into();
 			let info = T::FeeInfo::dispatch_info(&call);
 			let base_info = T::FeeInfo::base_dispatch_info(&mut call);
+			// 执行前捕获同一 Runtime 路由报价，收据不得在业务状态变化后重新定价。
+			let native_fee = if T::StrictNativeBalance::get() {
+				Some(
+					T::FeeInfo::native_quote(&signer, &call)
+						.map_err(|_| Error::<T>::TxFeeOverdraw)?,
+				)
+			} else {
+				None
+			};
 			drop(call);
 
 			block_storage::with_ethereum_context::<T>(transaction_encoded, || {
@@ -1430,6 +1438,7 @@ pub mod pallet {
 					encoded_len,
 					&info,
 					effective_gas_price,
+					native_fee,
 				)
 			})
 		}
@@ -1488,6 +1497,15 @@ pub mod pallet {
 			.into();
 			let info = T::FeeInfo::dispatch_info(&call);
 			let base_info = T::FeeInfo::base_dispatch_info(&mut call);
+			// 成功与回滚都报告已授权的原生费，不根据实际执行量补扣或退费。
+			let native_fee = if T::StrictNativeBalance::get() {
+				Some(
+					T::FeeInfo::native_quote(&signer, &call)
+						.map_err(|_| Error::<T>::TxFeeOverdraw)?,
+				)
+			} else {
+				None
+			};
 			drop(call);
 
 			block_storage::with_ethereum_context::<T>(transaction_encoded, || {
@@ -1512,6 +1530,7 @@ pub mod pallet {
 					encoded_len,
 					&info,
 					effective_gas_price,
+					native_fee,
 				)
 			})
 		}
@@ -2274,11 +2293,10 @@ impl<T: Config> Pallet<T> {
 
 		let base_fee = Self::evm_base_fee();
 		let effective_gas_price = if T::StrictNativeBalance::get() {
-			// 原生路径的价格字段只保留钱包授权上限，不代表单位资源收费。
-			let price = tx.max_fee_per_gas.or(tx.gas_price).unwrap_or_default();
-			if tx.max_fee_per_gas.is_none() {
-				tx.max_fee_per_gas = tx.gas_price;
-			}
+			// 查询和签名使用同一价格校验，明确错误上限或优先费不能被静默改写。
+			let price = tx
+				.native_gas_price::<T>()
+				.map_err(|err| EthTransactError::Message(format!("Invalid gas price: {err:?}")))?;
 			if tx.from.is_none() {
 				tx.from = Some(H160::default());
 			}
@@ -2509,12 +2527,14 @@ impl<T: Config> Pallet<T> {
 		}
 
 		if T::StrictNativeBalance::get() {
-			// 估算只报告资源需求；费用已经由同一 Runtime 路由报价，不按实际执行量重算。
+			// 估算同时覆盖资源需求及本笔业务费；两者取大，不能让钱包少授权。
 			let info = T::FeeInfo::dispatch_info(&call_info.call);
 			let total = total_weight
 				.saturating_add(T::BlockWeights::get().get(info.class).base_extrinsic)
 				.saturating_add(Weight::from_parts(0, call_info.encoded_len as u64));
-			dry_run.eth_gas = evm::fees::resource_weight_to_gas::<T>(total).into();
+			let fee_gas = evm::fees::native_fee_to_gas::<T>(call_info.tx_fee)
+				.map_err(|err| EthTransactError::Message(format!("Invalid native fee: {err:?}")))?;
+			dry_run.eth_gas = evm::fees::resource_weight_to_gas::<T>(total).max(fee_gas).into();
 			return Ok(dry_run);
 		}
 
@@ -2674,9 +2694,9 @@ impl<T: Config> Pallet<T> {
 
 	/// Get the base gas price.
 	pub fn evm_base_fee() -> U256 {
-		// 原生费用按业务路由报价，没有按资源 gas 定价的 base_fee。
+		// 原生路径提供非零固定兼容价格，真实费用仍由 Runtime 业务路由决定。
 		if T::StrictNativeBalance::get() {
-			return U256::zero();
+			return evm::fees::native_gas_price::<T>();
 		}
 		let gas_scale = <T as Config>::GasScale::get();
 		let multiplier = T::FeeInfo::next_fee_multiplier();

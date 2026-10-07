@@ -15,7 +15,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 use crate::{
-	dispatch_result,
+	AccountIdOf, BalanceOf, BalanceWithDust, BlockHash, BlockNumberFor, Config, ContractResult,
+	Error, EthBlockBuilderIR, EthereumBlock, Event, ExecReturnValue, H160, H256, LOG_TARGET,
+	Pallet, ReceiptGasInfo, ReceiptInfoData, StorageDeposit, Weight, dispatch_result,
 	evm::{
 		block_hash::{AccumulateReceipt, EthereumBlockBuilder, LogsBloom},
 		burn_with_dust,
@@ -24,9 +26,6 @@ use crate::{
 	limits,
 	sp_runtime::traits::{One, Zero},
 	weights::WeightInfo,
-	AccountIdOf, BalanceOf, BalanceWithDust, BlockHash, BlockNumberFor, Config, ContractResult,
-	Error, EthBlockBuilderIR, EthereumBlock, Event, ExecReturnValue, Pallet, ReceiptGasInfo,
-	ReceiptInfoData, StorageDeposit, Weight, H160, H256, LOG_TARGET,
 };
 use alloc::vec::Vec;
 use environmental::environmental;
@@ -67,6 +66,7 @@ impl EthereumCallResult {
 	/// - `encoded_len`: The length of the encoded transaction in bytes
 	/// - `info`: Dispatch information used for fee computation
 	/// - `effective_gas_price`: The EVM gas price
+	/// - `native_fee`: 严格原生模式执行前由既有路由返回的业务费
 	pub(crate) fn new<T: Config>(
 		signer: AccountIdOf<T>,
 		mut output: ContractResult<ExecReturnValue, BalanceOf<T>>,
@@ -74,6 +74,7 @@ impl EthereumCallResult {
 		encoded_len: u32,
 		info: &DispatchInfo,
 		effective_gas_price: U256,
+		native_fee: Option<BalanceOf<T>>,
 	) -> Self {
 		// 未配置现有收费路由时仍拒绝，不能靠空费用接口开放执行。
 		if T::StrictNativeBalance::get() && !T::FeeInfo::native_fee_enabled() {
@@ -101,18 +102,20 @@ impl EthereumCallResult {
 
 		let result = dispatch_result(output.result, output.weight_consumed, base_call_weight);
 		if T::StrictNativeBalance::get() {
-			// 收据仅记录资源；实际费用以 Runtime 现有收费事件为准，失败也不退费。
-			// 不从存储资金推导费用，不做 gasPrice 舍入补扣。
-			let total = output
-				.weight_consumed
-				.saturating_add(base_call_weight)
-				.saturating_add(info.extension_weight)
-				.saturating_add(T::BlockWeights::get().get(info.class).base_extrinsic)
-				.saturating_add(Weight::from_parts(0, encoded_len as u64));
+			// 回执乘积严格等于执行前的原生业务费；不做舍入补扣，失败也不退费。
+			let gas_used = native_fee
+				.ok_or(())
+				.and_then(|fee| super::fees::native_fee_to_gas::<T>(fee).map_err(|_| ()));
+			let Ok(gas_used) = gas_used else {
+				return Self {
+					receipt_gas_info: ReceiptGasInfo::default(),
+					result: Err(Error::<T>::TxFeeOverdraw.into()),
+				};
+			};
 			return Self {
 				receipt_gas_info: ReceiptGasInfo {
-					gas_used: super::fees::resource_weight_to_gas::<T>(total).into(),
-					effective_gas_price,
+					gas_used: gas_used.into(),
+					effective_gas_price: super::fees::native_gas_price::<T>(),
 				},
 				result,
 			};
