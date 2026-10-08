@@ -414,7 +414,7 @@ pub trait EthExtra {
 		// 原生报价只能使用已验签恢复的账户，不能信任交易自报付款者。
 		let mut tx = GenericTransaction::from_signed(tx, base_fee, Some(signer_addr));
 		if <Self::Config as Config>::StrictNativeBalance::get() {
-			// 先检查签名原价和上限，再写入固定实际价格，不能静默接受错误 Legacy 原价。
+			// 先验证签名价格足够且优先费不超过总上限，再使用固定实际价格；不收框架 tip。
 			tx.gas_price = Some(tx.native_gas_price::<Self::Config>()?);
 		}
 		let nonce: <Self::Config as frame_system::Config>::Nonce =

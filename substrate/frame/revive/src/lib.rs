@@ -2293,7 +2293,7 @@ impl<T: Config> Pallet<T> {
 
 		let base_fee = Self::evm_base_fee();
 		let effective_gas_price = if T::StrictNativeBalance::get() {
-			// 查询和签名使用同一价格校验，明确错误上限或优先费不能被静默改写。
+			// 查询和签名共用费用上限校验；合法优先费不转换为框架 tip，报价仍使用原生规则。
 			let price = tx
 				.native_gas_price::<T>()
 				.map_err(|err| EthTransactError::Message(format!("Invalid gas price: {err:?}")))?;
@@ -2320,8 +2320,7 @@ impl<T: Config> Pallet<T> {
 
 		// tx.into_call expects tx.gas_price to be the effective gas price
 		tx.gas_price = Some(effective_gas_price);
-		// we don't support priority fee for now as the tipping system in pallet-transaction-payment
-		// works differently and the total tip needs to be known pre dispatch
+		// 原生路径已验证优先费上限，模拟时不将其转换为框架tip；其它链保留上游归零规则。
 		tx.max_priority_fee_per_gas = Some(0.into());
 		if !T::StrictNativeBalance::get() && tx.max_fee_per_gas.is_none() {
 			tx.max_fee_per_gas = Some(effective_gas_price);

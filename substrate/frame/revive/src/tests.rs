@@ -1045,40 +1045,67 @@ mod native_fees {
 		});
 	}
 
-	/// 钱包默认估算覆盖业务费；修改 gas 缓冲与 EIP-1559 上限不改变实际费。
+	/// Legacy、访问列表和钱包非零优先费的真实报价、签名及回执都只扣一次原生费。
 	#[test]
 	fn native_fee_estimate_and_eip1559_receipt_use_the_same_fixed_price() {
 		ext().execute_with(|| {
 			let price = crate::evm::fees::native_gas_price::<NativeTest>();
 			assert_eq!(Contracts::evm_base_fee(), price);
-			let mut generic = tx(Some(H160::repeat_byte(9)), vec![], 1_000_000_000);
-			generic.gas = None;
-			generic.gas_price = None;
-			generic.r#type = Some(crate::evm::TYPE_EIP1559.into());
-			let before = sp_io::storage::root(sp_runtime::StateVersion::V1);
-			let estimate =
-				Contracts::eth_estimate_gas(generic.clone(), Default::default()).unwrap();
-			assert!(estimate >= U256::from(FEE * 10_000_000));
-			assert_eq!(sp_io::storage::root(sp_runtime::StateVersion::V1), before);
-			generic.gas = Some(estimate * 2);
-			generic.max_fee_per_gas = Some(price * 2);
-			generic.max_priority_fee_per_gas = Some(U256::zero());
-			execute(generic.clone()).unwrap();
-			execute(generic).unwrap();
+			let mut plain = tx(Some(H160::repeat_byte(9)), vec![], 1_000_000_000);
+			plain.gas = None;
+			plain.gas_price = None;
+			plain.r#type = Some(crate::evm::TYPE_EIP1559.into());
+			let root = sp_io::storage::root(sp_runtime::StateVersion::V1);
+			assert!(Contracts::eth_estimate_gas(plain, Default::default()).is_ok());
+			assert_eq!(sp_io::storage::root(sp_runtime::StateVersion::V1), root);
+			let variants = [
+				(crate::evm::TYPE_LEGACY, price, U256::zero()),
+				(crate::evm::TYPE_LEGACY, price + 1, U256::zero()),
+				(crate::evm::TYPE_EIP2930, price * 2, U256::zero()),
+				(crate::evm::TYPE_EIP1559, price * 2, U256::zero()),
+				(crate::evm::TYPE_EIP1559, price, U256::one()),
+				(crate::evm::TYPE_EIP1559, price * 2, U256::from(1_000_000u64)),
+				(crate::evm::TYPE_EIP1559, price * 2, price * 2),
+			];
+			for (kind, cap, priority) in variants {
+				let eip1559 = kind == crate::evm::TYPE_EIP1559;
+				let mut generic = tx(Some(H160::repeat_byte(9)), vec![], 1_000_000_000);
+				generic.gas = None;
+				generic.r#type = Some(kind.into());
+				generic.gas_price = if eip1559 { None } else { Some(cap) };
+				generic.max_fee_per_gas = if eip1559 { Some(cap) } else { None };
+				generic.max_priority_fee_per_gas = if eip1559 { Some(priority) } else { None };
+				let before = sp_io::storage::root(sp_runtime::StateVersion::V1);
+				let estimate = Contracts::eth_estimate_gas(generic.clone(), Default::default())
+					.unwrap_or_else(|error| panic!("报价失败: type={kind} cap={cap} priority={priority}: {error:?}"));
+				assert!(estimate >= U256::from(FEE * 10_000_000));
+				assert_eq!(sp_io::storage::root(sp_runtime::StateVersion::V1), before);
+				generic.gas = Some(estimate * 2);
+				let signed = crate::evm::Account::default().sign_transaction(generic.clone().try_into_unsigned().unwrap());
+				assert!(Contracts::eth_pre_dispatch_weight(signed.signed_payload()).is_ok());
+				let decoded = crate::GenericTransaction::from_signed(signed, U256::MAX,
+					Some(crate::evm::Account::default().address()));
+				let info = decoded.into_call::<NativeTest>(
+					crate::evm::CreateCallMode::ExtrinsicExecution(1024, vec![])).unwrap();
+				assert!(matches!(info.call, RuntimeCall::Contracts(crate::Call::eth_call {
+					effective_gas_price, ..
+				}) if effective_gas_price == price));
+				let payer_before = Balances::balance(&BOB);
+				execute(generic).unwrap();
+				assert_eq!(Balances::balance(&BOB), payer_before - FEE);
+			}
 			crate::block_storage::on_finalize_build_eth_block::<NativeTest>(1);
 			let receipts = crate::ReceiptInfoData::<NativeTest>::get();
-			assert_eq!(receipts.len(), 2);
+			assert_eq!(receipts.len(), variants.len());
 			for receipt in receipts {
 				assert_eq!(receipt.effective_gas_price, price);
-				assert_eq!(
-					receipt.gas_used * price,
-					U256::from(FEE) * U256::from(native_monetary::SCALE)
-				);
+				assert_eq!(receipt.gas_used * price,
+					U256::from(FEE) * U256::from(native_monetary::SCALE));
 			}
 			let block = crate::EthereumBlock::<NativeTest>::get();
 			assert_eq!(block.base_fee_per_gas, price);
-			assert_eq!(block.gas_used, U256::from(FEE * 20_000_000));
-			assert_eq!(Balances::balance(&BOB), 10_000 - 2 * FEE);
+			assert_eq!(block.gas_used, U256::from(FEE * 10_000_000 * variants.len() as u128));
+			assert_eq!(Balances::balance(&BOB), 10_000 - FEE * variants.len() as u128);
 		});
 	}
 
@@ -1096,15 +1123,17 @@ mod native_fees {
 			);
 			let before = sp_io::storage::root(sp_runtime::StateVersion::V1);
 			let mut invalid = vec![];
-			for value in [U256::zero(), price - 1, price + 1] {
+			for value in [U256::zero(), price - 1] {
 				let mut generic = tx(Some(H160::repeat_byte(9)), vec![], 1_000_000_000);
 				generic.gas_price = Some(value);
 				invalid.push(generic);
 			}
 			for (cap, tip, gas) in [
 				(price - 1, U256::zero(), 1_000_000_000u64),
-				(price * 2, U256::one(), 1_000_000_000),
+				(price * 2, price * 2 + 1, 1_000_000_000),
 				(price * 2, U256::zero(), (FEE * 10_000_000 - 1) as u64),
+				// 价格上限与gas相乘溢出仍是非法交易，不为接受钱包缓冲放宽整数边界。
+				(U256::MAX, U256::MAX, 1_000_000_000),
 			] {
 				let mut generic = tx(Some(H160::repeat_byte(9)), vec![], gas);
 				generic.r#type = Some(crate::evm::TYPE_EIP1559.into());
@@ -1112,7 +1141,14 @@ mod native_fees {
 				generic.max_priority_fee_per_gas = Some(tip);
 				invalid.push(generic);
 			}
+			// 非零优先费缺少总上限必须在只读报价阶段拒绝；不得改成零再接受。
+			let mut missing_cap = tx(Some(H160::repeat_byte(9)), vec![], 1_000_000_000);
+			missing_cap.max_priority_fee_per_gas = Some(U256::one());
+			assert!(Contracts::eth_estimate_gas(missing_cap, Default::default()).is_err());
+			assert_eq!(sp_io::storage::root(sp_runtime::StateVersion::V1), before);
 			for generic in invalid {
+				assert!(Contracts::eth_estimate_gas(generic.clone(), Default::default()).is_err());
+				assert_eq!(sp_io::storage::root(sp_runtime::StateVersion::V1), before);
 				let signed = crate::evm::Account::default()
 					.sign_transaction(generic.try_into_unsigned().unwrap());
 				assert!(checked_payload(signed.signed_payload()).is_err());

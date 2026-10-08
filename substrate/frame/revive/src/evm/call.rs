@@ -62,24 +62,24 @@ pub enum CreateCallMode {
 }
 
 impl GenericTransaction {
-	/// 固定兼容价格只用于钱包费用刻度；优先费为零，Legacy 必须使用准确价格。
+	/// 钱包价格和优先费仅表示授权上限；实际单次原生费用使用固定价格换算。
 	pub(crate) fn native_gas_price<T: Config>(&self) -> Result<U256, InvalidTransaction> {
 		let price = super::fees::native_gas_price::<T>();
-		if self.max_priority_fee_per_gas.is_some_and(|tip| !tip.is_zero()) {
-			return Err(InvalidTransaction::Payment);
-		}
 		if let Some(cap) = self.max_fee_per_gas {
-			if cap < price {
+			if cap < price || self.max_priority_fee_per_gas.is_some_and(|tip| tip > cap) {
 				return Err(InvalidTransaction::Payment);
 			}
-		} else if self.gas_price.is_some_and(|value| value != price) {
+		} else if self.gas_price.is_some_and(|value| value < price)
+			|| self.max_priority_fee_per_gas.is_some_and(|tip| !tip.is_zero())
+		{
+			// 无价格的只读报价仍可用；非零优先费必须携带有效的总价格上限。
 			return Err(InvalidTransaction::Payment);
 		}
 		Ok(price)
 	}
 
 	/// Decode `tx` into a dispatchable call.
-	pub fn into_call<T>(self, mode: CreateCallMode) -> Result<CallInfo<T>, InvalidTransaction>
+	pub fn into_call<T>(mut self, mode: CreateCallMode) -> Result<CallInfo<T>, InvalidTransaction>
 	where
 		T: Config,
 		CallOf<T>: SetWeightLimit,
@@ -93,7 +93,8 @@ impl GenericTransaction {
 		let is_dry_run = matches!(mode, CreateCallMode::DryRun);
 		let base_fee = <Pallet<T>>::evm_base_fee();
 		if T::StrictNativeBalance::get() {
-			self.native_gas_price::<T>()?;
+			// 所有转换入口均使用固定实际价格，包括已签交易的权重预检。
+			self.gas_price = Some(self.native_gas_price::<T>()?);
 		}
 
 		// 原生整单位策略必须携带准确ChainId，禁止无链签名跨链重放。
