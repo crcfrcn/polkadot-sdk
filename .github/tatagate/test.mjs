@@ -5,7 +5,8 @@ import { gateContract, gatePath, gateRange, gateEnvironment, lockedPackages, loc
   remoteTools, prepareOffline, verifyVendor, verifyGitCache, lockedGitSource, hostChecks, remoteRange } from './index.mjs';
 import { readFileSync, mkdtempSync, mkdirSync, writeFileSync, realpathSync, rmSync, symlinkSync, renameSync, linkSync, cpSync } from 'node:fs';
 import { createHash } from 'node:crypto';
-import { tmpdir } from 'node:os';
+// SDK测试数据同归本产品target；本地和远端不借用系统临时根。
+const tmpdir=()=>{const root=new URL('../../target/test/',import.meta.url);mkdirSync(root,{recursive:true});return realpathSync(root);};
 import { dirname, join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 const contract = JSON.parse(readFileSync(new URL('./contracts.json', import.meta.url), 'utf8'));
@@ -23,7 +24,7 @@ const lock = entries => header + entries.map(([name, version, checksum]) => '[[p
 function fixture(context) {
   const directory = realpathSync(mkdtempSync(join(tmpdir(), 'sdk-remote-preparation-')));
   context.after(() => rmSync(directory, { recursive: true, force: true }));
-  const root = join(directory, 'repository'), work = join(directory, 'operation'), library = join(directory, 'rust/library');
+  const root = join(directory, 'repository'), work = join(root, 'target/test/operation'), library = join(directory, 'rust/library');
   for (const path of [root, work, library]) mkdirSync(path, { recursive: true });
   const archives = new Map([['alpha-1.0.0', Buffer.from('official alpha fixture')], ['beta-2.0.0', Buffer.from('official beta fixture')]]);
   const sdk = lock([['alpha', '1.0.0', hash(archives.get('alpha-1.0.0'))]]);
@@ -199,7 +200,7 @@ test('Workflow保留固定官方安装器、只读同SHA push并明确完整准�
   for (const value of ['timeout-minutes: 240', 'contents: read', 'ref: ${{ github.sha }}', 'persist-credentials: false',
     'node-version: 25.2.1', 'toolchain: 1.97.1', 'components: rustfmt,clippy,rust-src', 'targets: wasm32-unknown-unknown',
     'a0853c24544627f65ddf259abe73b1d18a591444', '032958afbdc797a9164d3bc0b56325c1308924a5',
-    '/home/runner/work/_temp/polkadot-sdk-tatagate', 'CARGO_BUILD_JOBS=2', 'CARGO_PROFILE_DEV_DEBUG=0',
+    'work="$GITHUB_WORKSPACE/target/test/tatagate"', 'CARGO_BUILD_JOBS=2', 'CARGO_PROFILE_DEV_DEBUG=0',
     'CARGO_PROFILE_TEST_DEBUG=0', 'CARGO_INCREMENTAL=0', '.github/tatagate/index.mjs prepare', '.github/tatagate/index.mjs remote',
     'CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS=--cfg=rustix_use_libc',
     'NO_INSTALL_HARDLINKS=YesPlease', 'test "$(stat -c \'%h\' "$tool/payload/bin/git")" = 1']) assert.ok(workflow.includes(value), value);
@@ -208,6 +209,7 @@ test('Workflow保留固定官方安装器、只读同SHA push并明确完整准�
     'f3e987dc6ecebd4bd350c48edcbc320b46cf9e3109bd3fc3d88f1acaf4c428f7',
     'e626ba7a1a0d26828c14713781b0082ececc9a0fbfe984f11f0d93d66bbd7806',
     'a45cda0989c17dd950db55f6fbe1e5814c50fda08e87aa422980ac1f89dddbbc']) assert.ok(workflow.includes(hash));
+  assert.ok(!workflow.includes('/home/runner/work/_temp/polkadot-sdk-tatagate'));
   assert.doesNotMatch(workflow, /apt-get|apt install|dpkg-deb|NO_CURL|NO_EXPAT|rm -rf|npm (?:ci|install)|SKIP_WASM_BUILD|SKIP_PALLET_REVIVE_FIXTURES/u);
   assert.equal((workflow.match(/https:[^'\n]+\.deb/gu) ?? []).length, 2);
 });
@@ -264,8 +266,8 @@ test('真实离线子Cargo拒绝父cfg泄漏，WASM命令隔离后按自身目�
 test('完整门禁使用同一Rust对象和独立离线环境，拒绝跳过及工具替换', context => {
   const directory = realpathSync(mkdtempSync(join(tmpdir(), 'sdk-gate-environment-')));
   context.after(() => rmSync(directory, { recursive: true, force: true }));
-  const root = join(directory, 'repository'), work = join(directory, 'gate');
-  const home = join(directory, 'cargo/home'), packages = join(directory, 'cargo/packages');
+  const root = join(directory, 'repository'), work = join(root, 'target/test/gate');
+  const home = join(work, 'cargo/home'), packages = join(work, 'cargo/packages');
   const bin = join(directory, 'rust/bin');
   for (const path of [root, work, home, packages, bin]) mkdirSync(path, { recursive: true });
   for (const tool of ['cargo', 'rustc']) writeFileSync(join(bin, tool), 'fixture', { mode: 0o755 });
@@ -288,6 +290,8 @@ test('完整门禁使用同一Rust对象和独立离线环境，拒绝跳过及�
     assert.throws(() => gateEnvironment(root, work, { ...input, ...changes }, { execute }));
   }
   assert.throws(() => gateEnvironment(root, root, input, { execute }), /中间物/u);
+  const outside=join(directory,'outside'),build=join(root,'target/build/foreign');mkdirSync(outside);mkdirSync(build,{recursive:true});
+  for(const foreign of [outside,build])assert.throws(()=>gateEnvironment(root,foreign,input,{execute}),/中间物/u);
   assert.throws(() => gateEnvironment(root, work, input, { execute: () => 'rustc 1.97.0 fixture' }), /版本/u);
   symlinkSync(home, join(directory, 'home-link'));
   assert.throws(() => gateEnvironment(root, work, { ...input, CARGO_HOME: join(directory, 'home-link') }, { execute }));
@@ -388,4 +392,26 @@ test('Git与registry同次准备后仍从原锁Git检出消费，复制缓存和
   assert.throws(() => readFileSync(join(f.work, 'cargo/packages/fixture-1.0.0/Cargo.toml')), /ENOENT/u);
   assert.equal(readFileSync(join(f.root, 'Cargo.lock'), 'utf8'), sdk);
   assert.doesNotMatch(readFileSync(join(result.CARGO_HOME, 'config.toml'), 'utf8'), /source[.]git|patch|fixture/u);
+});
+
+// 完整执行的判定调用真实汇总函数，不以零退出码代替非空、无跳过结果。
+test('SDK测试汇总拒绝空执行、跳过、取消和不相等计数',async()=>{
+ const {successfulTestSummary,hasFirstPartyTemporaryComments}=await import('./index.mjs');
+ const good={success:true,counts:{tests:2,passed:2,failed:0,skipped:0,cancelled:0,todo:0}};
+ assert.equal(successfulTestSummary(good),true);
+ for(const change of [{tests:0,passed:0},{passed:1},{failed:1},{skipped:1},{cancelled:1},{todo:1}])assert.ok(!successfulTestSummary({...good,counts:{...good.counts,...change}}));
+ assert.equal(hasFirstPartyTemporaryComments('code.rs','let x="TODO";'),false);
+ assert.equal(hasFirstPartyTemporaryComments('code.rs','// TODO upstream\n','// TODO upstream\n'),false);
+ assert.equal(hasFirstPartyTemporaryComments('code.rs','// TODO upstream\n// TODO upstream\n','// TODO upstream\n'),true);
+ assert.throws(()=>gateContract({...contract,github_repository:'foreign/sdk'}));
+ assert.throws(()=>gateContract({...contract,node_tests:[]}));
+});
+
+// 结果协议夹具只验证同一SDK核验接口；真实affected crate及WASM由完整门禁执行。
+test('SDK功能目标闭合，实际结果拒绝空跑、过滤、跳过和失败',async()=>{
+ const {sdkFunctionalResult}=await import('./index.mjs'),output='test feature ... ok\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out;';
+ assert.deepEqual(sdkFunctionalResult(output,{target:'owned-crate'}),{target:'owned-crate',type:'all-targets',tests:1,status:'success'});
+ for(const invalid of ['',output.replace('1 passed','0 passed'),output.replace('0 ignored','1 ignored'),output.replace('0 filtered out','1 filtered out'),output.replace('ok.','FAILED.')])assert.throws(()=>sdkFunctionalResult(invalid,{target:'owned-crate'}));
+ assert.equal(sdkFunctionalResult(output.replace('1 passed','0 passed'),{target:'owned-crate',documentation:true}).tests,0);
+ for(const targets of [[],[...contract.functional_targets,'undeclared'],contract.functional_targets.slice(1)])assert.throws(()=>gateContract({...contract,functional_targets:targets}));
 });

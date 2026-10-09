@@ -1,4 +1,6 @@
 [build]
+# 固定编译现场只位于target/build；执行入口负责结束清空。
+target-dir = "target/build"
 rustdocflags = [
 	"-Dwarnings",
 	"-Arustdoc::redundant_explicit_links", # stylistic

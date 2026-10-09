@@ -2,12 +2,13 @@
 import { execFileSync, spawnSync } from 'node:child_process';
 import { lstatSync, readFileSync, realpathSync, existsSync, readdirSync, mkdirSync, writeFileSync, cpSync, rmSync } from 'node:fs';
 import { createHash } from 'node:crypto';
-import { resolve, dirname, join } from 'node:path';
+import { resolve, dirname, join, isAbsolute, extname } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import {Readable} from 'node:stream';
+import {spec} from 'node:test/reporters';
 
 const shaPattern = /^[0-9a-f]{40}$/u;
 const registry = 'registry+https://github.com/rust-lang/crates.io-index';
-const remoteWork = '/home/runner/work/_temp/polkadot-sdk-tatagate';
 const rustRoot = '/home/runner/.rustup/toolchains/1.97.1-x86_64-unknown-linux-gnu';
 const digest = bytes => createHash('sha256').update(bytes).digest('hex');
 const offlineConfig = packages => '[net]\noffline = true\n\n[source.crates-io]\nreplace-with = "verified"\n\n[source.verified]\ndirectory = '
@@ -82,7 +83,7 @@ function exactFile(path) {
 }
 
 // 正式入口固定官方Ubuntu Runner及本仓push，测试只能通过函数参数提供受控事实。
-export function remoteContext(root, work, input, { expectedWork = remoteWork, platform = process.platform,
+export function remoteContext(root, work, input, { expectedWork = join(root,'target/test/tatagate'), platform = process.platform,
   arch = process.arch, os = readFileSync('/etc/os-release', 'utf8'), event = JSON.parse(readFileSync(input.GITHUB_EVENT_PATH, 'utf8')) } = {}) {
   if (platform !== 'linux' || arch !== 'x64' || !/^ID=ubuntu$/mu.test(os) || !/^VERSION_ID="24\.04"$/mu.test(os)
     || input.GITHUB_ACTIONS !== 'true' || input.RUNNER_ENVIRONMENT !== 'github-hosted'
@@ -93,7 +94,7 @@ export function remoteContext(root, work, input, { expectedWork = remoteWork, pl
   gateRange(event.before, event.after);
   exactDirectory(root); exactDirectory(work);
   if (work !== expectedWork || input.TATAGATE_WORK !== work || input.GITHUB_WORKSPACE !== root || realpathSync(input.GITHUB_WORKSPACE) !== root
-    || work === root || work.startsWith(root + '/') || root.startsWith(work + '/')) throw new Error('SDK远端准备工作根越界');
+    || work === root || !work.startsWith(join(root,'target') + '/') || root.startsWith(work + '/')) throw new Error('SDK远端准备工作根越界');
   return event;
 }
 export function remoteTools(root, work, input, { execute = command, expectedRust = rustRoot,
@@ -210,7 +211,7 @@ export function prepareOffline(root, work, input, library, { execute = command,
   expectedSDK = 'e87457b0d643498e75840b68b2a4a33d26ae316cc43514eae3f34f63e4fc0780',
   expectedStd = '02120dd57c4c5fd70c81fd92472681c8de5cc2dd78258276da37bb2253666061', expectedCount = 1556 } = {}) {
   const stableRoot = exactDirectory(root), stableWork = exactDirectory(work), stableLibrary = exactDirectory(library);
-  if (root === work || root.startsWith(work + '/') || work.startsWith(root + '/')) throw new Error('SDK离线准备根越界');
+  if (root === work || root.startsWith(work + '/') || !work.startsWith(join(root,'target') + '/')) throw new Error('SDK离线准备根越界');
   const sdkLock = join(root, 'Cargo.lock'), stdLock = join(library, 'Cargo.lock');
   const sdkBytes = exactFile(sdkLock), stdBytes = exactFile(stdLock);
   if (digest(sdkBytes) !== expectedSDK || digest(stdBytes) !== expectedStd) throw new Error('SDK准备锁不在获准闭包');
@@ -261,8 +262,9 @@ export function remoteRange(contract, event) {
   return gateRange(contract.initial_sha, event.after);
 }
 export function gateContract(value) {
-  if (value?.schema !== 1 || value.repository !== 'polkadot-sdk' || value.upstream !== 'paritytech/polkadot-sdk'
+  if (!value||Object.keys(value).sort().join(',')!==['schema','repository','github_repository','node_tests','checks','upstream','upstream_base','initial_sha','functional_targets'].sort().join(',')||value.github_repository!=='crcfrcn/polkadot-sdk'||!Array.isArray(value.node_tests)||value.node_tests.join(',')!=='.github/tatagate/test.mjs'||value?.schema !== 1 || value.repository !== 'polkadot-sdk' || value.upstream !== 'paritytech/polkadot-sdk'
     || !shaPattern.test(value.upstream_base ?? '') || !shaPattern.test(value.initial_sha ?? '')
+    || !Array.isArray(value.functional_targets)||value.functional_targets.join(',')!=='affected-crates-all-targets,affected-crates-doc,workspace-on-lock-or-manifest-change,applicable-wasm-hosts'
     || !Array.isArray(value.checks) || value.checks.join(',') !== 'identity,history,source,workflow,tests,changed-crates') {
     throw new Error('SDK门禁合同无效');
   }
@@ -301,11 +303,11 @@ export function gateEnvironment(root, work, input, { canonical = realpathSync, s
     || input.RUSTC !== rustc || input.CARGO !== cargo
     || execute(rustc, ['--version'], root, input).split(' ')[1] !== '1.97.1'
     || execute(cargo, ['--version'], root, input).split(' ')[1] !== '1.97.1') throw new Error('SDK门禁Rust对象或版本不符');
-  if (!work || !work.startsWith('/') || resolve(work) !== work || work === root || work.startsWith(root + '/')
+  if (!work || !work.startsWith('/') || resolve(work) !== work || work === root || !work.startsWith(resolve(root,'target/test') + '/')
     || canonical(work) !== work || !stat(work).isDirectory()) throw new Error('SDK检查中间物目录无效');
   const home = input.CARGO_HOME;
-  const boundary = dirname(root) === dirname(work) ? dirname(work) : work;
-  if (typeof home !== 'string' || !home.startsWith(boundary + '/') || home.startsWith(root + '/')
+  const boundary = work;
+  if (typeof home !== 'string' || !home.startsWith(boundary + '/') || !home.startsWith(work + '/')
     || canonical(home) !== home || !stat(home).isDirectory()) throw new Error('SDK门禁缺少独立离线Cargo主目录');
   const config = join(home, 'config.toml');
   if (canonical(config) !== config || !stat(config).isFile()) throw new Error('SDK门禁离线配置不是准确文件');
@@ -313,7 +315,7 @@ export function gateEnvironment(root, work, input, { canonical = realpathSync, s
   const directory = text.match(/^directory = (".*")$/mu)?.[1];
   const packages = directory && JSON.parse(directory);
   if (!/^\[net\]\noffline = true\n\n\[source\.crates-io\]\nreplace-with = "verified"\n\n\[source\.verified\]\ndirectory = "[^\n]+"\n$/u.test(text)
-    || typeof packages !== 'string' || !packages.startsWith(boundary + '/') || packages.startsWith(root + '/')
+    || typeof packages !== 'string' || !packages.startsWith(boundary + '/') || !packages.startsWith(work + '/')
     || canonical(packages) !== packages || !stat(packages).isDirectory()) throw new Error('SDK门禁缺少完整离线目录源');
   return { ...input, RUSTC: rustc, CARGO: cargo, CARGO_NET_OFFLINE: 'true',
     CARGO_TARGET_DIR: join(work, 'cargo-target'), RUSTC_BOOTSTRAP: '1', WASM_BUILD_STD: '1',
@@ -327,10 +329,15 @@ function git(root, args) {
   return execFileSync(tool, ['-C', root, ...args], { encoding: 'utf8', maxBuffer: 8 * 1024 * 1024,
     env: { ...process.env, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null' }, stdio: ['ignore', 'pipe', 'pipe'] }).trim();
 }
-function identity(root, physical = false) {
+export function identity(root, physical = false) {
   if (realpathSync(root) !== root || !lstatSync(root + '/.git').isDirectory()
     || git(root, ['rev-parse', '--show-toplevel']) !== root
-    || git(root, ['remote', 'get-url', 'origin']) !== 'https://github.com/crcfrcn/polkadot-sdk.git') throw new Error('SDK门禁仓库身份无效');
+    || lstatSync(root+'/.git').isSymbolicLink()
+    || git(root,['rev-parse','--is-bare-repository'])!=='false'
+    || resolve(root,git(root,['rev-parse','--git-common-dir']))!==join(root,'.git')
+    || git(root,['rev-parse','--absolute-git-dir'])!==join(root,'.git')
+    || git(root, ['remote', 'get-url','--all', 'origin']) !== 'https://github.com/crcfrcn/polkadot-sdk.git') throw new Error('SDK门禁仓库身份无效');
+  if(process.env.GITHUB_ACTIONS!=='true'&&git(root,['symbolic-ref','--quiet','--short','HEAD'])!=='main')throw Error('SDK本机门禁只接受所属main');
   if (physical && (root !== '/Users/rhett/polkadot-sdk' || git(root, ['branch', '--show-current']) !== 'main'
     || git(root, ['remote', 'get-url', 'upstream']) !== 'https://github.com/paritytech/polkadot-sdk.git')) throw new Error('SDK正式开发入口无效');
 }
@@ -341,6 +348,126 @@ function checkedSource(root, path) {
   if (/-----BEGIN [A-Z ]*PRIVATE KEY-----|github_pat_[A-Za-z0-9_]{20,}|ghs_[A-Za-z0-9_]{20,}/u.test(text)
     || /\/Users\/[A-Za-z0-9_-]+\/(?:tataconsole|GMB|TATA|TUYU)\//u.test(text)) throw new Error('SDK源码包含机密或私有工作区路径');
 }
+// 词法扫描保留真实代码与注释位置；字符串、正则及模板正文不作为实现注释。
+export function lexicalParts(path, source) {
+  const extension=extname(path).toLowerCase(), javascript=['.js','.jsx','.mjs','.ts','.tsx'].includes(extension);
+  const comments=[], code=source.split('');let index=0;
+  const blank=(begin,end)=>{for(let at=begin;at<end;at++)if(source[at]!=='\n'&&source[at]!=='\r')code[at]=' ';};
+  const quote=(delimiter,triple=false,interpolated=false)=>{
+    const size=triple?3:1;blank(index,index+size);index+=size;
+    while(index<source.length){
+      if(source[index]==='\\'){blank(index,index+2);index+=2;continue;}
+      if(interpolated&&source.startsWith('${',index)){blank(index,index+2);index+=2;scan(true);continue;}
+      if(source.startsWith(delimiter.repeat(size),index)){blank(index,index+size);index+=size;return;}
+      blank(index,index+1);index++;
+    }
+  };
+  const scan=(interpolation=false)=>{
+    let previous='',word='',depth=1;
+    while(index<source.length){
+      const value=source[index];
+      if(/\s/u.test(value)){index++;continue;}
+      if(interpolation&&value==='}'){if(--depth===0){blank(index,index+1);index++;return;}index++;previous='}';continue;}
+      if(interpolation&&value==='{')depth++;
+      const lineComment=(['.py','.sh'].includes(extension)&&value==='#'&&!source.startsWith('#!',index))
+        ||extension==='.sql'&&source.startsWith('--',index)
+        ||!['.py','.sh','.sql'].includes(extension)&&source.startsWith('//',index);
+      if(lineComment){const begin=index,end=source.indexOf('\n',index);index=end<0?source.length:end;comments.push(source.slice(begin,index));blank(begin,index);continue;}
+      if(!['.py','.sh'].includes(extension)&&source.startsWith('/*',index)){
+        const begin=index;let nested=1;index+=2;
+        while(index<source.length&&nested){if(extension==='.rs'&&source.startsWith('/*',index)){nested++;index+=2;}else if(source.startsWith('*/',index)){nested--;index+=2;}else index++;}
+        comments.push(source.slice(begin,index));blank(begin,index);continue;
+      }
+      if(extension==='.rs'){
+        const raw=/^(?:b)?r(#+)?"/u.exec(source.slice(index));
+        if(raw){const begin=index,close='"'+(raw[1]||''),end=source.indexOf(close,index+raw[0].length);index=end<0?source.length:end+close.length;blank(begin,index);previous='literal';continue;}
+        if(value==="'"&&!/^'(?:\\(?:u\{[0-9a-fA-F]+\}|x[0-9a-fA-F]{2}|.)|[^'\\\n])'/u.test(source.slice(index))){index++;previous=value;continue;}
+      }
+      if(value==='"'||value==="'"||value==='`'){
+        quote(value,['.dart','.py'].includes(extension)&&source.startsWith(value.repeat(3),index),javascript&&value==='`'||extension==='.dart'&&source[index-1]!=='r');previous='literal';word='';continue;
+      }
+      if(javascript&&value==='/'&&(!previous||/[=(:,!\[{};?]/u.test(previous)||['return','throw','yield','case'].includes(word))){
+        const begin=index++;let bracket=false;
+        while(index<source.length){const current=source[index++];if(current==='\\'){index++;continue;}if(current==='[')bracket=true;else if(current===']')bracket=false;else if(current==='/'&&!bracket)break;else if(current==='\n')break;}
+        while(/[a-z]/iu.test(source[index]||''))index++;blank(begin,index);previous='literal';word='';continue;
+      }
+      if(/[A-Za-z_$]/u.test(value)){const begin=index++;while(/[A-Za-z0-9_$]/u.test(source[index]||''))index++;word=source.slice(begin,index);previous='word';continue;}
+      previous=value;word='';index++;
+    }
+  };
+  scan();return {comments:comments.join('\n'),code:code.join('')};
+}
+
+export function commentText(path, source) { return lexicalParts(path,source).comments; }
+
+
+function temporaryComments(path, source) {
+  return commentText(path, source).split('\n').filter((line) => /(?:TODO|FIXME|HACK|XXX)\b/u.test(line));
+}
+
+// 上游说明只能逐字、按原有数量保留；复制同一句到新位置不能增加允许数量。
+
+export function hasFirstPartyTemporaryComments(path, source, upstream = '') {
+  const retained = new Map();
+  for (const comment of temporaryComments(path, upstream)) retained.set(comment, (retained.get(comment) ?? 0) + 1);
+  return temporaryComments(path, source).some((comment) => {
+    const count = retained.get(comment) ?? 0;
+    if (count === 0) return true;
+    retained.set(comment, count - 1);
+    return false;
+  });
+}
+
+
+export function validateOwnedDocuments(root){
+ const path=join(root,'PolkadotSDK.md'),info=lstatSync(path,{throwIfNoEntry:false});
+ if(!info||!info.isFile()||info.isSymbolicLink()||!info.size||realpathSync(path)!==path)throw Error('SDK唯一自有技术文档无效');
+ // README与官方上游资料保留原件，不把它们列为自有技术文档或开发凭证。
+ for(const entry of readdirSync(root)){if(entry!=='PolkadotSDK.md'&&entry!=='README.md'&&/\.md$/iu.test(entry)){
+  const listed=git(root,['ls-tree','--name-only',JSON.parse(readFileSync(join(root,'.github/tatagate/contracts.json'),'utf8')).upstream_base,'--',entry]);
+  if(listed!==entry)throw Error('SDK新增额外根技术文档');
+ }}
+}
+export function validateOwnedNodeTests(root,registered,upstream){
+ const tracked=git(root,['ls-files','-z']).split('\0').filter(Boolean);
+ const upstreamTests=new Set(git(root,['ls-tree','-r','--name-only','-z',upstream]).split('\0').filter(Boolean));
+ const actual=tracked.filter(path=>/(?:^|\/)(?:test\.mjs|[^/]+[._-](?:test|spec)\.mjs)$/u.test(path)&&!upstreamTests.has(path)).sort();
+ if(actual.join('\0')!==[...registered].sort().join('\0')||new Set(registered).size!==registered.length||!actual.length)throw Error('SDK自有Node测试清单不闭合');
+ for(const path of actual){const file=join(root,gatePath(path)),info=lstatSync(file);if(!info.isFile()||info.isSymbolicLink()||!info.size||realpathSync(file)!==file)throw Error('SDK真实测试入口无效');}
+}
+// 逐文件与最终汇总必须对应同一非空清单，拒绝漏文件、重复汇总及伪造总数。
+export default async function* reporter(events) {
+  async function* checked() {
+    let list;
+    try{list=JSON.parse(process.env.TATAGATE_NODE_TESTS||'null');}catch{list=null;}
+    const validList=Array.isArray(list)&&list.length>0&&list.every(file=>typeof file==='string'&&isAbsolute(file)&&resolve(file)===file)&&new Set(list).size===list.length;
+    const expected=new Set(validList?list:[]),seen=new Set();let cumulative=false,total=0,invalid=!validList;
+    for await(const event of events){
+      if(event.type==='test:summary'){
+        const data=event.data;let valid=successfulTestSummary(data);
+        if(data?.file!==undefined){
+          if(typeof data.file!=='string'||!data.file)valid=false;
+          else{const file=resolve(data.file);if(!expected.has(file)||seen.has(file)||cumulative)valid=false;seen.add(file);total+=data.counts?.tests||0;}
+        }else{if(cumulative||seen.size!==expected.size||[...expected].some(file=>!seen.has(file))||data?.counts?.tests!==total)valid=false;cumulative=true;}
+        if(!valid)invalid=true;
+      }
+      yield event;
+    }
+    if(invalid||!cumulative||seen.size!==expected.size){process.exitCode=1;yield{type:'test:diagnostic',data:{nesting:0,message:'产品门禁缺少逐文件完整成功回执。'}};}
+  }
+  yield* Readable.from(checked()).pipe(spec());
+}
+
+// 汇总必须非空且没有失败、取消、待办或跳过，不能用零用例退出码冒充验收。
+export function successfulTestSummary(data) {
+  const counts = data?.counts;
+  return data?.success === true && counts && Number.isSafeInteger(counts.tests) && counts.tests > 0
+    && ['failed', 'skipped', 'todo', 'cancelled'].every(name => counts[name] === 0)
+    && Number.isSafeInteger(counts.passed) && counts.passed === counts.tests;
+}
+
+
+
 export function runGate(root, baseSHA, headSHA, work) {
   root = resolve(root); identity(root); const range = gateRange(baseSHA, headSHA);
   const contract = gateContract(JSON.parse(readFileSync(join(root, '.github/tatagate/contracts.json'), 'utf8')));
@@ -350,12 +477,19 @@ export function runGate(root, baseSHA, headSHA, work) {
   git(root, ['merge-base', '--is-ancestor', contract.upstream_base, contract.initial_sha]);
   git(root, ['diff', '--check', range.base, range.head]);
   const paths = git(root, ['diff', '--name-only', '-z', range.base, range.head]).split('\u0000').filter(Boolean);
+  const implementation=paths.filter(path=>/\.(?:rs|mjs|js|ts|py|sh|toml)$/u.test(path)&&!/(?:^|\/)(?:test|tests)\//u.test(path)&&!/(?:^|[/._-])test\.mjs$/u.test(path));
+  if(implementation.length){const meaningful=path=>{if(!existsSync(join(root,path)))return false;const old=git(root,['ls-tree','--name-only',range.base,'--',path])?git(root,['show',range.base+':'+path]):'';return old.replace(/\s/gu,'')!==readFileSync(join(root,path),'utf8').replace(/\s/gu,'');};if(!paths.includes('PolkadotSDK.md')||!meaningful('PolkadotSDK.md')||!paths.some(path=>/(?:^|[/._-])test\.mjs$|(?:^|\/)tests?\//u.test(path)&&meaningful(path)))throw Error('SDK自有实现缺少所属资料或真实回归同步');}
   const crates = new Set();
   for (const path of paths) {
     gatePath(path);
     const absolute = join(root, path);
     if (!existsSync(absolute)) continue;
-    checkedSource(root, path);
+    checkedSource(root,path);
+    if(/\.(?:rs|mjs|js|ts|py|sh|c|h|cpp|swift)$/u.test(path)){
+      const upstreamPaths=git(root,['ls-tree','--name-only',contract.upstream_base,'--',path]);
+      const original=upstreamPaths?git(root,['show',contract.upstream_base+':'+path]):'';
+      if(hasFirstPartyTemporaryComments(path,readFileSync(absolute,'utf8'),original))throw Error('SDK自有新增临时注释：'+path);
+    }
     if (path.startsWith('.github/workflows/') && /\.ya?ml$/u.test(path)) {
       command(process.env.TATAGATE_ACTIONLINT, ['-shellcheck=', '-pyflakes=', path], root);
     }
@@ -373,27 +507,37 @@ export function runGate(root, baseSHA, headSHA, work) {
       }
     }
   }
-  command(process.execPath, ['--test', '.github/tatagate/test.mjs'], root);
-  const hosts = hostChecks(paths);
+  validateOwnedDocuments(root);
+  validateOwnedNodeTests(root,contract.node_tests,contract.upstream_base);
+  if(process.version!=='v25.2.1')throw Error('SDK门禁Node版本不符');
+  command(process.execPath,['--test','--test-reporter='+join(root,'.github/tatagate/index.mjs'),...contract.node_tests],root,{...process.env,TATAGATE_NODE_TESTS:JSON.stringify(contract.node_tests.map(path=>join(root,path)))});
+  const functionalResults=[],hosts = hostChecks(paths);
   if (crates.size || hosts.length || paths.includes('Cargo.lock') || paths.includes('Cargo.toml')) {
     const environment = gateEnvironment(root, work, process.env), cargo = environment.CARGO;
     const metadata = JSON.parse(command(cargo, ['metadata', '--locked', '--offline', '--format-version', '1'], root, environment));
     verifyGitCache(root, environment.CARGO_HOME, lockedPackages(readFileSync(join(root, 'Cargo.lock'), 'utf8')), environment, { metadata });
     for (const name of crates) {
       command(cargo, ['check', '--locked', '--offline', '-p', name], root, environment);
-      command(cargo, ['test', '--locked', '--offline', '-p', name, '--lib'], root, environment);
+      const output=command(cargo, ['test', '--locked', '--offline', '-p', name, '--all-targets','--','--color','never'], root, environment);
+      const item=sdkFunctionalResult(output,{target:name,documentation:false});functionalResults.push(item);
+      functionalResults.push(sdkFunctionalResult(command(cargo, ['test', '--locked', '--offline', '-p', name, '--doc','--','--color','never'], root, environment),{target:name,documentation:true}));
     }
-    for (const args of hosts) command(cargo, args, root, environment);
+    for(const args of hosts){functionalResults.push(sdkFunctionalResult(command(cargo,[...args,'--','--color','never'],root,environment),{target:args.join(' '),documentation:args.includes('--doc')}));}
     // workspace声明与锁整体改动需要全工作空间检查，不能只验证门禁自身。
-    if (paths.includes('Cargo.lock') || paths.includes('Cargo.toml')) command(cargo, ['check', '--locked', '--offline', '--workspace'], root, environment);
+    if(paths.includes('Cargo.lock')||paths.includes('Cargo.toml')){
+      command(cargo,['check','--locked','--offline','--workspace','--all-targets'],root,environment);
+      functionalResults.push(sdkFunctionalResult(command(cargo,['test','--locked','--offline','--workspace','--all-targets','--','--color','never'],root,environment),{target:'workspace',documentation:false}));
+      functionalResults.push(sdkFunctionalResult(command(cargo,['test','--locked','--offline','--workspace','--doc','--','--color','never'],root,environment),{target:'workspace',documentation:true}));
+    }
   }
-  return { repository: 'polkadot-sdk', base_sha: range.base, head_sha: range.head, changed_crates: [...crates].sort() };
+  if(git(root,['rev-parse','HEAD'])!==range.head||git(root,['status','--porcelain=v1','--untracked-files=all'])!=='')throw Error('SDK门禁执行改变受检快照');
+  return { repository: 'polkadot-sdk', base_sha: range.base, head_sha: range.head, changed_crates: [...crates].sort(), functional_results:functionalResults };
 }
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   try {
     const [mode, ...args] = process.argv.slice(2);
     if (mode === 'physical' && args.length === 1) identity(resolve(args[0]), true);
-    else if (mode === 'local' && args.length === 4) console.log(JSON.stringify(runGate(args[0], args[1], args[2], args[3])));
+    else if(mode==='local'&&args.length===4){const [root,base,head,requested]=args;exactDirectory(requested);if(readdirSync(requested).length||root===requested||root.startsWith(requested+'/'))throw Error('SDK请求协调目录无效');const parent=join(root,'target/test');mkdirSync(parent,{recursive:true});exactDirectory(parent);const work=join(parent,'tatagate-local-'+process.pid+'-'+Date.now());mkdirSync(work,{mode:0o700});try{const rustc=process.env.TATAGATE_RUSTC,cargo=process.env.TATAGATE_CARGO;if(!rustc||!cargo||dirname(rustc)!==dirname(cargo))throw Error('SDK本机缺少同版准确Rust对象');const library=join(command(rustc,['--print','sysroot'],root),'lib/rustlib/src/rust/library');const input={...process.env,RUSTC:rustc,CARGO:cargo};const prepared=prepareOffline(root,work,input,library);Object.assign(process.env,prepared);console.log(JSON.stringify(runGate(root,base,head,work)));}finally{rmSync(work,{recursive:true,force:true});}}
     else if (['prepare', 'remote'].includes(mode) && args.length === 0) {
       const root = realpathSync(process.cwd()), work = process.env.TATAGATE_WORK;
       const event = remoteContext(root, work, process.env);
@@ -419,4 +563,14 @@ if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.ur
       }
     } else throw new Error('SDK门禁参数无效');
   } catch (error) { console.error(error.message); process.exitCode = 1; }
+}
+
+// SDK按受影响包绑定真实libtest摘要；文档零用例是编译结果，不冒充业务测试成功。
+export function sdkFunctionalResult(source,{target,documentation=false}){
+ if(typeof source!=='string'||typeof target!=='string'||!target||/test result: FAILED|\bFAILED\b/u.test(source))throw Error('SDK真实功能测试失败');
+ const rows=[...source.matchAll(/^test result: ok\. (\d+) passed; (\d+) failed; (\d+) ignored; (\d+) measured; (\d+) filtered out;/gmu)];
+ if(!rows.length||rows.some(row=>Number(row[2])||Number(row[3])||Number(row[5])))throw Error('SDK功能测试摘要缺失、跳过或过滤');
+ const tests=rows.reduce((count,row)=>count+Number(row[1]),0);
+ if(!documentation&&!tests)throw Error('SDK受影响包功能测试为空');
+ return {target,type:documentation?'documentation':'all-targets',tests,status:'success'};
 }

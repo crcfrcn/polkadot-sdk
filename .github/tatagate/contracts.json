@@ -11,5 +11,15 @@
   ],
   "upstream": "paritytech/polkadot-sdk",
   "upstream_base": "0bf9cb31b867b91b2e9cca3cf59ef3014e430a0b",
-  "initial_sha": "1aa4447575d446ab393e89b86cd8ec0a8fca100d"
+  "initial_sha": "1aa4447575d446ab393e89b86cd8ec0a8fca100d",
+  "github_repository": "crcfrcn/polkadot-sdk",
+  "node_tests": [
+    ".github/tatagate/test.mjs"
+  ],
+  "functional_targets": [
+    "affected-crates-all-targets",
+    "affected-crates-doc",
+    "workspace-on-lock-or-manifest-change",
+    "applicable-wasm-hosts"
+  ]
 }
