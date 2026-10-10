@@ -14,12 +14,17 @@
   "initial_sha": "1aa4447575d446ab393e89b86cd8ec0a8fca100d",
   "github_repository": "crcfrcn/polkadot-sdk",
   "node_tests": [
-    ".github/tatagate/test.mjs"
+    ".github/tatagate/test.mjs",
+    ".github/workflows/release-sdk.mjs"
   ],
   "functional_targets": [
     "affected-crates-all-targets",
     "affected-crates-doc",
     "workspace-on-lock-or-manifest-change",
     "applicable-wasm-hosts"
-  ]
+  ],
+  "workflows": [
+    "release-sdk.yml"
+  ],
+  "functions": []
 }

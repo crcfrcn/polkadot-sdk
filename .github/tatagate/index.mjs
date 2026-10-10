@@ -262,7 +262,7 @@ export function remoteRange(contract, event) {
   return gateRange(contract.initial_sha, event.after);
 }
 export function gateContract(value) {
-  if (!value||Object.keys(value).sort().join(',')!==['schema','repository','github_repository','node_tests','checks','upstream','upstream_base','initial_sha','functional_targets'].sort().join(',')||value.github_repository!=='crcfrcn/polkadot-sdk'||!Array.isArray(value.node_tests)||value.node_tests.join(',')!=='.github/tatagate/test.mjs'||value?.schema !== 1 || value.repository !== 'polkadot-sdk' || value.upstream !== 'paritytech/polkadot-sdk'
+  if (!value||Object.keys(value).sort().join(',')!==['schema','repository','github_repository','node_tests','checks','upstream','upstream_base','initial_sha','functional_targets','workflows'].sort().join(',')||value.github_repository!=='crcfrcn/polkadot-sdk'||!Array.isArray(value.node_tests)||value.node_tests.join(',')!=='.github/tatagate/test.mjs,.github/workflows/release-sdk.mjs'||value?.schema !== 1 || value.repository !== 'polkadot-sdk' || value.upstream !== 'paritytech/polkadot-sdk'
     || !shaPattern.test(value.upstream_base ?? '') || !shaPattern.test(value.initial_sha ?? '')
     || !Array.isArray(value.functional_targets)||value.functional_targets.join(',')!=='affected-crates-all-targets,affected-crates-doc,workspace-on-lock-or-manifest-change,applicable-wasm-hosts'
     || !Array.isArray(value.checks) || value.checks.join(',') !== 'identity,history,source,workflow,tests,changed-crates') {

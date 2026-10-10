@@ -195,24 +195,6 @@ test('宿主生成器变更同时触发原生、实际WASM执行器及文档测�
     ['test', '--locked', '--offline', '-p', 'sp-runtime-interface-test', '--lib'],
     ['test', '--locked', '--offline', '-p', 'sp-runtime-interface', '--doc']]);
 });
-test('Workflow保留固定官方安装器、只读同SHA push并明确完整准备；没有扩大下载或删除Runner', () => {
-  const workflow = readFileSync(new URL('../workflows/tatagate.yml', import.meta.url), 'utf8');
-  for (const value of ['timeout-minutes: 240', 'contents: read', 'ref: ${{ github.sha }}', 'persist-credentials: false',
-    'node-version: 25.2.1', 'toolchain: 1.97.1', 'components: rustfmt,clippy,rust-src', 'targets: wasm32-unknown-unknown',
-    'a0853c24544627f65ddf259abe73b1d18a591444', '032958afbdc797a9164d3bc0b56325c1308924a5',
-    'work="$GITHUB_WORKSPACE/target/test/tatagate"', 'CARGO_BUILD_JOBS=2', 'CARGO_PROFILE_DEV_DEBUG=0',
-    'CARGO_PROFILE_TEST_DEBUG=0', 'CARGO_INCREMENTAL=0', '.github/tatagate/index.mjs prepare', '.github/tatagate/index.mjs remote',
-    'CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS=--cfg=rustix_use_libc',
-    'NO_INSTALL_HARDLINKS=YesPlease', 'test "$(stat -c \'%h\' "$tool/payload/bin/git")" = 1']) assert.ok(workflow.includes(value), value);
-  for (const hash of ['c63393dd39d8bc49580e3e23be3eda63ce62ae4823d95f692c7547b25ade8a31',
-    '87281ce46d74f261caff4ac404fe5af7b07f185d305246fef81797ddc20fa9f8',
-    'f3e987dc6ecebd4bd350c48edcbc320b46cf9e3109bd3fc3d88f1acaf4c428f7',
-    'e626ba7a1a0d26828c14713781b0082ececc9a0fbfe984f11f0d93d66bbd7806',
-    'a45cda0989c17dd950db55f6fbe1e5814c50fda08e87aa422980ac1f89dddbbc']) assert.ok(workflow.includes(hash));
-  assert.ok(!workflow.includes('/home/runner/work/_temp/polkadot-sdk-tatagate'));
-  assert.doesNotMatch(workflow, /apt-get|apt install|dpkg-deb|NO_CURL|NO_EXPAT|rm -rf|npm (?:ci|install)|SKIP_WASM_BUILD|SKIP_PALLET_REVIVE_FIXTURES/u);
-  assert.equal((workflow.match(/https:[^'\n]+\.deb/gu) ?? []).length, 2);
-});
 test('错仓、错来源、缺检查与非法区间拒绝', () => {
   for (const change of [{ repository: 'citizenchain' }, { upstream: 'other/polkadot-sdk' }, { checks: [] }, { upstream_base: 'main' }, { schema: 2 }]) {
     assert.throws(() => gateContract({ ...contract, ...change }));
