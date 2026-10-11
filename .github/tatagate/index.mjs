@@ -339,7 +339,7 @@ export function identity(root, physical = false) {
     || git(root,['rev-parse','--is-bare-repository'])!=='false'
     || resolve(root,git(root,['rev-parse','--git-common-dir']))!==join(root,'.git')
     || git(root,['rev-parse','--absolute-git-dir'])!==join(root,'.git')
-    || git(root, ['remote', 'get-url','--all', 'origin']) !== 'https://github.com/crcfrcn/polkadot-sdk.git') throw new Error('SDK门禁仓库身份无效');
+    || !['https://github.com/crcfrcn/polkadot-sdk','https://github.com/crcfrcn/polkadot-sdk.git'].includes(git(root, ['remote', 'get-url','--all', 'origin']))) throw new Error('SDK门禁仓库身份无效');
   if(process.env.GITHUB_ACTIONS!=='true'&&git(root,['symbolic-ref','--quiet','--short','HEAD'])!=='main')throw Error('SDK本机门禁只接受所属main');
   if (physical && (root !== '/Users/rhett/polkadot-sdk' || git(root, ['branch', '--show-current']) !== 'main'
     || git(root, ['remote', 'get-url', 'upstream']) !== 'https://github.com/paritytech/polkadot-sdk.git')) throw new Error('SDK正式开发入口无效');
@@ -596,7 +596,7 @@ export function tataGateContext(repositoryRoot, input=process.env, event=JSON.pa
   const git=input.PRODUCT_GIT_BIN || '/usr/bin/git';
   const read=args=>tataGateExec(git,['-c','core.hooksPath=/dev/null','-C',repositoryRoot,...args],{encoding:'utf8'}).trim();
   if (read(['rev-parse','HEAD']) !== event.after || read(['rev-parse','--show-toplevel']) !== repositoryRoot
-    || read(['remote','get-url','--all','origin']) !== 'https://github.com/'+tataGateOwner+'.git') {
+    || !['https://github.com/'+tataGateOwner,'https://github.com/'+tataGateOwner+'.git'].includes(read(['remote','get-url','--all','origin']))) {
     throw Error('本仓塔塔门禁GitHub提交或来源无效');
   }
   if(read(['status','--porcelain=v1','--untracked-files=all']))throw Error('本仓塔塔门禁GitHub检出存在未提交改动');

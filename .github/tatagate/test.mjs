@@ -453,6 +453,8 @@ test('GitHub门禁工具供给使用公开固定test根，离线验收使用其�
         GITHUB_WORKFLOW_REF:tataGateOwner+'/.github/workflows/tatagate.yml@refs/heads/main',PRODUCT_GIT_BIN:git};
       const event={repository:{full_name:tataGateOwner},ref:'refs/heads/main',before,after};
       assert.equal(tataGateContext(directory,input,event).after,after);
+      invoke(['remote','set-url','origin','https://github.com/'+tataGateOwner]);assert.equal(tataGateContext(directory,input,event).after,after);
+      invoke(['remote','set-url','origin','https://github.com/'+tataGateOwner+'.git']);
       assert.throws(()=>tataGateContext(directory,input,{...event,before:'a'.repeat(40)}),/祖先/u);
       writeFileSync(join(directory,'late'),'new change');assert.throws(()=>tataGateContext(directory,input,event),/未提交改动/u);rmSync(join(directory,'late'));
       for(const changed of [{...input,GITHUB_SHA:before},{...input,GITHUB_REPOSITORY:'example/other'},{...input,GITHUB_WORKFLOW_REF:tataGateOwner+'/.github/workflows/release-sdk.yml@refs/heads/main'}])assert.throws(()=>tataGateContext(directory,changed,event));
