@@ -1,3 +1,6 @@
+import {readFileSync as tataGateRead, realpathSync as tataGateReal} from 'node:fs';
+import {execFileSync as tataGateExec} from 'node:child_process';
+export const tataGateOwner = "crcfrcn/polkadot-sdk";
 // SDK独立门禁：准确提交、上游来源、自有改动和适用测试均失败关闭。
 import { execFileSync, spawnSync } from 'node:child_process';
 import { lstatSync, readFileSync, realpathSync, existsSync, readdirSync, mkdirSync, writeFileSync, cpSync, rmSync } from 'node:fs';
@@ -491,7 +494,7 @@ export function runGate(root, baseSHA, headSHA, work) {
       if(hasFirstPartyTemporaryComments(path,readFileSync(absolute,'utf8'),original))throw Error('SDK自有新增临时注释：'+path);
     }
     if (path.startsWith('.github/workflows/') && /\.ya?ml$/u.test(path)) {
-      command(process.env.TATAGATE_ACTIONLINT, ['-shellcheck=', '-pyflakes=', path], root);
+      command(process.env.TATAGATE_ACTIONLINT, ['-shellcheck=', '-pyflakes=', '-ignore', '^unexpected key "queue" for "concurrency" section[.]', '-ignore', '^label "xcode-27" is unknown[.]', path], root);
     }
     if (path.endsWith('.rs') || path.endsWith('Cargo.toml')) {
       let directory = dirname(absolute);
@@ -533,7 +536,7 @@ export function runGate(root, baseSHA, headSHA, work) {
   if(git(root,['rev-parse','HEAD'])!==range.head||git(root,['status','--porcelain=v1','--untracked-files=all'])!=='')throw Error('SDK门禁执行改变受检快照');
   return { repository: 'polkadot-sdk', base_sha: range.base, head_sha: range.head, changed_crates: [...crates].sort(), functional_results:functionalResults };
 }
-if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+if (!['github','cleanup'].includes(process.argv[2]) && process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   try {
     const [mode, ...args] = process.argv.slice(2);
     if (mode === 'physical' && args.length === 1) identity(resolve(args[0]), true);
@@ -573,4 +576,171 @@ export function sdkFunctionalResult(source,{target,documentation=false}){
  const tests=rows.reduce((count,row)=>count+Number(row[1]),0);
  if(!documentation&&!tests)throw Error('SDK受影响包功能测试为空');
  return {target,type:documentation?'documentation':'all-targets',tests,status:'success'};
+}
+
+// GitHub入口和清理只处理本仓tatagate.yml；产品检查仍由本仓原有实现执行。
+export function tataGateBranch(repositoryRoot) {
+  if (process.env.GITHUB_ACTIONS === 'true') { tataGateContext(repositoryRoot); return true; }
+  return tataGateExec(process.env.PRODUCT_GIT_BIN || '/usr/bin/git', ['-C',repositoryRoot,'branch','--show-current'], {encoding:'utf8'}).trim() === 'main';
+}
+export function tataGateContext(repositoryRoot, input=process.env, event=JSON.parse(tataGateRead(input.GITHUB_EVENT_PATH,'utf8'))) {
+  if (input.GITHUB_ACTIONS !== 'true' || input.GITHUB_EVENT_NAME !== 'push'
+    || input.GITHUB_REPOSITORY !== tataGateOwner || input.GITHUB_REF !== 'refs/heads/main'
+    || input.GITHUB_WORKSPACE !== repositoryRoot || tataGateReal(repositoryRoot) !== repositoryRoot
+    || event.repository?.full_name !== tataGateOwner || event.ref !== input.GITHUB_REF
+    || event.deleted === true || event.after !== input.GITHUB_SHA
+    || !/^[a-f0-9]{40}$/u.test(event.after || '') || !/^[a-f0-9]{40}$/u.test(event.before || '')
+    || event.before === event.after || input.GITHUB_WORKFLOW_REF!==tataGateOwner+'/.github/workflows/tatagate.yml@refs/heads/main') {
+    throw Error('本仓塔塔门禁GitHub事件身份无效');
+  }
+  const git=input.PRODUCT_GIT_BIN || '/usr/bin/git';
+  const read=args=>tataGateExec(git,['-c','core.hooksPath=/dev/null','-C',repositoryRoot,...args],{encoding:'utf8'}).trim();
+  if (read(['rev-parse','HEAD']) !== event.after || read(['rev-parse','--show-toplevel']) !== repositoryRoot
+    || read(['remote','get-url','--all','origin']) !== 'https://github.com/'+tataGateOwner+'.git') {
+    throw Error('本仓塔塔门禁GitHub提交或来源无效');
+  }
+  if(read(['status','--porcelain=v1','--untracked-files=all']))throw Error('本仓塔塔门禁GitHub检出存在未提交改动');
+  if(input.GITHUB_JOB==='gate'&&event.before!=='0'.repeat(40)){
+    try{tataGateExec(git,['-C',repositoryRoot,'merge-base','--is-ancestor',event.before,event.after],{encoding:'utf8',stdio:'pipe'});}catch{throw Error('本仓塔塔门禁GitHub提交范围不是快进祖先');}
+  }
+  return {...event,before:event.before === '0'.repeat(40) ? '4b825dc642cb6eb9a060e54bf8d69288fbee4904' : event.before};
+}
+export function tataGateValidateWorkflow(source) {
+  const jobs=source?.slice(source.indexOf('\njobs:\n')).match(/^  [a-z][a-z0-9_]*:$/gmu);
+  const entry=new URL(import.meta.url).pathname.split('/').at(-1);
+  const gate=source?.split('  gate:\n')[1]?.split('\n  cleanup:')[0];
+  if(!gate||/^    continue-on-error:/mu.test(gate)||!source.includes('permissions:\n  contents: read\n'))throw Error('本仓塔塔门禁检查权限或结果处理无效');
+  if(JSON.stringify(jobs)!==JSON.stringify(['  gate:','  cleanup:'])||!source.includes('run: node .github/tatagate/'+entry+' github\n')||!source.includes('run: node .github/tatagate/'+entry+' cleanup\n'))throw Error('本仓塔塔门禁Job或执行入口无效');
+  if (typeof source !== 'string' || !source.startsWith('name: '+tataGateOwner.split('/')[1]+'.tatagate\n')
+    || !/^  push:\n    branches: \[main\]$/mu.test(source)
+    || /^\s*(?:workflow_run|workflow_dispatch|schedule|pull_request):/mu.test(source)
+    || !source.includes('group: "${{ github.repository }}-tatagate"')
+    || !/^  cancel-in-progress: false$/mu.test(source) || !/^  queue: max$/mu.test(source)
+    || !/^  gate:$/mu.test(source) || !/^  cleanup:$/mu.test(source)
+    || !/^    needs: \[gate\]$/mu.test(source) || !source.includes('if: ${{ always() }}')
+    || !/^    continue-on-error: true$/mu.test(source)
+    || !source.includes('TATAGATE_RESULT: "${{ needs.gate.result }}"')
+    || !source.includes('persist-credentials: false')
+    || !source.includes(' github\n') || !source.includes(' cleanup\n')) throw Error('本仓塔塔门禁Workflow合同无效');
+  return true;
+}
+function tataGateWorkflowRun(run) {
+  return Number.isSafeInteger(run?.id) && run.id>0 && Number.isSafeInteger(run.run_number) && run.run_number>0
+    && Number.isSafeInteger(run.run_attempt) && run.run_attempt>0
+    && run.path === '.github/workflows/tatagate.yml' && run.event === 'push' && run.head_branch === 'main'
+    && run.repository?.full_name === tataGateOwner && /^[a-f0-9]{40}$/u.test(run.head_sha || '')
+    && Number.isFinite(Date.parse(run.created_at));
+}
+export function tataGateCleanupPlan(rows,current,result) {
+  if (!['success','failed'].includes(result) || !tataGateWorkflowRun(current) || !Array.isArray(rows)) throw Error('本仓塔塔门禁清理身份无效');
+  return rows.filter(run=>tataGateWorkflowRun(run) && run.status==='completed' && typeof run.conclusion==='string'
+    && run.id!==current.id && run.run_number<current.run_number
+    && (run.conclusion==='success'?'success':'failed')===result).sort((a,b)=>a.run_number-b.run_number);
+}
+async function tataGateAPI(path,{method='GET',fetchImpl=fetch,token=process.env.GH_TOKEN}={}) {
+  if (typeof token!=='string' || !token || typeof path!=='string' || path.includes('..') || path.startsWith('/') || /[\r\n]/u.test(path)) throw Error('本仓塔塔门禁API参数无效');
+  let response;
+  try {response=await fetchImpl('https://api.github.com/repos/'+tataGateOwner+'/'+path,{method,redirect:'error',
+    headers:{Authorization:'Bearer '+token,Accept:'application/vnd.github+json','X-GitHub-Api-Version':'2026-03-10','User-Agent':'TataGate'},
+    signal:AbortSignal.timeout(30000)});}catch{throw Error('本仓塔塔门禁API连接未确认');}
+  if(response.status===404 && method==='GET')return null;
+  if(!response.ok)throw Error('本仓塔塔门禁API失败：HTTP '+response.status);
+  if(response.status===204)return null;
+  let size=0;const parts=[];
+  if(!response.body)throw Error('本仓塔塔门禁API回执缺失');
+  for await(const chunk of response.body){size+=chunk.length;if(size>8*1024**2)throw Error('本仓塔塔门禁API回执超限');parts.push(chunk);}
+  try{return JSON.parse(new TextDecoder('utf-8',{fatal:true}).decode(Buffer.concat(parts)));}catch{throw Error('本仓塔塔门禁API回执无效');}
+}
+async function tataGateHistory(current,api) {
+  const read=async(start,end)=>{
+    const query='actions/workflows/tatagate.yml/runs?event=push&branch=main&status=completed&created='+encodeURIComponent(new Date(start).toISOString().slice(0,19)+'Z..'+new Date(end).toISOString().slice(0,19)+'Z');
+    const first=await api(query+'&per_page=100&page=1');
+    if(!Number.isSafeInteger(first?.total_count)||!Array.isArray(first.workflow_runs))throw Error('本仓塔塔门禁历史清单无效');
+    if(first.total_count>1000){const middle=Math.floor((start+end)/2000)*1000;if(middle<=start||middle>=end)throw Error('本仓塔塔门禁历史超过同秒上限');return [...await read(start,middle),...await read(middle+1000,end)];}
+    const rows=[...first.workflow_runs];
+    for(let page=2;rows.length<first.total_count;page++){const value=await api(query+'&per_page=100&page='+page);if(!Array.isArray(value?.workflow_runs)||!value.workflow_runs.length)throw Error('本仓塔塔门禁历史分页不完整');rows.push(...value.workflow_runs);}
+    return rows;
+  };
+  const rows=await read(Date.UTC(2008,0,1),Math.floor(Date.parse(current.created_at)/1000)*1000);
+  return [...new Map(rows.map(run=>[run.id,run])).values()];
+}
+export async function tataGateCleanup(result,identity,api=tataGateAPI) {
+  const current=await api('actions/runs/'+identity.id);
+  if(identity.attempt!==undefined&&current?.run_attempt!==identity.attempt)throw Error('本仓塔塔门禁当前Attempt不符');
+  if(!tataGateWorkflowRun(current)||current.id!==identity.id||current.head_sha!==identity.sha)throw Error('本仓塔塔门禁当前Run回读无效');
+  const plan=tataGateCleanupPlan(await tataGateHistory(current,api),current,result),removed=[];
+  for(const candidate of plan){
+    const path='actions/runs/'+candidate.id;
+    const latest=await api('actions/runs/'+current.id);
+    if(!latest||latest.head_sha!==current.head_sha||latest.run_attempt!==current.run_attempt)throw Error('本仓塔塔门禁当前Run已变化');
+    const again=await api(path);
+    if(again===null){removed.push(candidate.id);continue;}
+    if(again.run_attempt!==candidate.run_attempt||again.conclusion!==candidate.conclusion
+      ||tataGateCleanupPlan([again],current,result).length!==1)throw Error('本仓塔塔门禁旧Run已变化，停止清理');
+    try{await api(path,{method:'DELETE'});}catch(error){if(await api(path)!==null)throw error;}
+    if(await api(path)!==null)throw Error('本仓塔塔门禁旧Run删除回查失败');
+    removed.push(candidate.id);
+  }
+  return removed;
+}
+export async function tataGateCommand(mode) {
+  const {fileURLToPath}=await import('node:url'),{resolve}=await import('node:path');
+  const repositoryRoot=resolve(fileURLToPath(new URL('../..',import.meta.url)));
+  const event=tataGateContext(repositoryRoot);
+  tataGateValidateWorkflow(tataGateRead(repositoryRoot+'/.github/workflows/tatagate.yml','utf8'));
+  if(mode==='github'){if(process.env.GITHUB_JOB!=='gate')throw Error('本仓塔塔门禁Job身份无效');const receipt=await tataGateRunOwn(repositoryRoot,event);console.log(JSON.stringify({repository:tataGateOwner,source_sha:event.after,receipt}));return receipt;}
+  if(process.env.GITHUB_JOB!=='cleanup')throw Error('本仓塔塔门禁清理Job身份无效');
+  const result=process.env.TATAGATE_RESULT;
+  if(!['success','failure','cancelled','skipped'].includes(result))throw Error('本仓塔塔门禁前置结果无效');
+  const id=Number(process.env.GITHUB_RUN_ID);
+  if(!Number.isSafeInteger(id)||id<=0)throw Error('本仓塔塔门禁Run编号无效');
+  const jobs=await tataGateAPI('actions/runs/'+id+'/jobs?filter=latest&per_page=100');
+  const gate=jobs?.jobs?.find(job=>job.name==='gate');
+  if(gate?.status!=='completed'||typeof gate.conclusion!=='string'||(gate.conclusion==='success')!==(result==='success'))throw Error('本仓塔塔门禁前置结果与GitHub不一致');
+  const removed=await tataGateCleanup(result==='success'?'success':'failed',{id,sha:event.after,attempt:Number(process.env.GITHUB_RUN_ATTEMPT)});
+  const summary='塔塔门禁'+(result==='success'?'成功':'失败')+'；同类旧Run已清理：'+(removed.join('、')||'无')+'。\n';
+  if(process.env.GITHUB_STEP_SUMMARY){const {appendFileSync}=await import('node:fs');appendFileSync(process.env.GITHUB_STEP_SUMMARY,summary);}
+  console.log(summary.trim());
+}
+if(process.argv[1] && ['github','cleanup'].includes(process.argv[2]) && process.argv.length===3
+  && new URL('file:'+process.argv[1]).href===import.meta.url){
+  try{await tataGateCommand(process.argv[2]);}catch(error){console.error(error.message?.startsWith('本仓')?error.message:'本仓塔塔门禁执行失败');process.exitCode=1;}
+}
+
+export async function tataGatePrepareTools(work) {
+  const {createHash}=await import('node:crypto'),{mkdirSync,writeFileSync}=await import('node:fs');
+  const {spawnSync}=await import('node:child_process');
+  const invoke=(file,args,env=process.env)=>{const result=spawnSync(file,args,{cwd:work,env,stdio:'inherit'});if(result.error||result.signal||result.status!==0)throw Error('本仓SDK门禁工具准备失败');};
+  const archive=async(url,sha,path)=>{const response=await fetch(url,{redirect:'follow',signal:AbortSignal.timeout(120000)});if(!response.ok)throw Error('本仓SDK门禁工具下载失败');const bytes=Buffer.from(await response.arrayBuffer());if(createHash('sha256').update(bytes).digest('hex')!==sha)throw Error('本仓SDK门禁工具归档摘要不符');writeFileSync(path,bytes,{flag:'wx'});};
+  const tools=join(work,'gate-tools');mkdirSync(tools);
+  const gitArchive=join(tools,'git.tar.xz');
+  await archive('https://www.kernel.org/pub/software/scm/git/git-2.54.0.tar.xz','f689162364c10de79ef89aa8dbf48731eb057e34edbbd20aca510ce0154681a3',gitArchive);
+  invoke('/usr/bin/tar',['-xf',gitArchive,'-C',tools]);
+  const prefix=join(tools,'git');
+  invoke('/usr/bin/make',['-C',join(tools,'git-2.54.0'),'-j2','prefix='+prefix,'NO_GETTEXT=YesPlease','NO_TCLTK=YesPlease','NO_PERL=YesPlease','NO_PYTHON=YesPlease','NO_OPENSSL=YesPlease','all']);
+  invoke('/usr/bin/make',['-C',join(tools,'git-2.54.0'),'prefix='+prefix,'NO_GETTEXT=YesPlease','NO_TCLTK=YesPlease','NO_PERL=YesPlease','NO_PYTHON=YesPlease','NO_OPENSSL=YesPlease','install']);
+  const lint=join(tools,'actionlint');mkdirSync(lint);
+  const lintArchive=join(tools,'actionlint.tar.gz');
+  await archive('https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_darwin_arm64.tar.gz','aba9ced2dee8d27fecca3dc7feb1a7f9a52caefa1eb46f3271ea66b6e0e6953f',lintArchive);
+  invoke('/usr/bin/tar',['-xf',lintArchive,'-C',lint]);
+  return {git:join(prefix,'bin/git'),actionlint:join(lint,'actionlint')};
+}
+export function tataGateResourceRoots(repositoryRoot) {
+  const supply=join(repositoryRoot,'target/test');
+  return {supply,work:join(supply,'tatagate')};
+}
+async function tataGateRunOwn(repositoryRoot,event) {
+  if(process.platform!=='darwin'||process.arch!=='arm64')throw Error('本仓SDK门禁要求登记的Apple ARM宿主');
+  const {supply:resourceRoot,work}=tataGateResourceRoots(repositoryRoot);mkdirSync(work,{recursive:true});
+  const gateTools=await tataGatePrepareTools(work);
+  const build=await import('../../scripts/build.mjs');
+  const supply=await build.prepareResourceSupply('sdk',resourceRoot,{run_id:String(process.env.GITHUB_RUN_ID)},{offline:false});
+  const env=build.resourceEnvironment('sdk',resourceRoot,supply),rustc=env.RUSTC,cargo=join(dirname(rustc),'cargo');
+  Object.assign(env,{CARGO:cargo,TATAGATE_CARGO:cargo,TATAGATE_RUSTC:rustc,PRODUCT_GIT_BIN:gateTools.git,
+    TATAGATE_ACTIONLINT:gateTools.actionlint,LIBCLANG_PATH:join(env.DEVELOPER_DIR,'Toolchains/XcodeDefault.xctoolchain/usr/lib')});
+  Object.assign(process.env,env);
+  const library=join(command(rustc,['--print','sysroot'],repositoryRoot,env),'lib/rustlib/src/rust/library');
+  Object.assign(process.env,prepareOffline(repositoryRoot,work,process.env,library));
+  const range=remoteRange(JSON.parse(tataGateRead(join(repositoryRoot,'.github/tatagate/contracts.json'),'utf8')),event);
+  return runGate(repositoryRoot,range.base,range.head,work);
 }

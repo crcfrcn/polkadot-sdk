@@ -25,6 +25,5 @@
   ],
   "workflows": [
     "release-sdk.yml"
-  ],
-  "functions": []
+  ]
 }

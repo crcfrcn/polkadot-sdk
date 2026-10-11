@@ -397,3 +397,64 @@ test('SDK功能目标闭合，实际结果拒绝空跑、过滤、跳过和失�
  assert.equal(sdkFunctionalResult(output.replace('1 passed','0 passed'),{target:'owned-crate',documentation:true}).tests,0);
  for(const targets of [[],[...contract.functional_targets,'undeclared'],contract.functional_targets.slice(1)])assert.throws(()=>gateContract({...contract,functional_targets:targets}));
 });
+
+import {tataGateOwner,tataGateContext,tataGateValidateWorkflow,tataGateCleanupPlan,tataGateCleanup} from './index.mjs';
+import {readFileSync as tataGateRead} from 'node:fs';
+  test('塔塔门禁Workflow只允许本仓push，门禁和清理同处唯一文件',()=>{
+    const source=tataGateRead(new URL('../workflows/tatagate.yml',import.meta.url),'utf8');
+    assert.equal(tataGateValidateWorkflow(source),true);
+    for(const invalid of [source.replace('branches: [main]','branches: [other]'),source.replace('needs: [gate]','needs: [other]'),source.replace('continue-on-error: true','continue-on-error: false')])assert.throws(()=>tataGateValidateWorkflow(invalid));
+  });
+  test('塔塔门禁成功清旧成功、失败清旧失败，活动、未来和其它流程均保留',()=>{
+    const row=(id,conclusion='success',status='completed')=>({id,run_number:id,run_attempt:1,path:'.github/workflows/tatagate.yml',event:'push',head_branch:'main',head_sha:'a'.repeat(40),repository:{full_name:tataGateOwner},created_at:'2026-01-01T00:00:00Z',status,conclusion});
+    const current=row(9,null,'in_progress'),rows=[row(1),row(2,'failure'),row(3,null,'in_progress'),row(10),{...row(4),path:'.github/workflows/release-sdk.yml'},{...row(5),repository:{full_name:'example/other'}}];
+    assert.deepEqual(tataGateCleanupPlan(rows,current,'success').map(x=>x.id),[1]);
+    assert.deepEqual(tataGateCleanupPlan(rows,current,'failed').map(x=>x.id),[2]);
+  });
+  test('塔塔门禁删除逐项回查，清理失败和重跑变化均不能伪报完成',async()=>{
+    const current={id:9,run_number:9,run_attempt:1,path:'.github/workflows/tatagate.yml',event:'push',head_branch:'main',head_sha:'a'.repeat(40),repository:{full_name:tataGateOwner},created_at:'2026-01-02T00:00:00Z',status:'in_progress',conclusion:null};
+    const old={...current,id:1,run_number:1,status:'completed',conclusion:'success',created_at:'2026-01-01T00:00:00Z'};
+    for(const mode of ['success','readback','rerun']){
+      let deleted=false;const api=async(path,options={})=>{
+        if(path==='actions/runs/9')return current;
+        if(path.startsWith('actions/workflows/'))return {total_count:1,workflow_runs:[old]};
+        if(options.method==='DELETE'){deleted=true;return null;}
+        if(path==='actions/runs/1')return mode==='rerun'?{...old,run_attempt:2}:deleted&&mode==='success'?null:old;
+        throw Error('错误清理路径');
+      };
+      if(mode==='success')assert.deepEqual(await tataGateCleanup('success',{id:9,sha:current.head_sha},api),[1]);
+      else await assert.rejects(tataGateCleanup('success',{id:9,sha:current.head_sha},api),/回查失败|已变化/u);
+      if(mode==='rerun')assert.equal(deleted,false);
+    }
+  });
+
+import {execFileSync as tataGateExec} from 'node:child_process';
+test('GitHub门禁工具供给使用公开固定test根，离线验收使用其独立子目录',async()=>{
+  const {fileURLToPath}=await import('node:url');
+  const {tataGateResourceRoots}=await import('./index.mjs'),{checkWork,testRoot}=await import('../../scripts/build.mjs');
+  const source=fileURLToPath(new URL('../..',import.meta.url));
+  const roots=tataGateResourceRoots(source);
+  assert.equal(checkWork(roots.supply),testRoot());
+  assert.equal(roots.work,join(roots.supply,'tatagate'));
+  assert.throws(()=>checkWork(roots.work),/工作根/u);
+});
+  test('GitHub门禁接受准确提交的detached检出，错仓、错SHA和错误Workflow拒绝',async()=>{
+    const {mkdtempSync,mkdirSync,writeFileSync,rmSync,realpathSync}=await import('node:fs');
+    const {tmpdir}=await import('node:os'),{join}=await import('node:path');
+    const directory=mkdtempSync(join(realpathSync(tmpdir()),'tata-gate-context-'));
+    try{
+      const git=process.env.PRODUCT_GIT_BIN||'/usr/bin/git';
+      const invoke=args=>tataGateExec(git,['-c','core.hooksPath=/dev/null','-c','user.name=Tata Gate Fixture','-c','user.email=fixture@example.invalid','-C',directory,...args],{encoding:'utf8'}).trim();
+      invoke(['init','--quiet','--initial-branch=main']);invoke(['remote','add','origin','https://github.com/'+tataGateOwner+'.git']);
+      writeFileSync(join(directory,'file'),'first');invoke(['add','file']);invoke(['commit','--quiet','-m','first']);const before=invoke(['rev-parse','HEAD']);
+      writeFileSync(join(directory,'file'),'second');invoke(['add','file']);invoke(['commit','--quiet','-m','second']);const after=invoke(['rev-parse','HEAD']);
+      invoke(['checkout','--quiet','--detach',after]);
+      const input={GITHUB_ACTIONS:'true',GITHUB_JOB:'gate',GITHUB_EVENT_NAME:'push',GITHUB_REPOSITORY:tataGateOwner,GITHUB_REF:'refs/heads/main',GITHUB_WORKSPACE:directory,GITHUB_SHA:after,
+        GITHUB_WORKFLOW_REF:tataGateOwner+'/.github/workflows/tatagate.yml@refs/heads/main',PRODUCT_GIT_BIN:git};
+      const event={repository:{full_name:tataGateOwner},ref:'refs/heads/main',before,after};
+      assert.equal(tataGateContext(directory,input,event).after,after);
+      assert.throws(()=>tataGateContext(directory,input,{...event,before:'a'.repeat(40)}),/祖先/u);
+      writeFileSync(join(directory,'late'),'new change');assert.throws(()=>tataGateContext(directory,input,event),/未提交改动/u);rmSync(join(directory,'late'));
+      for(const changed of [{...input,GITHUB_SHA:before},{...input,GITHUB_REPOSITORY:'example/other'},{...input,GITHUB_WORKFLOW_REF:tataGateOwner+'/.github/workflows/release-sdk.yml@refs/heads/main'}])assert.throws(()=>tataGateContext(directory,changed,event));
+    }finally{rmSync(directory,{recursive:true,force:true});}
+  });
