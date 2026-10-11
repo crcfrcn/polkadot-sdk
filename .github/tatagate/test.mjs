@@ -398,8 +398,21 @@ test('SDK功能目标闭合，实际结果拒绝空跑、过滤、跳过和失�
  for(const targets of [[],[...contract.functional_targets,'undeclared'],contract.functional_targets.slice(1)])assert.throws(()=>gateContract({...contract,functional_targets:targets}));
 });
 
-import {tataGateOwner,tataGateContext,tataGateValidateWorkflow,tataGateCleanupPlan,tataGateCleanup} from './index.mjs';
+import {tataGateOwner,tataGateContext,tataGateValidateWorkflow,tataGateCleanupPlan,tataGateCleanup,tataGateAPI} from './index.mjs';
 import {readFileSync as tataGateRead} from 'node:fs';
+test('SDK独立Apple供给直接交付系统xcrun，rust-src由独立摘要组件交付',async()=>{
+ const {standaloneApple,requirements,testRoot}=await import('../../scripts/build.mjs'),calls=[];
+ const value=await standaloneApple({names:['xcrun','clang']},'/fixture',{},undefined,async(file,args)=>{calls.push([file,args]);return file.endsWith('xcode-select')?'/fixture/Xcode':'/fixture/Xcode/clang';});
+ assert.equal(value.tools.xcrun,'/usr/bin/xcrun');assert.equal(value.tools.clang,'/fixture/Xcode/clang');assert.equal(calls.some(([,args])=>args.includes('xcrun')),false);
+ const plan=await requirements('sdk',testRoot()),source=plan.tools.find(t=>t.id==='rust').components.find(c=>c.target==='rust-src');
+ assert.equal(source.sha256,'e9a1e616d04c6845895c827a178b9227f7c7199f3f4a80af81ab3aff7b80156b');
+ assert.equal(source.url,'https://static.rust-lang.org/dist/2026-07-16/rust-src-1.97.1.tar.xz');
+ const {validateOwnedNodeTests}=await import('./index.mjs'),{fileURLToPath}=await import('node:url');
+ const repository=fileURLToPath(new URL('../..',import.meta.url)).replace(/\/$/u,'');
+ assert.doesNotThrow(()=>validateOwnedNodeTests(repository,contract.node_tests,contract.upstream_base));
+ assert.throws(()=>validateOwnedNodeTests(repository,contract.node_tests.filter(path=>path!=='scripts/build.mjs'),contract.upstream_base),/清单不闭合/u);
+ assert.throws(()=>validateOwnedNodeTests(repository,[...contract.node_tests,'.github/tatagate/index.mjs'],contract.upstream_base),/清单不闭合/u);
+});
   test('塔塔门禁Workflow只允许本仓push，门禁和清理同处唯一文件',()=>{
     const source=tataGateRead(new URL('../workflows/tatagate.yml',import.meta.url),'utf8');
     assert.equal(tataGateValidateWorkflow(source),true);
@@ -412,6 +425,11 @@ import {readFileSync as tataGateRead} from 'node:fs';
     assert.deepEqual(tataGateCleanupPlan(rows,current,'failed').map(x=>x.id),[2]);
   });
   test('塔塔门禁删除逐项回查，清理失败和重跑变化均不能伪报完成',async()=>{
+    const range='actions/workflows/tatagate.yml/runs?created=2008-01-01T00%3A00%3A00Z..2026-10-11T00%3A00%3A00Z';
+    const empty={total_count:0,workflow_runs:[]};
+    assert.deepEqual(await tataGateAPI(range,{token:'fixture',fetchImpl:async(url,options)=>{assert.ok(url.includes('created='));assert.equal(options.method,'GET');return new Response(JSON.stringify(empty));}}),empty);
+    for(const path of ['../actions/runs/1','actions/%2e%2e/runs','actions/runs/1\n'])await assert.rejects(tataGateAPI(path,{token:'fixture',fetchImpl:()=>{throw Error('越界不应请求网络');}}),/参数无效/u);
+
     const current={id:9,run_number:9,run_attempt:1,path:'.github/workflows/tatagate.yml',event:'push',head_branch:'main',head_sha:'a'.repeat(40),repository:{full_name:tataGateOwner},created_at:'2026-01-02T00:00:00Z',status:'in_progress',conclusion:null};
     const old={...current,id:1,run_number:1,status:'completed',conclusion:'success',created_at:'2026-01-01T00:00:00Z'};
     for(const mode of ['success','readback','rerun']){

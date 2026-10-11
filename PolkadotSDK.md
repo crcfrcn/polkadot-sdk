@@ -116,3 +116,13 @@ SDK是一个完整包、一个sdk目标。内部组件属于该包的完整构�
 本仓保留自己的.github/tatagate门禁实现和合同。main的push只触发本仓.github/workflows/tatagate.yml，gate与cleanup在这一个文件内执行；检出准确GITHUB_SHA并验证本仓GitHub事件、main引用和HTTPS origin，门禁继续执行本仓现有检查。gate成功时删除本仓该门禁旧成功Run；gate失败时删除旧失败Run；另一类最近记录和活动Run保留。清理前重新验真Run、Attempt和结论，删除后回查；清理错误如实记录并由后续运行补清，不影响gate检查结论。塔塔控制台通过塔塔鹿鹿的一次生物识别保存、推送本仓，并按准确SHA与Run ID追踪独立门禁任务；门禁结果不影响已确认的推送。
 
 本仓 GitHub 门禁接受 actions/checkout 的准确 HTTPS origin（同一仓库地址有或没有 `.git` 后缀），仓库、事件、提交和工作流身份仍逐项校验。
+
+门禁清理接口只对 URL 的路径部分拒绝越界，允许 created 查询中的时间范围分隔符；同文件回归直接执行正式 HTTP 参数校验，覆盖时间范围和越界拒绝。
+
+SDK 独立供给解析 Apple tar 的固定 /usr/bin/bsdtar 别名，Rust 主归档只安装其实际组件；rust-src 作为本仓独立锁定的官方归档组件交付，并核验完整 SHA-256。
+
+GitHub 门禁为同一 Xcode 的规范 macOS SDK 与 ARM Clang 显式交付 SDKROOT 和 Cargo 宿主链接器，真实离线子 Cargo 回归沿用相同输入。
+
+独立供给直接交付系统 /usr/bin/xcrun，其余开发者工具通过同一 Xcode 查找；同文件正常回归验证不会把 xcrun 当成开发者工具查询。
+
+门禁按实际同文件测试闭合登记 test.mjs、release-sdk.mjs、scripts/build.mjs；Node 回归在同一已提交 SHA 的独立 Git 副本中逐文件串行执行，避免测试清场影响真实离线供给。

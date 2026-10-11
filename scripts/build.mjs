@@ -37,7 +37,11 @@ async function run(file,args,{cwd,env,signal,capture=false}={}){
  });
 }
 export function assertWorkQuiescent(work=task.getStore()?.work){for(const pid of new Set([...(task.getStore()?.groups||[]),...(recipeGroups.get(work)||[])]))try{process.kill(-pid,0);fail('工具进程退出未确认');}catch(e){if(e.code!=='ESRCH')throw e;}}
-async function bootstrapTools(work,signal){for(const name of ['tar','shell']){const file=contract.bootstrap[name];if(await realpath(file)!==file||!(await lstat(file)).isFile())fail('Apple自举入口无效');}return {tar:contract.bootstrap.tar,shell:contract.bootstrap.shell};}
+async function bootstrapTools(work,signal){
+ const tools={};for(const name of ['tar','shell']){const file=contract.bootstrap[name],actual=await realpath(file);
+  if(actual!==file&&!(file==='/usr/bin/tar'&&actual==='/usr/bin/bsdtar')||!(await lstat(actual)).isFile())fail('Apple自举入口无效');tools[name]=actual;
+ }return tools;
+}
 async function standaloneOriginal(entry,{work,offline,signal}){const dir=await directory(join(work,'originals')),file=join(dir,entry.sha256+'.blob');try{const bytes=await readFile(file);if(hash(bytes)!==entry.sha256)fail('原件与本仓声明不符');return file;}catch(e){if(e.code!=='ENOENT')throw e;}if(offline)fail('离线缺少声明原件');const url=new URL(entry.url);if(url.protocol!=='https:'||url.username||url.password)fail('原件必须为公开HTTPS');const response=await fetch(url,{signal});if(!response.ok)fail('原件获取失败');const bytes=Buffer.from(await response.arrayBuffer());if(!bytes.length||bytes.length>4*1024**3||hash(bytes)!==entry.sha256)fail('原件与声明不符');await writeFile(file,bytes,{flag:'wx',mode:0o444});return file;}
 export async function prepareToolSupply(tool,{original,payload,work,signal,acquireOriginal,acquireApple}){
  const bootstrap=await bootstrapTools(work,signal),environment={PATH:'/usr/bin:/bin',HOME:work,TMPDIR:work};await directory(payload);
@@ -46,17 +50,22 @@ export async function prepareToolSupply(tool,{original,payload,work,signal,acqui
   const listing=await run(bootstrap.tar,['-tf',original],{cwd:work,env:environment,signal,capture:true});for(const name of listing.trim().split('\n'))if(name.startsWith('/')||name.split('/').includes('..'))fail('官方工具归档路径越界');
   await run(bootstrap.tar,['-xf',original,'-C',unpack],{cwd:work,env:environment,signal});const source=tool.archive.root==='.'?unpack:join(unpack,tool.archive.root);
   if(tool.archive.kind==='rust'){
-   await run(bootstrap.shell,[join(source,'install.sh'),'--prefix='+payload,'--disable-ldconfig','--components=rustc,cargo,rust-std-aarch64-apple-darwin,rust-src,rustfmt-preview,clippy-preview'],{cwd:work,env:environment,signal});
+   await run(bootstrap.shell,[join(source,'install.sh'),'--prefix='+payload,'--disable-ldconfig','--components=rustc,cargo,rust-std-aarch64-apple-darwin,rustfmt-preview,clippy-preview'],{cwd:work,env:environment,signal});
    for(const component of tool.components||[]){const file=await acquireOriginal(component,{kind:'tool'}),at=await directory(join(unpack,component.target));await run(bootstrap.tar,['-xf',file,'-C',at],{cwd:work,env:environment,signal});await run(bootstrap.shell,[join(at,component.root,'install.sh'),'--prefix='+payload,'--disable-ldconfig'],{cwd:work,env:environment,signal});}
   }else{for(const name of await readdir(source))await rename(join(source,name),join(payload,name));}
  }finally{assertWorkQuiescent(work);await rm(unpack,{recursive:true,force:true});}}
  return {schema:1,id:tool.id,version:tool.version,payload,original};
 }
+export async function standaloneApple(plan,work,environment,signal,execute=run){
+ const developerDirectory=(await execute('/usr/bin/xcode-select',['-p'],{cwd:work,env:environment,signal,capture:true})).trim(),tools={};
+ for(const name of plan.names)tools[name]=name==='xcrun'?'/usr/bin/xcrun':(await execute('/usr/bin/xcrun',['--find',name],{cwd:work,env:{...environment,DEVELOPER_DIR:developerDirectory},signal,capture:true})).trim();
+ return {developerDirectory,tools};
+}
 export async function prepareResourceSupply(platform,work,previous,options={}){
  if(options.provided===true&&['acquireTool','acquireApple','runCommand'].some(name=>typeof options[name]!=='function'))fail('调度供给能力不完整');
  const plan=await requirements(platform,work),tools={},signal=options.signal,environment={HOME:work,TMPDIR:join(work,'tmp'),PATH:''};await directory(environment.TMPDIR);
  for(const tool of plan.tools){signal?.throwIfAborted();if(options.acquireTool)tools[tool.id]=await options.acquireTool(tool);else{const original=await standaloneOriginal(tool.archive,{work,offline:options.offline,signal}),payload=await directory(join(work,'tools',tool.id));await prepareToolSupply(tool,{original,payload,work,signal,acquireOriginal:e=>standaloneOriginal(e,{work,offline:options.offline,signal})});tools[tool.id]={version:tool.version,path:join(payload,tool.archive.executable)};}}
- let apple;if(options.acquireApple)apple=await options.acquireApple(plan.apple);else{const developerDirectory=(await run('/usr/bin/xcode-select',['-p'],{cwd:work,env:environment,signal,capture:true})).trim();const names={};for(const name of plan.apple.names)names[name]=(await run('/usr/bin/xcrun',['--find',name],{cwd:work,env:{...environment,DEVELOPER_DIR:developerDirectory},signal,capture:true})).trim();apple={developerDirectory,tools:names};}
+ const apple=options.acquireApple?await options.acquireApple(plan.apple):await standaloneApple(plan.apple,work,environment,signal);
  const cargo=join(dirname(tools.rust.path),'cargo'),cargoHome=await directory(join(work,'dependencies/cargo')),cargoTarget=await directory(join(work,'work/cargo-target'));
  Object.assign(environment,{CARGO_HOME:cargoHome,CARGO_TARGET_DIR:cargoTarget,RUSTC:tools.rust.path,DEVELOPER_DIR:apple.developerDirectory,CC:apple.tools.clang,CXX:apple.tools['clang++'],AR:apple.tools.ar,PROTOC:tools.protoc.path,SOLC:tools.solc.path,RESOLC:tools.resolc.path,CMAKE:tools.cmake.path,PATH:[...new Set(Object.values(tools).map(t=>dirname(t.path))),dirname(apple.tools.make)].join(':')});
  // Cargo只按本仓原始锁准备依赖；随后构建强制离线，不改锁、不跟随新版本。
@@ -111,6 +120,7 @@ if(process.argv[1]===fileURLToPath(import.meta.url)&&!process.env.NODE_TEST_CONT
 // BEGIN INLINE TESTS
 if(process.env.NODE_TEST_CONTEXT&&process.argv[1]===import.meta.filename){
  const {test}=await import('node:test'),{default:assert}=await import('node:assert/strict');
+ test('独立供给只为开发者工具查询xcrun，系统xcrun直接交付',async()=>{const calls=[];const value=await standaloneApple({names:['xcrun','clang']},'/fixture',{},undefined,async(file,args)=>{calls.push([file,args]);return file.endsWith('xcode-select')?'/fixture/Xcode':'/fixture/Xcode/clang';});assert.equal(value.tools.xcrun,'/usr/bin/xcrun');assert.equal(value.tools.clang,'/fixture/Xcode/clang');assert.equal(calls.some(([,args])=>args.includes('xcrun')),false);});
  test('SDK平台编译现场位于独立目录且空现场收尾删除目录',async()=>{
   const work=join(root,'target/build/sdk');assert.equal(checkWork(work),work);
   assert.throws(()=>checkWork(join(root,'target/build')),/工作根/);
@@ -121,7 +131,7 @@ if(process.env.NODE_TEST_CONTEXT&&process.argv[1]===import.meta.filename){
  test('SDK编译使用本仓原始锁，完整工作区和离线依赖',async()=>{const value=receipt();let called=0;await build('sdk',testRoot(),value,{runner:async(file,args,options)=>{called++;assert.equal(file,'/fixture/rust/bin/cargo');assert.ok(args.includes('--workspace')&&args.includes('--all-targets')&&args.includes('--locked')&&args.includes('--offline'));assert.equal(options.env.CARGO_NET_OFFLINE,'true');assert.equal(options.cwd,testRoot());}});assert.equal(called,1);});
  test('SDK工具版本不符、取消或真实执行失败不能产生成功',async()=>{const value=receipt();value.tools.rust.version='invalid';let called=false;await assert.rejects(build('sdk',testRoot(),value,{runner:()=>{called=true;}}),/版本/);assert.equal(called,false);const abort=new AbortController();abort.abort();await assert.rejects(build('sdk',testRoot(),receipt(),{signal:abort.signal,runner:()=>assert.fail('取消不得执行')}));await assert.rejects(build('sdk',testRoot(),receipt(),{runner:()=>{throw Error('fixture compiler failure');}}),/fixture compiler failure/);});
  test('SDK调度依赖只使用交付执行能力，缺能力及执行失败不回退',async()=>{
-  const work=testRoot();await mkdir(dirname(work),{recursive:true});await mkdir(work);
+  const work=testRoot();await mkdir(dirname(work),{recursive:true});await mkdir(work,{recursive:true});
   try{
    const previous={run_id:'123456789'};let calls=0;
    const options={provided:true,acquireTool:async tool=>({version:tool.version,path:'/fixture/'+tool.id+'/bin/'+(tool.id==='rust'?'rustc':tool.id)}),acquireApple:async plan=>({developerDirectory:'/fixture/Xcode',tools:Object.fromEntries(plan.names.map(name=>[name,'/fixture/Apple/'+name]))}),runCommand:async(file,args,settings)=>{calls++;assert.equal(file,'/fixture/rust/bin/cargo');assert.equal(args[0],'fetch');assert.ok(args.includes('--locked'));assert.equal(settings.cwd,work);}};
@@ -132,7 +142,7 @@ if(process.env.NODE_TEST_CONTEXT&&process.argv[1]===import.meta.filename){
  });
 
  test('SDK领取与收尾互斥，异任务及资源后代不能清场',async()=>{
-  const work=testRoot();await mkdir(dirname(work),{recursive:true});await mkdir(work);
+  const work=testRoot();await mkdir(dirname(work),{recursive:true});await mkdir(work,{recursive:true});
   try{
    await withWorkClaim(work,async()=>{
     await assert.rejects(finishBuild(work,{run_id:'123456789'}),/EEXIST/);

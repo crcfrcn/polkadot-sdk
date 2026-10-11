@@ -43,6 +43,12 @@
               "url": "https://static.rust-lang.org/dist/2026-07-16/rust-std-1.97.1-wasm32-unknown-unknown.tar.xz",
               "sha256": "fa0edb6e9f34faae5735554d62d50875eded839dc707d0f1c01467a918d8453b",
               "root": "rust-std-1.97.1-wasm32-unknown-unknown"
+            },
+            {
+              "target": "rust-src",
+              "url": "https://static.rust-lang.org/dist/2026-07-16/rust-src-1.97.1.tar.xz",
+              "sha256": "e9a1e616d04c6845895c827a178b9227f7c7199f3f4a80af81ab3aff7b80156b",
+              "root": "rust-src-1.97.1"
             }
           ]
         },

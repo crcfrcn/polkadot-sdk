@@ -265,7 +265,7 @@ export function remoteRange(contract, event) {
   return gateRange(contract.initial_sha, event.after);
 }
 export function gateContract(value) {
-  if (!value||Object.keys(value).sort().join(',')!==['schema','repository','github_repository','node_tests','checks','upstream','upstream_base','initial_sha','functional_targets','workflows'].sort().join(',')||value.github_repository!=='crcfrcn/polkadot-sdk'||!Array.isArray(value.node_tests)||value.node_tests.join(',')!=='.github/tatagate/test.mjs,.github/workflows/release-sdk.mjs'||value?.schema !== 1 || value.repository !== 'polkadot-sdk' || value.upstream !== 'paritytech/polkadot-sdk'
+  if (!value||Object.keys(value).sort().join(',')!==['schema','repository','github_repository','node_tests','checks','upstream','upstream_base','initial_sha','functional_targets','workflows'].sort().join(',')||value.github_repository!=='crcfrcn/polkadot-sdk'||!Array.isArray(value.node_tests)||value.node_tests.join(',')!=='.github/tatagate/test.mjs,.github/workflows/release-sdk.mjs,scripts/build.mjs'||value?.schema !== 1 || value.repository !== 'polkadot-sdk' || value.upstream !== 'paritytech/polkadot-sdk'
     || !shaPattern.test(value.upstream_base ?? '') || !shaPattern.test(value.initial_sha ?? '')
     || !Array.isArray(value.functional_targets)||value.functional_targets.join(',')!=='affected-crates-all-targets,affected-crates-doc,workspace-on-lock-or-manifest-change,applicable-wasm-hosts'
     || !Array.isArray(value.checks) || value.checks.join(',') !== 'identity,history,source,workflow,tests,changed-crates') {
@@ -286,6 +286,7 @@ function command(file, args, root, environment = process.env) {
     // SDK完整metadata当前约13MiB，保留有界缓冲以容纳完整依赖图。
     stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 32 * 1024 * 1024 });
   if (result.status !== 0 || result.error) {
+    process.stderr.write((result.stdout ?? '').slice(-64 * 1024));
     process.stderr.write((result.stderr ?? '').slice(-64 * 1024));
     throw new Error('SDK门禁工具检查失败：' + args.slice(0, 4).join(' ') + '；退出码 ' + result.status
       + (result.error ? '；' + result.error.message : ''));
@@ -434,7 +435,7 @@ export function validateOwnedDocuments(root){
 export function validateOwnedNodeTests(root,registered,upstream){
  const tracked=git(root,['ls-files','-z']).split('\0').filter(Boolean);
  const upstreamTests=new Set(git(root,['ls-tree','-r','--name-only','-z',upstream]).split('\0').filter(Boolean));
- const actual=tracked.filter(path=>/(?:^|\/)(?:test\.mjs|[^/]+[._-](?:test|spec)\.mjs)$/u.test(path)&&!upstreamTests.has(path)).sort();
+ const actual=tracked.filter(path=>!upstreamTests.has(path)&&(/(?:^|\/)(?:test\.mjs|[^/]+[._-](?:test|spec)\.mjs)$/u.test(path)||path.endsWith('.mjs')&&/\bprocess\s*\.\s*env\s*\.\s*NODE_TEST_CONTEXT\b/u.test(lexicalParts(path,readFileSync(join(root,path),'utf8')).code)&&/(?<![.\w])test\s*\(/u.test(lexicalParts(path,readFileSync(join(root,path),'utf8')).code))).sort();
  if(actual.join('\0')!==[...registered].sort().join('\0')||new Set(registered).size!==registered.length||!actual.length)throw Error('SDK自有Node测试清单不闭合');
  for(const path of actual){const file=join(root,gatePath(path)),info=lstatSync(file);if(!info.isFile()||info.isSymbolicLink()||!info.size||realpathSync(file)!==file)throw Error('SDK真实测试入口无效');}
 }
@@ -513,7 +514,12 @@ export function runGate(root, baseSHA, headSHA, work) {
   validateOwnedDocuments(root);
   validateOwnedNodeTests(root,contract.node_tests,contract.upstream_base);
   if(process.version!=='v25.2.1')throw Error('SDK门禁Node版本不符');
-  command(process.execPath,['--test','--test-reporter='+join(root,'.github/tatagate/index.mjs'),...contract.node_tests],root,{...process.env,TATAGATE_NODE_TESTS:JSON.stringify(contract.node_tests.map(path=>join(root,path)))});
+  const testSource=join(work,'node-source');
+  git(root,['clone','--quiet','--no-hardlinks','--no-local',root,testSource]);
+  if(git(testSource,['rev-parse','HEAD'])!==range.head)throw Error('SDK Node回归快照提交不符');
+  const testPaths=contract.node_tests.map(path=>join(testSource,path));
+  command(process.execPath,['--test','--test-concurrency=1','--test-reporter='+join(testSource,'.github/tatagate/index.mjs'),...testPaths],testSource,{...process.env,TATAGATE_NODE_TESTS:JSON.stringify(testPaths)});
+  if(git(testSource,['rev-parse','HEAD'])!==range.head||git(testSource,['status','--porcelain=v1','--untracked-files=all'])!=='')throw Error('SDK Node回归改变受检源码');
   const functionalResults=[],hosts = hostChecks(paths);
   if (crates.size || hosts.length || paths.includes('Cargo.lock') || paths.includes('Cargo.toml')) {
     const environment = gateEnvironment(root, work, process.env), cargo = environment.CARGO;
@@ -637,8 +643,8 @@ export function tataGateCleanupPlan(rows,current,result) {
     && run.id!==current.id && run.run_number<current.run_number
     && (run.conclusion==='success'?'success':'failed')===result).sort((a,b)=>a.run_number-b.run_number);
 }
-async function tataGateAPI(path,{method='GET',fetchImpl=fetch,token=process.env.GH_TOKEN}={}) {
-  if (typeof token!=='string' || !token || typeof path!=='string' || path.includes('..') || path.startsWith('/') || /[\r\n]/u.test(path)) throw Error('本仓塔塔门禁API参数无效');
+export async function tataGateAPI(path,{method='GET',fetchImpl=fetch,token=process.env.GH_TOKEN}={}) {
+  if (typeof token!=='string' || !token || typeof path!=='string' || path.split('?')[0].includes('..') || path.split('?')[0].includes('%') || path.startsWith('/') || /[\r\n]/u.test(path)) throw Error('本仓塔塔门禁API参数无效');
   let response;
   try {response=await fetchImpl('https://api.github.com/repos/'+tataGateOwner+'/'+path,{method,redirect:'error',
     headers:{Authorization:'Bearer '+token,Accept:'application/vnd.github+json','X-GitHub-Api-Version':'2026-03-10','User-Agent':'TataGate'},
@@ -704,7 +710,7 @@ export async function tataGateCommand(mode) {
 }
 if(process.argv[1] && ['github','cleanup'].includes(process.argv[2]) && process.argv.length===3
   && new URL('file:'+process.argv[1]).href===import.meta.url){
-  try{await tataGateCommand(process.argv[2]);}catch(error){console.error(error.message?.startsWith('本仓')?error.message:'本仓塔塔门禁执行失败');process.exitCode=1;}
+  try{await tataGateCommand(process.argv[2]);}catch(error){console.error(('本仓塔塔门禁执行失败：'+String(error.message??error)).replace(/gh[sopru]_[^\s]+|github_pat_[^\s]+/gu,'[已隐藏]').slice(0,2000));process.exitCode=1;}
 }
 
 export async function tataGatePrepareTools(work) {
@@ -738,6 +744,9 @@ async function tataGateRunOwn(repositoryRoot,event) {
   const env=build.resourceEnvironment('sdk',resourceRoot,supply),rustc=env.RUSTC,cargo=join(dirname(rustc),'cargo');
   Object.assign(env,{CARGO:cargo,TATAGATE_CARGO:cargo,TATAGATE_RUSTC:rustc,PRODUCT_GIT_BIN:gateTools.git,
     TATAGATE_ACTIONLINT:gateTools.actionlint,LIBCLANG_PATH:join(env.DEVELOPER_DIR,'Toolchains/XcodeDefault.xctoolchain/usr/lib')});
+  const developer=tataGateReal(env.DEVELOPER_DIR),sdk=tataGateReal(command('/usr/bin/xcrun',['--sdk','macosx','--show-sdk-path'],repositoryRoot,env));
+  if(!sdk.startsWith(developer+'/Platforms/MacOSX.platform/Developer/SDKs/'))throw Error('本仓SDK门禁宿主SDK不属于同一Xcode');
+  Object.assign(env,{DEVELOPER_DIR:developer,SDKROOT:sdk,CARGO_TARGET_AARCH64_APPLE_DARWIN_LINKER:env.CC});
   Object.assign(process.env,env);
   const library=join(command(rustc,['--print','sysroot'],repositoryRoot,env),'lib/rustlib/src/rust/library');
   Object.assign(process.env,prepareOffline(repositoryRoot,work,process.env,library));

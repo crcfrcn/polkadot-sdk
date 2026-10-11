@@ -15,7 +15,8 @@
   "github_repository": "crcfrcn/polkadot-sdk",
   "node_tests": [
     ".github/tatagate/test.mjs",
-    ".github/workflows/release-sdk.mjs"
+    ".github/workflows/release-sdk.mjs",
+    "scripts/build.mjs"
   ],
   "functional_targets": [
     "affected-crates-all-targets",
