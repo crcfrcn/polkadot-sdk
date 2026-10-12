@@ -100,6 +100,10 @@ export async function finishBuild(work,{run_id}={}){
   assertWorkQuiescent(work);await clearBuildContents(work);if(work===join(root,'target/build/sdk'))await rmdir(work);
  });return value;
 }
+// 编译任务先执行本仓现有回归；测试清单只归所属产品Build接口。
+export function testFiles(){return ['scripts/build.mjs'];}
+export async function testTools(){return [];}
+
 export async function execute(platform,work,request={},options={}){
  options.signal?.throwIfAborted();checkWork(work);await directory(work);await requirements(platform,work);if(!request||typeof request!=='object'||Array.isArray(request)||Object.keys(request).some(k=>k!=='run_id')||request.run_id!==undefined&&(typeof request.run_id!=='string'||!/^[1-9][0-9]{8}$/u.test(request.run_id)))fail('SDK Build只接受本轮运行编号');
  const provided=process.env.PRODUCT_RESOURCE_FD==='4';

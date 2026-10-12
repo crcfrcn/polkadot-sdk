@@ -142,8 +142,8 @@
   "automation": {
     "targets": {
       "sdk": {
-        "workflow": ".github/workflows/release-sdk.yml",
-        "entry": ".github/workflows/release-sdk.mjs"
+        "workflow": ".github/workflows/sdk.yml",
+        "entry": ".github/workflows/sdk.yml"
       }
     }
   }
