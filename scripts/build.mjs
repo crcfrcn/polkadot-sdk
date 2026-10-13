@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // Polkadot SDK唯一完整本机编译入口；只消费本仓锁与声明，不调用控制台或兄弟仓流程。
-import {writeFileSync} from 'node:fs';
+import {writeFileSync,existsSync,readdirSync,rmdirSync} from 'node:fs';
 import {spawn} from 'node:child_process';
 import {AsyncLocalStorage} from 'node:async_hooks';
 import {Socket} from 'node:net';
@@ -9,6 +9,9 @@ import {readFile,writeFile,mkdir,lstat,realpath,readdir,rm,rmdir,copyFile,rename
 import {dirname,join,resolve,relative,isAbsolute,sep} from 'node:path';
 import {fileURLToPath} from 'node:url';
 const root=resolve(dirname(fileURLToPath(import.meta.url)),'..');
+// 本仓测试用随机会话映射固定夹具；正式Build始终领取原平台根。
+if(process.env.NODE_TEST_CONTEXT&&!process.env.POLKADOT_SDK_TEST_SESSION)process.env.POLKADOT_SDK_TEST_SESSION=randomUUID();
+const testSession=process.env.NODE_TEST_CONTEXT&&/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/u.test(process.env.POLKADOT_SDK_TEST_SESSION||'')?process.env.POLKADOT_SDK_TEST_SESSION:null;
 export const contract=JSON.parse(await readFile(join(root,'scripts/flows.json'),'utf8'));
 const recipeGroups=new Map();
 const task=new AsyncLocalStorage(),fail=message=>{throw Error('Polkadot SDK编译：'+message);};
@@ -25,12 +28,13 @@ export async function polkadotRelease(release,platform,readTag){
  return {version:sequence[1],run_id:Number(run),run_attempt:Number(attempt),tag,source_sha:commit.object.sha};
 }
 const inside=(base,path)=>path===base||path.startsWith(base+sep),hash=bytes=>createHash('sha256').update(bytes).digest('hex');
-export function testRoot(){return join(root,'target/test');}
-export function checkWork(work){if(work!==join(root,'target/build/sdk')&&work!==testRoot())fail('工作根必须归本仓target/build/sdk或target/test');return work;}
+export function testRoot(){return testSession?join(root,'target/test/sessions',testSession):join(root,'target/test');}
+function buildWork(){return testSession?join(testRoot(),'build/sdk'):join(root,'target/build/sdk');}
+export function checkWork(work){if(work!==buildWork()&&work!==testRoot())fail('工作根必须归本仓本轮Build或测试会话');return work;}
 async function directory(path){await mkdir(path,{recursive:true,mode:0o700});if(await realpath(path)!==path||!(await lstat(path)).isDirectory())fail('工作路径经过链接或非目录');return path;}
 export async function requirements(platform,work){checkWork(work);if(platform!=='sdk'||process.platform!==contract.bootstrap.platform||process.arch!==contract.bootstrap.arch)fail('本机平台没有声明实现');await readFile(join(root,'Cargo.lock'));return {schema:1,product_id:contract.product_id,platform,tools:contract.platforms.sdk.tools,locks:contract.platforms.sdk.locks,apple:contract.apple,bootstrap:contract.bootstrap};}
 async function run(file,args,{cwd,env,signal,capture=false}={}){
- signal?.throwIfAborted();return new Promise((ok,reject)=>{let reason,closed=false,output=[];const child=spawn(file,args,{cwd,env,detached:true,stdio:['ignore','pipe','pipe']});const state=task.getStore(),work=[join(root,'target/build/sdk'),testRoot()].find(path=>cwd===path||cwd?.startsWith(path+sep));const groups=work?(recipeGroups.get(work)||new Set()):new Set();if(work)recipeGroups.set(work,groups);const record=()=>{if(work)writeFileSync(join(work,'.resource-active.json'),JSON.stringify({pid:process.pid,groups:[...groups]})+'\n');};if(Number.isSafeInteger(child.pid)){groups.add(child.pid);state?.groups.add(child.pid);state?.onGroups?.(state.groups);record();}
+ signal?.throwIfAborted();return new Promise((ok,reject)=>{let reason,closed=false,output=[];const child=spawn(file,args,{cwd,env,detached:true,stdio:['ignore','pipe','pipe']});const state=task.getStore(),work=[buildWork(),testRoot()].find(path=>cwd===path||cwd?.startsWith(path+sep));const groups=work?(recipeGroups.get(work)||new Set()):new Set();if(work)recipeGroups.set(work,groups);const record=()=>{if(work)writeFileSync(join(work,'.resource-active.json'),JSON.stringify({pid:process.pid,groups:[...groups]})+'\n');};if(Number.isSafeInteger(child.pid)){groups.add(child.pid);state?.groups.add(child.pid);state?.onGroups?.(state.groups);record();}
  let killer;const stop=()=>{reason??=Error('编译已取消');try{process.kill(-child.pid,'SIGTERM');}catch{}killer??=setTimeout(()=>{try{process.kill(-child.pid,'SIGKILL');}catch{}},1500);};signal?.addEventListener('abort',stop,{once:true});
  let size=0;for(const stream of [child.stdout,child.stderr])stream.on('data',bytes=>{size+=bytes.length;if(size>16*1024**2){reason=Error('工具输出超限');stop();}else if(capture)output.push(bytes);else process.stderr.write(bytes);});
  child.once('error',e=>{reason=e;});child.once('close',async code=>{closed=true;signal?.removeEventListener('abort',stop);clearTimeout(killer);const alive=()=>{if(!Number.isSafeInteger(child.pid))return false;try{process.kill(-child.pid,0);return true;}catch(e){return e.code!=='ESRCH';}};if(alive()){try{process.kill(-child.pid,'SIGTERM');}catch{}for(let n=0;n<15&&alive();n++)await new Promise(resolve=>setTimeout(resolve,100));if(alive())try{process.kill(-child.pid,'SIGKILL');}catch{}for(let n=0;n<15&&alive();n++)await new Promise(resolve=>setTimeout(resolve,100));}if(alive())return reject(Error('工具后代仍运行，保留现场'));groups.delete(child.pid);record();state?.groups.delete(child.pid);state?.onGroups?.(state.groups);reason||code!==0?reject(reason||Error('工具执行失败，退出码'+code)):ok(Buffer.concat(output).toString());});
@@ -77,7 +81,7 @@ export function resourceEnvironment(platform,work,value){checkWork(work);if(plat
 async function suppliedResources(platform,work,request,signal){const stream=new Socket({fd:4,readable:true,writable:true}),plan=await requirements(platform,work);return new Promise((ok,reject)=>{let text='',done=false;const finish=(error,value)=>{if(done)return;done=true;signal?.removeEventListener('abort',abort);stream.destroy();error?reject(error):ok(value);},abort=()=>finish(Error('资源供给已取消'));signal?.throwIfAborted();signal?.addEventListener('abort',abort,{once:true});stream.setEncoding('utf8');stream.on('data',chunk=>{text+=chunk;if(Buffer.byteLength(text)>2*1024**2)return finish(Error('供给回执超限'));if(!text.includes('\n'))return;try{const [line,extra]=text.split('\n');if(extra)fail('供给回执不是唯一帧');const reply=JSON.parse(line);if(reply.id!=='1'||reply.ok!==true||reply.value?.run_id!==request.run_id)fail('供给回执失败或任务不符');finish(null,reply.value);}catch(e){finish(e);}});stream.on('error',e=>finish(e));stream.on('end',()=>finish(Error('供给通道中断')));stream.write(JSON.stringify({id:'1',operation:'prepare',previous:request})+'\n');});}
 // 领取与收尾共用本仓短锁，直到全部子内容删除后才释放。
 async function withWorkClaim(work,action){
- checkWork(work);await directory(work);const path=work===join(root,'target/build/sdk')?join(root,'target/build/.claim-sdk'):join(work,'.claim.lock');await mkdir(path,{mode:0o700});const held=await lstat(path);
+ checkWork(work);await directory(work);const path=work===buildWork()?join(dirname(work),'.claim-sdk'):join(work,'.claim.lock');await mkdir(path,{mode:0o700});const held=await lstat(path);
  try{return await action();}finally{const current=await lstat(path);if(current.dev!==held.dev||current.ino!==held.ino)fail('工作短锁漂移');await rm(path,{recursive:true});}
 }
 async function assertSupplyExited(work){
@@ -92,24 +96,34 @@ async function clearBuildContents(work){
  await assertSupplyExited(work);for(const name of await readdir(work))if(!['.claim.lock','.active.json'].includes(name))await rm(join(work,name),{recursive:true,force:true});await rm(join(work,'.active.json'),{force:true});
 }
 export async function finishBuild(work,{run_id}={}){
- if(run_id&&work===join(root,'target/build/sdk'))try{await lstat(work);}catch(error){if(error.code==='ENOENT')return;throw error;}
+ if(run_id&&work===buildWork())try{await lstat(work);}catch(error){if(error.code==='ENOENT')return;throw error;}
  const value=await withWorkClaim(work,async()=>{
-  const lock=join(work,'.active.json');let owner;try{const info=await lstat(lock);if(!info.isFile()||info.isSymbolicLink()||info.nlink!==1)fail('编译守卫无效');owner=JSON.parse(await readFile(lock,'utf8'));}catch(error){if(error.code==='ENOENT'){if(work===join(root,'target/build/sdk')&&(await readdir(work)).length===0)await rmdir(work);return;}throw error;}
+  const lock=join(work,'.active.json');let owner;try{const info=await lstat(lock);if(!info.isFile()||info.isSymbolicLink()||info.nlink!==1)fail('编译守卫无效');owner=JSON.parse(await readFile(lock,'utf8'));}catch(error){if(error.code==='ENOENT'){if(work===buildWork()&&(await readdir(work)).length===0)await rmdir(work);return;}throw error;}
   if(owner.work!==work||owner.product_id!==contract.product_id||owner.run_id!==run_id||!Number.isSafeInteger(owner.pid)||owner.pid<2||!Array.isArray(owner.groups)||owner.groups.some(pid=>!Number.isSafeInteger(pid)||pid<2))fail('编译收尾身份无效');
   for(const pid of [owner.pid,...owner.groups.map(pid=>-pid)])try{process.kill(pid,0);fail('产品进程退出未确认');}catch(error){if(error.code!=='ESRCH')throw error;}
-  assertWorkQuiescent(work);await clearBuildContents(work);if(work===join(root,'target/build/sdk'))await rmdir(work);
+  assertWorkQuiescent(work);await clearBuildContents(work);if(work===buildWork())await rmdir(work);
  });return value;
 }
-// 编译任务先执行本仓现有回归；测试清单只归所属产品Build接口。
-export function testFiles(){return ['scripts/build.mjs'];}
-export async function testTools(){return [];}
+// 完整Build由本仓在资源回执后运行自身测试，再进入正式编译。
+function testFiles(){return ['scripts/build.mjs'];}
+async function runProductTests(platform,work,receipt,signal){
+ const node=receipt.tools.node,expected=contract.platforms.sdk.tools.find(value=>value.id==='node');
+ if(!node||node.version!==expected?.version||!isAbsolute(node.path)||await realpath(node.path)!==node.path)fail('SDK测试缺少准确Node入口');
+ const files=testFiles().map(file=>join(root,file));
+ for(const file of files){const info=await lstat(file);if(!info.isFile()||info.isSymbolicLink()||await realpath(file)!==file)fail('SDK测试文件无效');}
+ const digests=await Promise.all(files.map(async file=>hash(await readFile(file))));
+ // Node测试运行器自行设置测试子进程身份；预设NODE_TEST_CONTEXT会跳过测试文件。
+ await run(node.path,['--test','--test-concurrency=1',...files],
+  {cwd:root,env:{HOME:work,LANG:'C',LC_ALL:'C',PATH:receipt.environment.PATH},signal});
+ for(let index=0;index<files.length;index++)if(hash(await readFile(files[index]))!==digests[index])fail('SDK测试期间源码改变');
+}
 
 export async function execute(platform,work,request={},options={}){
  options.signal?.throwIfAborted();checkWork(work);await directory(work);await requirements(platform,work);if(!request||typeof request!=='object'||Array.isArray(request)||Object.keys(request).some(k=>k!=='run_id')||request.run_id!==undefined&&(typeof request.run_id!=='string'||!/^[1-9][0-9]{8}$/u.test(request.run_id)))fail('SDK Build只接受本轮运行编号');
  const provided=process.env.PRODUCT_RESOURCE_FD==='4';
  const runID=request.run_id||randomUUID(),mode=provided?'provided':'independent',lock=join(work,'.active.json');const owner={schema:1,product_id:contract.product_id,platform,scope:'build',work,run_id:runID,pid:process.pid,nonce:randomUUID(),groups:[]};await withWorkClaim(work,async()=>{await assertSupplyExited(work);await writeFile(lock,JSON.stringify(owner)+'\n',{flag:'wx',mode:0o600});});let unsafe=false;
  const cancellation=new AbortController(),abort=()=>cancellation.abort();options.signal?.addEventListener('abort',abort,{once:true});
- try{return await task.run({work,groups:new Set(),onGroups:groups=>writeFileSync(lock,JSON.stringify({...owner,groups:[...groups]})+'\n')},async()=>{const receipt=mode==='provided'?await suppliedResources(platform,work,{run_id:runID},cancellation.signal):await prepareResourceSupply(platform,work,{run_id:runID},{...options,provided:false});const env=resourceEnvironment(platform,work,receipt);await build(platform,work,receipt,{signal:cancellation.signal});assertWorkQuiescent();return {schema:1,product_id:contract.product_id,platform,work,run_id:runID,completion:'compile-only',files:[]};});}
+ try{return await task.run({work,groups:new Set(),onGroups:groups=>writeFileSync(lock,JSON.stringify({...owner,groups:[...groups]})+'\n')},async()=>{const receipt=mode==='provided'?await suppliedResources(platform,work,{run_id:runID},cancellation.signal):await prepareResourceSupply(platform,work,{run_id:runID},{...options,provided:false});const env=resourceEnvironment(platform,work,receipt);await runProductTests(platform,work,receipt,cancellation.signal);await build(platform,work,receipt,{signal:cancellation.signal});assertWorkQuiescent();return {schema:1,product_id:contract.product_id,platform,work,run_id:runID,completion:'compile-only',files:[]};});}
  catch(e){unsafe=String(e.message).includes('退出未确认')||String(e.message).includes('后代仍运行');throw e;}finally{options.signal?.removeEventListener('abort',abort);if(!unsafe&&mode==='independent')await withWorkClaim(work,async()=>{await clearBuildContents(work);await rmdir(work);});}
 }
 
@@ -122,11 +136,22 @@ export async function build(platform,work,receipt,{signal,runner=run}={}){
 if(process.argv[1]===fileURLToPath(import.meta.url)&&!process.env.NODE_TEST_CONTEXT){const [command,platform,flag,work,...extra]=process.argv.slice(2);if(command!=='execute'||flag!=='--work'||extra.some(x=>x!=='--offline')||extra.length>1)fail('本机编译参数无效');let input='';for await(const chunk of process.stdin){input+=chunk;if(Buffer.byteLength(input)>2*1024**2)fail('公开输入超限');}const cancellation=new AbortController();for(const s of ['SIGINT','SIGTERM'])process.once(s,()=>cancellation.abort());process.stdout.write(JSON.stringify(await execute(platform,work,input?JSON.parse(input):{},{offline:extra.includes('--offline'),signal:cancellation.signal}))+'\n');}
 
 // BEGIN INLINE TESTS
-if(process.env.NODE_TEST_CONTEXT&&process.argv[1]===import.meta.filename){
- const {test}=await import('node:test'),{default:assert}=await import('node:assert/strict');
+if(process.env.NODE_TEST_CONTEXT&&process.argv.length===2&&process.argv[1]===import.meta.filename){
+ const {test,after}=await import('node:test'),{default:assert}=await import('node:assert/strict');
+ test('SDK测试现场归本轮随机会话，正式Build根保持固定',()=>{assert.ok(testSession);assert.equal(testRoot(),join(root,'target/test/sessions',testSession));assert.equal(buildWork(),join(testRoot(),'build/sdk'));});
+ after(async()=>{
+  // 仅删除当前测试进程的随机会话；守卫或工具仍活跃时失败并保留现场。
+  if(existsSync(buildWork()))fail('SDK测试平台夹具尚未收尾');
+  const session=testRoot();if(existsSync(session)){
+   await assertSupplyExited(session);assertWorkQuiescent(session);
+   if(existsSync(join(session,'.active.json'))||await realpath(session)!==session)fail('SDK测试会话身份或目录无效');
+   await rm(session,{recursive:true});
+  }
+  const parent=join(root,'target/test/sessions');if(existsSync(parent)&&readdirSync(parent).length===0)rmdirSync(parent);
+ });
  test('独立供给只为开发者工具查询xcrun，系统xcrun直接交付',async()=>{const calls=[];const value=await standaloneApple({names:['xcrun','clang']},'/fixture',{},undefined,async(file,args)=>{calls.push([file,args]);return file.endsWith('xcode-select')?'/fixture/Xcode':'/fixture/Xcode/clang';});assert.equal(value.tools.xcrun,'/usr/bin/xcrun');assert.equal(value.tools.clang,'/fixture/Xcode/clang');assert.equal(calls.some(([,args])=>args.includes('xcrun')),false);});
  test('SDK平台编译现场位于独立目录且空现场收尾删除目录',async()=>{
-  const work=join(root,'target/build/sdk');assert.equal(checkWork(work),work);
+  const work=buildWork();assert.equal(checkWork(work),work);
   assert.throws(()=>checkWork(join(root,'target/build')),/工作根/);
   await directory(work);await finishBuild(work,{run_id:'123456789'});
   await assert.rejects(lstat(work),{code:'ENOENT'});
