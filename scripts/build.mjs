@@ -157,17 +157,163 @@ export async function execute(platform,work,request={},options={}){
  catch(e){unsafe=String(e.message).includes('退出未确认')||String(e.message).includes('后代仍运行');throw e;}finally{options.signal?.removeEventListener('abort',abort);if(!unsafe&&mode==='independent')await withWorkClaim(work,async()=>{await clearBuildContents(work);await rmdir(work);});}
 }
 
+const sdkRepository='crcfrcn/polkadot-sdk';
+const sdkWorkflow='.github/workflows/sdk.yml';
+// Run与Cargo缓存使用不同的GitHub Actions资源接口；身份始终绑定本仓main和单一sdk.yml。
+function sdkRetentionIdentity(environment){
+ if(environment.GITHUB_ACTIONS!=='true'||environment.GITHUB_REPOSITORY!==sdkRepository
+  ||environment.GITHUB_EVENT_NAME!=='workflow_dispatch'||environment.GITHUB_REF!=='refs/heads/main'
+  ||environment.GITHUB_WORKFLOW_REF!==sdkRepository+'/'+sdkWorkflow+'@refs/heads/main'
+  ||!/^[a-f0-9]{40}$/u.test(environment.GITHUB_SHA||'')
+  ||!['GITHUB_RUN_ID','GITHUB_RUN_NUMBER','GITHUB_RUN_ATTEMPT'].every(key=>/^[1-9][0-9]*$/u.test(environment[key]||'')&&Number.isSafeInteger(Number(environment[key])))
+  ||!environment.GH_TOKEN)fail('GitHub SDK保留清理身份无效');
+}
+function sdkRunBucket(run){return run.conclusion==='success'?'success':'failure';}
+function sdkRunOrder(left,right){return right.run_number-left.run_number||right.run_attempt-left.run_attempt||right.id-left.id;}
+function sdkValidateRun(run,{current=false,environment}){
+ if(!Number.isSafeInteger(run?.id)||run.id<1||run.path!==sdkWorkflow
+  ||run.repository?.full_name!==sdkRepository||run.head_branch!=='main'
+  ||!/^[a-f0-9]{40}$/u.test(run.head_sha||'')
+  ||!Number.isSafeInteger(run.run_number)||run.run_number<1
+  ||!Number.isSafeInteger(run.run_attempt)||run.run_attempt<1
+  ||current&&(run.id!==Number(environment.GITHUB_RUN_ID)||run.run_number!==Number(environment.GITHUB_RUN_NUMBER)
+    ||run.run_attempt!==Number(environment.GITHUB_RUN_ATTEMPT)||run.head_sha!==environment.GITHUB_SHA||run.status!=='in_progress')
+  ||!current&&(run.status!=='completed'||typeof run.conclusion!=='string'||!run.conclusion))fail('GitHub SDK Run保留候选身份无效');
+ return run;
+}
+async function sdkGitHubRequest(path,{environment=process.env,fetchImpl=fetch,method='GET'}={}){
+ let response;try{response=await fetchImpl('https://api.github.com/repos/'+sdkRepository+'/'+path,{method,redirect:'error',
+  headers:{Accept:'application/vnd.github+json',Authorization:'Bearer '+environment.GH_TOKEN,'X-GitHub-Api-Version':'2026-03-10'},
+  signal:AbortSignal.timeout(30_000)});}catch{fail('GitHub SDK保留清理请求失败');}
+ if(method==='DELETE'&&response.status===204)return null;
+ if(!response.ok)fail('GitHub SDK保留清理接口失败（HTTP '+response.status+'）');
+ try{return await response.json();}catch{fail('GitHub SDK保留清理响应无效');}
+}
+async function sdkWorkflowRuns({environment=process.env,fetchImpl=fetch}={}){
+ const runs=[];
+ for(let page=1;page<=10000;page++){
+  const data=await sdkGitHubRequest('actions/workflows/sdk.yml/runs?per_page=100&page='+page,{environment,fetchImpl});
+  if(!Array.isArray(data?.workflow_runs))fail('GitHub SDK Run分页响应无效');
+  runs.push(...data.workflow_runs);if(data.workflow_runs.length<100)return runs;
+ }
+ fail('GitHub SDK Run分页超过上限');
+}
+export async function polkadotRunPrune(outcome,environment=process.env,{fetchImpl=fetch}={}){
+ if(!['success','failure'].includes(outcome))fail('GitHub SDK Run清理结果无效');sdkRetentionIdentity(environment);
+ const current=sdkValidateRun(await sdkGitHubRequest('actions/runs/'+environment.GITHUB_RUN_ID,{environment,fetchImpl}),{current:true,environment});
+ const all=await sdkWorkflowRuns({environment,fetchImpl});
+ for(const run of all){if(run?.repository?.full_name!==sdkRepository)fail('GitHub SDK Run列表仓库不符');
+  if(run.path!==sdkWorkflow||run.head_branch!=='main'||run.status!=='completed')continue;
+  sdkValidateRun(run,{environment});}
+ const completed=all.filter(run=>run.path===sdkWorkflow&&run.head_branch==='main'&&run.status==='completed');
+ if(completed.some(run=>run.id===current.id)||completed.some(run=>run.run_number>=current.run_number))fail('GitHub SDK Run顺序或活动身份不一致');
+ // 当前Run仍在运行，以前置完整流程结果作为本轮候选；只删本仓main本Workflow的旧Run。
+ const opposite=completed.filter(run=>sdkRunBucket(run)!==outcome).sort(sdkRunOrder)[0];
+ const keep=new Set([current.id,...(opposite?[opposite.id]:[])]),deleted=[];
+ for(const run of completed)if(!keep.has(run.id)){await sdkGitHubRequest('actions/runs/'+run.id,{environment,fetchImpl,method:'DELETE'});deleted.push(run.id);}
+ const remaining=(await sdkWorkflowRuns({environment,fetchImpl})).filter(run=>run.path===sdkWorkflow&&run.head_branch==='main'&&run.status==='completed');
+ const same=remaining.filter(run=>sdkRunBucket(run)===outcome),other=remaining.filter(run=>sdkRunBucket(run)!==outcome);
+ if(same.length||other.length!==(opposite?1:0)||opposite&&other[0]?.id!==opposite.id)fail('GitHub SDK Run保留清理未收敛');
+ const verifiedCurrent=sdkValidateRun(await sdkGitHubRequest('actions/runs/'+current.id,{environment,fetchImpl}),{current:true,environment});
+ if(verifiedCurrent.id!==current.id)fail('GitHub SDK活动Run身份改变');
+ process.stdout.write('GitHub SDK Run清理成功：候选='+outcome+'，删除旧Run='+deleted.length+'，保留另一结果='+other.length+'\n');
+ return {outcome,run_id:current.id,deleted:deleted.length,retained_other:other.length};
+}
+export async function polkadotCachePrune(environment=process.env,{fetchImpl=fetch}={}){
+ sdkRetentionIdentity(environment);
+ const prefix='polkadot-sdk-cargo-v1-macOS-ARM64-sdk-',key=environment.CARGO_CACHE_KEY;
+ const pattern=new RegExp('^'+prefix+'[a-f0-9]{64}-[1-9][0-9]*-[1-9][0-9]*$','u');
+ if(typeof key!=='string'||!pattern.test(key)
+  ||!key.endsWith('-'+environment.GITHUB_RUN_ID+'-'+environment.GITHUB_RUN_ATTEMPT))fail('Polkadot SDK Cargo缓存键无效');
+ async function list(){const rows=[];for(let page=1;page<=1000;page++){
+  const data=await sdkGitHubRequest('actions/caches?ref=refs%2Fheads%2Fmain&per_page=100&page='+page,{environment,fetchImpl});
+  if(!Array.isArray(data?.actions_caches))fail('GitHub SDK Cargo缓存列表无效');
+  rows.push(...data.actions_caches);if(data.actions_caches.length<100)return rows.filter(item=>item.ref==='refs/heads/main'&&typeof item.key==='string'&&item.key.startsWith(prefix));
+ }fail('GitHub SDK Cargo缓存分页超过上限');}
+ const caches=await list();for(const item of caches)if(!Number.isSafeInteger(item.id)||item.id<1||!pattern.test(item.key))fail('Polkadot SDK Cargo缓存候选无效');
+ const selected=caches.find(item=>item.key===key)??[...caches].sort((a,b)=>Date.parse(b.created_at)-Date.parse(a.created_at)||b.id-a.id)[0]??null;
+ const deleted=[];for(const item of caches)if(item.id!==selected?.id){await sdkGitHubRequest('actions/caches/'+item.id,{environment,fetchImpl,method:'DELETE'});deleted.push(item.id);}
+ const remaining=await list();if(remaining.length!==(selected?1:0)||selected&&remaining[0].id!==selected.id)fail('Polkadot SDK Cargo缓存未收敛到一份');
+ process.stdout.write('Polkadot SDK Cargo缓存清理成功：保留='+remaining.length+'，删除旧缓存='+deleted.length+'\n');
+ return {retained:remaining.length,deleted:deleted.length,key:selected?.key??null};
+}
+
 export async function build(platform,work,receipt,{signal,runner=run}={}){
  signal?.throwIfAborted();const env=resourceEnvironment(platform,work,receipt);
  await runner(join(dirname(receipt.tools.rust.path),'cargo'),['build','--manifest-path',join(root,'Cargo.toml'),'--workspace','--all-targets','--release','--locked','--offline'],{cwd:work,env:{...env,CARGO_NET_OFFLINE:'true'},signal});
  return {schema:1,product_id:contract.product_id,platform,work,run_id:receipt.run_id,completion:'compile-only',files:[]};
 }
 
-if(process.argv[1]===fileURLToPath(import.meta.url)&&!process.env.NODE_TEST_CONTEXT){const [command,platform,flag,work,...extra]=process.argv.slice(2);if(command!=='execute'||flag!=='--work'||extra.some(x=>x!=='--offline')||extra.length>1)fail('本机编译参数无效');let input='';for await(const chunk of process.stdin){input+=chunk;if(Buffer.byteLength(input)>2*1024**2)fail('公开输入超限');}const cancellation=new AbortController();for(const s of ['SIGINT','SIGTERM'])process.once(s,()=>cancellation.abort());process.stdout.write(JSON.stringify(await execute(platform,work,input?JSON.parse(input):{},{offline:extra.includes('--offline'),signal:cancellation.signal}))+'\n');}
+if(process.argv[1]===fileURLToPath(import.meta.url)&&!process.env.NODE_TEST_CONTEXT){
+ const [command,...args]=process.argv.slice(2);
+ if(command==='sdk-cache-prune'&&args.length===0)process.stdout.write(JSON.stringify(await polkadotCachePrune())+'\n');
+ else if(command==='sdk-run-prune'&&args.length===1)process.stdout.write(JSON.stringify(await polkadotRunPrune(args[0]))+'\n');
+ else if(command==='execute'){
+  const [platform,flag,work,...extra]=args;
+  if(flag!=='--work'||extra.some(x=>x!=='--offline')||extra.length>1)fail('本机编译参数无效');
+  let input='';for await(const chunk of process.stdin){input+=chunk;if(Buffer.byteLength(input)>2*1024**2)fail('公开输入超限');}
+  const cancellation=new AbortController();for(const s of ['SIGINT','SIGTERM'])process.once(s,()=>cancellation.abort());
+  process.stdout.write(JSON.stringify(await execute(platform,work,input?JSON.parse(input):{},{offline:extra.includes('--offline'),signal:cancellation.signal}))+'\n');
+ }else fail('本机编译参数无效');
+}
 
 // BEGIN INLINE TESTS
 if(process.env.NODE_TEST_CONTEXT&&process.argv.length===2&&process.argv[1]===import.meta.filename){
  const {test,after}=await import('node:test'),{default:assert}=await import('node:assert/strict');
+ test('SDK workflow在同一sdk.yml内测试、构建、发布并以保留Job收尾',async()=>{
+  const workflow=await readFile(join(root,'.github/workflows/sdk.yml'),'utf8');
+  const cache=workflow.slice(workflow.indexOf('\n  cargo-retention:'),workflow.indexOf('\n  run-retention:'));
+  const retention=workflow.slice(workflow.indexOf('\n  run-retention:'));
+  assert.match(workflow,/^  workflow_dispatch:/mu);
+  assert.match(workflow,/node --test scripts\/build\.mjs/u);
+  assert.match(workflow,/CARGO_INCREMENTAL: '1'/u);
+  assert.match(workflow,/CARGO_INCREMENTAL: '1', CARGO_NET_OFFLINE: 'true'/u);
+  assert.match(workflow,/cargo\(cargoPath, \['package',[^\n]*'--locked',\s*'--offline'\]/u);
+  assert.doesNotMatch(workflow,/cargoPath, \['package',[^\n]*--no-verify/u,'SDK正式包必须执行Cargo归档验真');
+  assert.match(workflow,/git\/ref\/tags\/\$\{encodeURIComponent\(tag\)\}/u,'正式Tag回执必须直接绑定本轮源码');
+  assert.match(cache,/actions: write/u);assert.match(cache,/polkadotCachePrune/u);
+  assert.match(retention,/needs: \[release, cargo-retention\]/u);
+  assert.match(retention,/polkadotRunPrune/u);assert.doesNotMatch(retention,/continue-on-error/u);
+ });
+ test('Polkadot SDK Run清理只处理本仓main同一Workflow并保护当前Run',async()=>{
+  const environment={GITHUB_ACTIONS:'true',GITHUB_REPOSITORY:sdkRepository,GITHUB_REF:'refs/heads/main',
+   GITHUB_EVENT_NAME:'workflow_dispatch',GITHUB_WORKFLOW_REF:sdkRepository+'/'+sdkWorkflow+'@refs/heads/main',GITHUB_SHA:'a'.repeat(40),
+   GITHUB_RUN_ID:'50',GITHUB_RUN_NUMBER:'10',GITHUB_RUN_ATTEMPT:'1',GH_TOKEN:'fixture'};
+  const make=(id,number,conclusion,event='workflow_dispatch',path=sdkWorkflow,branch='main')=>({id,path,
+   repository:{full_name:sdkRepository},head_branch:branch,head_sha:'b'.repeat(40),run_number:number,run_attempt:1,
+   status:'completed',conclusion,event});
+  const current={...make(50,10,null),'status':'in_progress','conclusion':null,head_sha:environment.GITHUB_SHA};
+  let runs=[make(44,6,'failure','push'),make(47,8,'failure'),make(49,9,'success'),
+   make(30,3,'success','push','.github/workflows/other.yml'),make(29,2,'failure','push',sdkWorkflow,'topic')];
+  const deleted=[];const fetchImpl=async(url,options={})=>{
+   const parsed=new URL(url),path=parsed.pathname.replace('/repos/'+sdkRepository+'/','');
+   if(options.method==='DELETE'){const id=Number(path.split('/').at(-1));deleted.push(id);runs=runs.filter(run=>run.id!==id);return new Response(null,{status:204});}
+   if(path==='actions/runs/50')return Response.json(current);
+   if(path==='actions/workflows/sdk.yml/runs')return Response.json({workflow_runs:runs});
+   assert.fail('unrequested GitHub path: '+path);
+  };
+  const result=await polkadotRunPrune('failure',environment,{fetchImpl});
+  assert.deepEqual(deleted,[44]);assert.deepEqual(result,{outcome:'failure',run_id:50,deleted:1,retained_other:1});
+  assert.ok(runs.some(run=>run.id===49));assert.ok(runs.some(run=>run.id===30)&&runs.some(run=>run.id===29));
+  assert.ok(!deleted.includes(50));
+ });
+ test('Polkadot SDK Cargo缓存清理只保留sdk平台最新缓存',async()=>{
+  const environment={GITHUB_ACTIONS:'true',GITHUB_REPOSITORY:sdkRepository,GITHUB_REF:'refs/heads/main',
+   GITHUB_EVENT_NAME:'workflow_dispatch',GITHUB_WORKFLOW_REF:sdkRepository+'/'+sdkWorkflow+'@refs/heads/main',GITHUB_SHA:'a'.repeat(40),
+   GITHUB_RUN_ID:'50',GITHUB_RUN_NUMBER:'10',GITHUB_RUN_ATTEMPT:'1',GH_TOKEN:'fixture'};
+  const prefix='polkadot-sdk-cargo-v1-macOS-ARM64-sdk-',currentKey=prefix+'a'.repeat(64)+'-50-1';
+  let caches=[{id:1,key:prefix+'b'.repeat(64)+'-40-1',ref:'refs/heads/main',created_at:'2026-10-10T00:00:00Z'},
+   {id:2,key:currentKey,ref:'refs/heads/main',created_at:'2026-10-16T00:00:00Z'}];
+  const deleted=[];const fetchImpl=async(url,options={})=>{
+   const parsed=new URL(url),path=parsed.pathname.replace('/repos/'+sdkRepository+'/','');
+   if(options.method==='DELETE'){const id=Number(path.split('/').at(-1));deleted.push(id);caches=caches.filter(item=>item.id!==id);return new Response(null,{status:204});}
+   if(path==='actions/caches')return Response.json({actions_caches:caches});
+   assert.fail('unrequested GitHub path: '+path);
+  };
+  environment.CARGO_CACHE_KEY=currentKey;
+  const result=await polkadotCachePrune(environment,{fetchImpl});
+  assert.deepEqual(deleted,[1]);assert.deepEqual(result,{retained:1,deleted:1,key:currentKey});
+ });
  test('SDK测试现场归本轮随机会话，正式Build根保持固定',()=>{assert.ok(testSession);assert.equal(testRoot(),join(root,'target/test/sessions',testSession));assert.equal(buildWork(),join(testRoot(),'build/sdk'));});
  after(async()=>{
   // 仅删除当前测试进程的随机会话；守卫或工具仍活跃时失败并保留现场。

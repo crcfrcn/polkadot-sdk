@@ -6,16 +6,18 @@ concurrency:
   group: "${{ github.repository }}-sdk"
   cancel-in-progress: false
 permissions:
-  contents: write
+  contents: read
   actions: read
 jobs:
   release:
     if: github.ref == 'refs/heads/main'
     runs-on: xcode-27
     timeout-minutes: 360
+    permissions:
+      contents: write
     env:
       GH_TOKEN: "${{ github.token }}"
-      CARGO_INCREMENTAL: '0'
+      CARGO_INCREMENTAL: '1'
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
         with:
@@ -25,7 +27,18 @@ jobs:
       - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444
         with:
           node-version: 25.2.1
+      - name: 先执行本仓代码回归
+        shell: bash
+        run: node --test scripts/build.mjs
+      - name: 恢复本SDK Cargo增量缓存
+        uses: actions/cache/restore@1bd1e32a3bdc45362d1e726936510720a7c30a57
+        with:
+          path: target/build/sdk/work/cargo-target
+          key: "polkadot-sdk-cargo-v1-macOS-ARM64-sdk-${{ hashFiles('Cargo.lock', 'scripts/build.mjs') }}-${{ github.run_id }}-${{ github.run_attempt }}"
+          restore-keys: |
+            polkadot-sdk-cargo-v1-macOS-ARM64-sdk-${{ hashFiles('Cargo.lock', 'scripts/build.mjs') }}-
       - name: 全量编译、测试、组包并回读正式版
+        id: sdk_release
         shell: bash
         run: |
           set -euo pipefail
@@ -78,12 +91,12 @@ jobs:
             const work = join(process.cwd(), 'target/build/sdk');
             mkdirSync(work, { recursive: true });
             const receipt = await build.prepareResourceSupply('sdk', work, { run_id: env('GITHUB_RUN_ID') }, { offline: false });
-            const environment = { ...build.resourceEnvironment('sdk', work, receipt), CARGO_INCREMENTAL: '0', CARGO_NET_OFFLINE: 'true' };
+            const environment = { ...build.resourceEnvironment('sdk', work, receipt), CARGO_INCREMENTAL: '1', CARGO_NET_OFFLINE: 'true' };
             const cargoPath = join(dirname(receipt.tools.rust.path), 'cargo');
             cargo(cargoPath, ['fmt', '--all', '--', '--check'], environment);
             cargo(cargoPath, ['build', '--workspace', '--all-targets', '--release', '--locked', '--offline'], environment);
             cargo(cargoPath, ['test', '--workspace', '--all-targets', '--release', '--locked', '--offline'], environment);
-            cargo(cargoPath, ['package', '--workspace', '--allow-dirty', '--no-verify', '--locked', '--offline'], environment);
+            cargo(cargoPath, ['package', '--workspace', '--allow-dirty', '--locked', '--offline'], environment);
             const stage = join(env('RUNNER_TEMP'), 'polkadot-sdk-release');
             mkdirSync(stage, { recursive: true });
             execFileSync('git', ['archive', '--format=tar', '--output', join(stage, 'source.tar'), sha], { stdio: 'inherit' });
@@ -95,9 +108,64 @@ jobs:
             execFileSync('tar', ['-czf', archive, '-C', stage, '.'], { stdio: 'inherit' });
             if (!statSync(archive).size) fail('SDK 正式包为空');
             const digest = `sha256:${createHash('sha256').update(readFileSync(archive)).digest('hex')}`;
+            writeFileSync(env('GITHUB_OUTPUT'), 'cargo_cache_ready=true\n', { flag: 'a' });
             execFileSync('gh', ['release', 'create', tag, archive, '--repo', repository, '--target', sha, '--title', `polkadot-sdk · sdk · ${releaseVersion}`, '--notes', `GitHub 自动化正式 SDK；源码 ${sha}；Run ${env('GITHUB_RUN_ID')}。`, '--latest=false'], { stdio: 'inherit', env: { ...process.env, GH_TOKEN: env('GH_TOKEN') } });
             const release = await api(`releases/tags/${encodeURIComponent(tag)}`);
-            if (release.draft || release.prerelease || release.target_commitish !== sha || release.assets?.length !== 1 || release.assets[0].name !== 'polkadot-sdk.tgz' || release.assets[0].state !== 'uploaded' || release.assets[0].digest !== digest) fail('SDK 正式 Release 回读失败');
+            const tagRef = await api(`git/ref/tags/${encodeURIComponent(tag)}`);
+            if (tagRef.ref !== `refs/tags/${tag}` || tagRef.object?.type !== 'commit' || tagRef.object.sha !== sha
+                || release.draft || release.prerelease || release.target_commitish !== sha || release.assets?.length !== 1
+                || release.assets[0].name !== 'polkadot-sdk.tgz' || release.assets[0].state !== 'uploaded' || release.assets[0].digest !== digest)
+              fail('SDK Tag或正式Release回执与本轮源码不一致');
           }
           try { await main(); } catch (error) { console.error(error.message); process.exitCode = 1; }
           NODE
+      - name: 保存本SDK Cargo增量缓存
+        id: cargo_cache_save
+        if: always() && steps.sdk_release.outputs.cargo_cache_ready == 'true'
+        continue-on-error: true
+        uses: actions/cache/save@1bd1e32a3bdc45362d1e726936510720a7c30a57
+        with:
+          path: target/build/sdk/work/cargo-target
+          key: "polkadot-sdk-cargo-v1-macOS-ARM64-sdk-${{ hashFiles('Cargo.lock', 'scripts/build.mjs') }}-${{ github.run_id }}-${{ github.run_attempt }}"
+  cargo-retention:
+    needs: release
+    if: always() && github.ref == 'refs/heads/main'
+    runs-on: xcode-27
+    permissions:
+      contents: read
+      actions: write
+    env:
+      GH_TOKEN: "${{ github.token }}"
+      CARGO_CACHE_KEY: "polkadot-sdk-cargo-v1-macOS-ARM64-sdk-${{ hashFiles('Cargo.lock', 'scripts/build.mjs') }}-${{ github.run_id }}-${{ github.run_attempt }}"
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+        with:
+          ref: "${{ github.sha }}"
+          persist-credentials: false
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444
+        with:
+          node-version: 25.2.1
+      - name: 只保留本SDK最新Cargo增量缓存
+        shell: bash
+        run: node --input-type=module -e 'import("./scripts/build.mjs").then(module => module.polkadotCachePrune())'
+  run-retention:
+    needs: [release, cargo-retention]
+    if: always() && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      actions: write
+    env:
+      GH_TOKEN: "${{ github.token }}"
+      SDK_FINAL_OUTCOME: "${{ needs.release.result == 'success' && needs.cargo-retention.result == 'success' && 'success' || 'failure' }}"
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+        with:
+          ref: "${{ github.sha }}"
+          persist-credentials: false
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444
+        with:
+          node-version: 25.2.1
+      - name: 仅保留本SDK最新成功与失败Run
+        shell: bash
+        run: node --input-type=module -e 'import("./scripts/build.mjs").then(module => module.polkadotRunPrune(process.env.SDK_FINAL_OUTCOME))'
