@@ -105,19 +105,21 @@ async fn scan_recent_evm_blocks<F, Fut>(
 ) -> Result<Option<SubstrateBlockNumber>, ClientError>
 where
 	F: FnMut(SubstrateBlockNumber) -> Fut,
-	Fut: Future<Output = Result<(), ClientError>>,
+	Fut: Future<Output = Result<bool, ClientError>>,
 {
 	let mut skipped_old_runtime = false;
 	let mut found_evm = false;
 	let mut boundary = None;
 	for number in first..=best {
 		match visit(number).await {
-			Ok(()) => {
+			Ok(true) => {
 				if skipped_old_runtime && !found_evm {
 					boundary = Some(number);
 				}
 				found_evm = true;
 			},
+			Ok(false) if !found_evm => skipped_old_runtime = true,
+			Ok(false) => return Err(ClientError::SyncBoundaryMismatch),
 			Err(error) if !found_evm && number < best && missing_eth_block_api(&error) => {
 				skipped_old_runtime = true;
 			},
@@ -151,8 +153,11 @@ impl Client {
 				.block_by_number(number)
 				.await?
 				.ok_or(ClientError::BlockNotFound)?;
-			self.process_block(&block).await?;
-			Ok(())
+			match self.process_block(&block).await {
+				Ok(_) => Ok(true),
+				Err(ClientError::EthereumBlockNotReady) => Ok(false),
+				Err(error) => Err(error),
+			}
 		})
 		.await?;
 		if let Some(first_evm) = boundary {
@@ -508,6 +513,44 @@ mod recent_runtime_upgrade_tests {
 	use crate::client::ClientError;
 	use subxt::{Error::Metadata, error::MetadataError, ext::subxt_rpcs::UserError};
 
+	#[tokio::test]
+	async fn upgrade_tip_without_ethereum_block_waits_without_an_index_boundary() {
+		let boundary = scan_recent_evm_blocks(14, 17, |number| async move {
+			if number < 17 { Err(wrapped_missing_api()) } else { Ok(false) }
+		}).await.unwrap();
+		assert_eq!(boundary, None);
+	}
+
+	#[tokio::test]
+	async fn transition_prefix_indexes_only_real_blocks_and_discovers_actual_boundary() {
+		use crate::client::validate_evm_block;
+		use pallet_revive::evm::{Block, H256};
+		let mut indexed = Vec::new();
+		let boundary = scan_recent_evm_blocks(14, 20, |number| {
+			let result = if number < 16 { Err(wrapped_missing_api()) } else {
+				let hash = H256::from_low_u64_be(u64::from(number));
+				let (block, stored, absent) = if number < 18 {
+					(Block::default(), None, true)
+				} else { (Block { number: number.into(), hash, ..Default::default() }, Some(hash), false) };
+				validate_evm_block(block, number, stored, absent).map(|block| {
+					if let Some(block) = block { indexed.push((number, block.hash)); true } else { false }
+				})
+			};
+			std::future::ready(result)
+		}).await.unwrap();
+		assert_eq!(boundary, Some(18));
+		assert_eq!(indexed.iter().map(|entry| entry.0).collect::<Vec<_>>(), vec![18, 19, 20]);
+		assert!(indexed.iter().all(|entry| entry.1 != H256::zero()));
+	}
+
+	#[tokio::test]
+	async fn absent_ethereum_block_after_real_history_is_an_error() {
+		let result = scan_recent_evm_blocks(18, 20, |number| async move {
+			Ok(number != 19)
+		}).await;
+		assert!(matches!(result, Err(ClientError::SyncBoundaryMismatch)));
+	}
+
 	fn missing_api(name: &str) -> ClientError {
 		ClientError::SubxtError(Metadata(MetadataError::RuntimeMethodNotFound(name.into())))
 	}
@@ -569,7 +612,7 @@ mod recent_runtime_upgrade_tests {
 		let mut visited = Vec::new();
 		let boundary = scan_recent_evm_blocks(9, 13, |number| {
 			visited.push(number);
-			async move { if number < 12 { Err(wrapped_missing_api()) } else { Ok(()) } }
+			async move { if number < 12 { Err(wrapped_missing_api()) } else { Ok(true) } }
 		}).await.expect("准确框架错误只允许跨过连续旧前缀");
 		assert_eq!(boundary, Some(12));
 		assert_eq!(visited, vec![9, 10, 11, 12, 13]);
@@ -579,7 +622,7 @@ mod recent_runtime_upgrade_tests {
 	async fn wrapped_missing_after_evm_or_at_best_is_returned_unchanged() {
 		let expected = wrapped_missing_api().to_string();
 		let result = scan_recent_evm_blocks(9, 11, |number| async move {
-			if number == 9 { Ok(()) } else { Err(wrapped_missing_api()) }
+			if number == 9 { Ok(true) } else { Err(wrapped_missing_api()) }
 		}).await;
 		assert_eq!(result.unwrap_err().to_string(), expected);
 		for first in [9, 11] {
@@ -610,7 +653,7 @@ mod recent_runtime_upgrade_tests {
 			if number < 79 {
 				Err(rpc_missing_api("Exported method ReviveApi_eth_block is not found"))
 			} else {
-				Ok(())
+				Ok(true)
 			}
 		})
 		.await
@@ -620,7 +663,7 @@ mod recent_runtime_upgrade_tests {
 
 	#[tokio::test]
 	async fn evm_only_window_needs_no_new_boundary() {
-		let boundary = scan_recent_evm_blocks(79, 80, |_| async { Ok(()) })
+		let boundary = scan_recent_evm_blocks(79, 80, |_| async { Ok(true) })
 			.await
 			.expect("全部区块均支持 Revive");
 		assert_eq!(boundary, None);
@@ -632,7 +675,7 @@ mod recent_runtime_upgrade_tests {
 			if number == 78 || number == 81 {
 				Err(missing_api("ReviveApi_eth_block"))
 			} else {
-				Ok(())
+				Ok(true)
 			}
 		})
 		.await;

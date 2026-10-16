@@ -269,7 +269,7 @@ impl EthRpcServer for EthRpcServerImpl {
 						log::debug!(target: LOG_TARGET, "Could not find the block with the received hash: {hash:?}.");
 						continue;
 					};
-					let Some(evm_block) = self.client.evm_block(block, false).await else {
+					let Some(evm_block) = self.client.evm_block(block, false).await? else {
 						log::debug!(target: LOG_TARGET, "Failed to get the EVM block for substrate block with hash: {hash:?}");
 						continue;
 					};
@@ -329,7 +329,7 @@ impl EthRpcServer for EthRpcServerImpl {
 		let Some(block) = self.client.block_by_ethereum_hash(&block_hash).await? else {
 			return Ok(None);
 		};
-		let block = self.client.evm_block(block, hydrated_transactions).await;
+		let block = self.client.evm_block(block, hydrated_transactions).await?;
 		Ok(block)
 	}
 
@@ -374,7 +374,7 @@ impl EthRpcServer for EthRpcServerImpl {
 		let Some(block) = self.client.block_by_number_or_tag(&block_number).await? else {
 			return Ok(None);
 		};
-		let block = self.client.evm_block(block, hydrated_transactions).await;
+		let block = self.client.evm_block(block, hydrated_transactions).await?;
 		Ok(block)
 	}
 

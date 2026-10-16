@@ -62,6 +62,14 @@ Ethereum边界、最佳块与成功后的缺方法拒绝，以及其它读取错
 这一模式供产品自身的受信 TLS 入口消费，不开放明文备用端口。
 实际 SDK 回归及消费产品 TLS/端口验收结果记录于所属唯一任务卡。
 
+升级状态已导出API但尚未生成Ethereum区块时，只有完整默认对象、同高Ethereum哈希
+不存在且原始EthereumBlock存储也不存在，才能识别为待首块状态。该状态不写区块映射、
+收据、费用历史或区块通知；首个真实区块写入后才登记FirstEvmBlock。父链追溯仅能在
+同高同哈希的已核实升级前末端停止，不能将其冒充已索引Ethereum区块。真实区块必须
+同高、非零哈希且与Runtime同高哈希一致；有效历史后的缺失和其它读取错误仍失败。
+待首块时区块查询返回null、eth_blockNumber明确返回尚未生成错误；不伪造升级区块，
+不改链上Runtime或历史块。按号、按哈希和hydrated查询保留实际读取错误。
+
 本机 SDK 编译的 C 构建脚本和 Rustc 链接均使用本轮 Xcode 验真 `clang` 绝对入口；
 受控 PATH 无 `cc` 名称时，Rustc 按 `CARGO_TARGET_AARCH64_APPLE_DARWIN_LINKER`
 完成宿主构建脚本链接。同一Xcode交付的 macOS SDK经 `SDKROOT` 提供系统库，

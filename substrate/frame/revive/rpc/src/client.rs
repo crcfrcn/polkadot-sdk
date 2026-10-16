@@ -174,6 +174,9 @@ pub enum ClientError {
 	/// Ethereum block was not found.
 	#[error("Ethereum block not found")]
 	EthereumBlockNotFound,
+	/// 新 Runtime 已可查询，但尚未执行首个 Ethereum 出块钩子。
+	#[error("Ethereum block has not been produced yet")]
+	EthereumBlockNotReady,
 	/// Receipt data length mismatch.
 	#[error("Receipt data length mismatch")]
 	ReceiptDataLengthMismatch,
@@ -205,6 +208,24 @@ const LOG_TARGET_SUBSCRIPTION: &str = "eth-rpc::subscription";
 const REVERT_CODE: i32 = 3;
 
 const NOTIFIER_CAPACITY: usize = 16;
+
+/// 只有确切缺失的存储和完整默认值才能表示待首块；部分零值、错高或错哈希均失败。
+pub(crate) fn validate_evm_block(
+	block: Block,
+	number: SubstrateBlockNumber,
+	stored_hash: Option<H256>,
+	storage_absent: bool,
+) -> Result<Option<Block>, ClientError> {
+	if storage_absent && stored_hash.is_none() && block == Block::default() {
+		return Ok(None);
+	}
+	if storage_absent || block.number != U256::from(number) || block.hash == H256::zero()
+		|| stored_hash != Some(block.hash)
+	{
+		return Err(ClientError::SyncBoundaryMismatch);
+	}
+	Ok(Some(block))
+}
 
 /// 最佳块通知可能跳过新分叉祖先；先完整校验父链，再交给调用方正序写入。
 /// 达到近期窗口仍未找到已索引父块时拒绝，不能把窗口边界当作共同祖先。
@@ -298,6 +319,8 @@ pub struct Client {
 	backfill_complete: Arc<AtomicBool>,
 	/// Queue for backfilling blocks missed during subscription reconnects.
 	subscription_gap_queue: SubscriptionGapQueue,
+	/// 经实际状态核实的无 Ethereum 区块前缀末端；不是已索引区块，也不写入哈希映射。
+	pre_evm_tip: Arc<Mutex<Option<SyncCheckpoint>>>,
 }
 
 /// A request to backfill a range of missed blocks (both bounds inclusive).
@@ -652,6 +675,7 @@ impl Client {
 			is_archive,
 			backfill_complete: Arc::new(AtomicBool::new(false)),
 			subscription_gap_queue,
+			pre_evm_tip: Arc::new(Mutex::new(None)),
 		};
 
 		Ok(client)
@@ -801,7 +825,16 @@ impl Client {
 			}};
 		}
 
-		let eth_block = time!("eth_block", self.runtime_api(hash).eth_block().await?);
+		let Some(eth_block) = time!("eth_block", self.checked_evm_block(block).await?) else {
+			if self.receipt_provider.first_evm_block().is_some_and(|first| block_number >= first) {
+				return Err(ClientError::SyncBoundaryMismatch);
+			}
+			let mut tip = self.pre_evm_tip.lock().await;
+			if tip.is_none_or(|old| old.block_number <= block_number) {
+				*tip = Some(SyncCheckpoint::new(block_number, hash));
+			}
+			return Err(ClientError::EthereumBlockNotReady);
+		};
 		let receipts = time!(
 			"receipts_from_block",
 			self.receipt_provider.receipts_from_block(block, eth_block.hash).await?
@@ -812,6 +845,11 @@ impl Client {
 				.insert_block_receipts(block, &receipts, &eth_block.hash)
 				.await?
 		);
+		if self.receipt_provider.first_evm_block().is_none()
+			&& self.pre_evm_tip.lock().await.is_some()
+		{
+			self.receipt_provider.set_first_evm_block(block_number).await?;
+		}
 
 		let (_, receipt_infos): (Vec<_>, Vec<_>) = receipts.into_iter().unzip();
 		self.fee_history_provider.update_fee_history(&eth_block, &receipt_infos).await;
@@ -824,21 +862,29 @@ impl Client {
 		&self,
 		block: &SubstrateBlock,
 	) -> Result<Block, ClientError> {
+		let pre_evm_tip = *self.pre_evm_tip.lock().await;
+		if pre_evm_tip == Some(SyncCheckpoint::new(block.number(), block.hash())) {
+			return Err(ClientError::EthereumBlockNotReady);
+		}
 		let pending = collect_best_chain(
 			Arc::new(block.clone()),
 			|block| (block.number(), block.hash(), block.header().parent_hash),
 			|number, hash| async move {
-				self.receipt_provider.get_processed_eth_block_hash(number, hash).await.is_some()
+				pre_evm_tip == Some(SyncCheckpoint::new(number, hash))
+					|| self.receipt_provider.get_processed_eth_block_hash(number, hash).await.is_some()
 			},
 			|hash| async move { self.block_provider.block_by_hash(&hash).await },
 		)
 		.await?;
 		let mut latest = None;
 		for ancestor in pending {
-			let (eth_block, _) = self.process_block(&ancestor).await?;
-			latest = Some(eth_block);
+			match self.process_block(&ancestor).await {
+				Ok((eth_block, _)) => latest = Some(eth_block),
+				Err(ClientError::EthereumBlockNotReady) if latest.is_none() => {},
+				Err(error) => return Err(error),
+			}
 		}
-		latest.ok_or(ClientError::BlockNotFound)
+		latest.ok_or(ClientError::EthereumBlockNotReady)
 	}
 
 	/// Start the block subscription, and populate the block cache.
@@ -852,17 +898,23 @@ impl Client {
 
 			match subscription_type {
 				SubscriptionType::BestBlocks => {
-					let eth_block = self.process_best_chain(&block).await?;
+					let eth_block = match self.process_best_chain(&block).await {
+						Ok(block) => Some(block),
+						Err(ClientError::EthereumBlockNotReady) => None,
+						Err(error) => return Err(error),
+					};
 					// 父链校验及全部索引写入成功后，才推进最佳块并发布通知。
 					self.block_provider.update_latest(Arc::new(block), subscription_type).await;
 
-					if let Some(sender) = &self.block_notifier {
-						if sender.receiver_count() > 0 {
-							let _ = sender.send(hash);
+					if let Some(eth_block) = eth_block {
+						if let Some(sender) = &self.block_notifier {
+							if sender.receiver_count() > 0 {
+								let _ = sender.send(hash);
+							}
 						}
-					}
-					if self.block_subscription_tx.receiver_count() > 0 {
-						let _ = self.block_subscription_tx.send(eth_block);
+						if self.block_subscription_tx.receiver_count() > 0 {
+							let _ = self.block_subscription_tx.send(eth_block);
+						}
 					}
 				},
 				SubscriptionType::FinalizedBlocks => {
@@ -879,7 +931,14 @@ impl Client {
 							(None, eth_hash)
 						},
 						None => {
-							let (eth_block, infos) = self.process_block(&block).await?;
+							let (eth_block, infos) = match self.process_block(&block).await {
+								Ok(result) => result,
+								Err(ClientError::EthereumBlockNotReady) => {
+									self.block_provider.update_latest(Arc::new(block), subscription_type).await;
+									return Ok(());
+								},
+								Err(error) => return Err(error),
+							};
 							(Some(infos), eth_block.hash)
 						},
 					};
@@ -1140,6 +1199,9 @@ impl Client {
 	/// Get the block number of the latest block.
 	pub async fn block_number(&self) -> Result<SubstrateBlockNumber, ClientError> {
 		let latest_block = self.block_provider.latest_block().await;
+		if self.checked_evm_block(&latest_block).await?.is_none() {
+			return Err(ClientError::EthereumBlockNotReady);
+		}
 		Ok(latest_block.number())
 	}
 
@@ -1167,6 +1229,11 @@ impl Client {
 				Ok(Some(block))
 			},
 			BlockNumberOrTag::BlockTag(BlockTag::Earliest) => {
+				if self.receipt_provider.first_evm_block().is_none()
+					&& self.pre_evm_tip.lock().await.is_some()
+				{
+					return Ok(None);
+				}
 				self.block_by_number(self.earliest_block_number()).await
 			},
 			BlockNumberOrTag::BlockTag(_) => {
@@ -1319,12 +1386,30 @@ impl Client {
 		runtime_api.trace_call(transaction, config, state_overrides).await
 	}
 
-	/// Get the EVM block for the given Substrate block.
+	/// 同一状态读取区块与本高度哈希；仅默认对象需再核对原始存储是否确实不存在。
+	async fn checked_evm_block(&self, block: &SubstrateBlock) -> Result<Option<Block>, ClientError> {
+		let runtime = self.runtime_api(block.hash());
+		let eth_block = runtime.eth_block().await?;
+		let hash = runtime.eth_block_hash(U256::from(block.number())).await?;
+		let storage_absent = if eth_block == Block::default() {
+			let key = [sp_crypto_hashing::twox_128(b"Revive"), sp_crypto_hashing::twox_128(b"EthereumBlock")].concat();
+			self.api.storage().at(block.hash()).fetch_raw(key).await?.is_none()
+		} else { false };
+		let result = validate_evm_block(eth_block, block.number(), hash, storage_absent)?;
+		if result.is_none() && self.receipt_provider.first_evm_block()
+			.is_some_and(|first| block.number() >= first)
+		{
+			return Err(ClientError::SyncBoundaryMismatch);
+		}
+		Ok(result)
+	}
+
+	/// Get the EVM block for the given Substrate block, preserving genuine read errors.
 	pub async fn evm_block(
 		&self,
 		block: Arc<SubstrateBlock>,
 		hydrated_transactions: bool,
-	) -> Option<Block> {
+	) -> Result<Option<Block>, ClientError> {
 		log::trace!(target: LOG_TARGET, "Get Ethereum block for hash {:?}", block.hash());
 
 		if self
@@ -1333,7 +1418,7 @@ impl Client {
 		{
 			log::trace!(target: LOG_TARGET,
 				"Block #{} is before receipt floor, skipping", block.number());
-			return None;
+			return Ok(None);
 		}
 
 		// This could potentially fail under below circumstances:
@@ -1341,8 +1426,8 @@ impl Client {
 		//  - the block author cannot be obtained from the digest logs (highly unlikely)
 		//  - the node we are targeting has an outdated revive pallet (or ETH block functionality is
 		//    disabled)
-		match self.runtime_api(block.hash()).eth_block().await {
-			Ok(mut eth_block) => {
+		match self.checked_evm_block(&block).await? {
+			Some(mut eth_block) => {
 				log::trace!(target: LOG_TARGET, "Ethereum block from runtime API hash {:?}", eth_block.hash);
 
 				if hydrated_transactions {
@@ -1355,8 +1440,7 @@ impl Client {
 							log::trace!(target: LOG_TARGET,
 								"Failed to extract receipts for block #{}: {err:?}",
 								block.number());
-						})
-						.unwrap_or_default()
+						})?
 						.into_iter()
 						.map(|(signed_tx, receipt)| TransactionInfo::new(&receipt, signed_tx))
 						.collect::<Vec<_>>();
@@ -1364,12 +1448,9 @@ impl Client {
 					eth_block.transactions = HashesOrTransactionInfos::TransactionInfos(tx_infos);
 				}
 
-				Some(eth_block)
+				Ok(Some(eth_block))
 			},
-			Err(err) => {
-				log::error!(target: LOG_TARGET, "Failed to get Ethereum block for hash {:?}: {err:?}", block.hash());
-				None
-			},
+			None => Ok(None),
 		}
 	}
 
@@ -1456,6 +1537,53 @@ mod in_process_tests {
 	use subxt::ext::subxt_rpcs::client::RpcClientT;
 
 	type TestHeader = (SubstrateBlockNumber, H256, H256);
+
+	#[test]
+	fn transition_requires_missing_storage_and_complete_default_block() {
+		assert_eq!(validate_evm_block(Block::default(), 17, None, true).unwrap(), None);
+		for (block, hash, absent) in [
+			(Block::default(), None, false),
+			(Block::default(), Some(H256::zero()), true),
+			(Block { number: 17.into(), ..Default::default() }, None, true),
+			(Block { gas_limit: 1.into(), ..Default::default() }, None, true),
+		] {
+			assert!(matches!(validate_evm_block(block, 17, hash, absent),
+				Err(ClientError::SyncBoundaryMismatch)));
+		}
+	}
+
+	#[test]
+	fn real_ethereum_block_requires_matching_height_and_runtime_hash() {
+		let hash = H256::from_low_u64_be(9);
+		let block = Block { number: 18.into(), hash, ..Default::default() };
+		assert_eq!(validate_evm_block(block.clone(), 18, Some(hash), false).unwrap(), Some(block.clone()));
+		for (number, stored_hash, absent) in [
+			(17, Some(hash), false), (18, None, false),
+			(18, Some(H256::from_low_u64_be(10)), false), (18, Some(hash), true),
+		] {
+			assert!(matches!(validate_evm_block(block.clone(), number, stored_hash, absent),
+				Err(ClientError::SyncBoundaryMismatch)));
+		}
+		// 真正的Ethereum创世块可以是0号，但哈希不能为零。
+		let genesis = Block { hash, ..Default::default() };
+		assert!(validate_evm_block(genesis, 0, Some(hash), false).unwrap().is_some());
+	}
+
+	#[tokio::test]
+	async fn first_real_block_stops_only_at_verified_pre_evm_parent_hash() {
+		let boundary = (17, H256::from_low_u64_be(17));
+		let tip = (18, H256::from_low_u64_be(18), boundary.1);
+		let pending = collect_best_chain(tip, |header: &TestHeader| *header,
+			|number, hash| std::future::ready((number, hash) == boundary),
+			|_| std::future::ready(Err::<Option<TestHeader>, _>(ClientError::BlockNotFound)),
+		).await.unwrap();
+		assert_eq!(pending, vec![tip]);
+		let fork = (18, tip.1, H256::from_low_u64_be(117));
+		assert!(matches!(collect_best_chain(fork, |header: &TestHeader| *header,
+			|number, hash| std::future::ready((number, hash) == boundary),
+			|_| std::future::ready(Err::<Option<TestHeader>, _>(ClientError::BlockNotFound)),
+		).await, Err(ClientError::BlockNotFound)));
+	}
 
 	#[tokio::test]
 	async fn best_chain_includes_skipped_fork_parent_in_canonical_order() {
