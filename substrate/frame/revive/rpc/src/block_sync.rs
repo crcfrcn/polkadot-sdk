@@ -88,8 +88,11 @@ fn missing_eth_block_api(error: &ClientError) -> bool {
 			name == "ReviveApi_eth_block"
 		},
 		ClientError::SubxtError(subxt::Error::Rpc(subxt::error::RpcError::ClientError(
-			subxt::ext::subxt_rpcs::Error::User(UserError { message, .. }),
-		))) => message == "Exported method ReviveApi_eth_block is not found",
+			subxt::ext::subxt_rpcs::Error::User(UserError { code: 4003, message, data: None }),
+		))) => matches!(message.as_str(),
+			"Exported method ReviveApi_eth_block is not found" |
+			"Client error: Execution failed: Other: Exported method ReviveApi_eth_block is not found"
+		),
 		_ => false,
 	}
 }
@@ -510,13 +513,95 @@ mod recent_runtime_upgrade_tests {
 	}
 
 	fn rpc_missing_api(message: &str) -> ClientError {
+		rpc_error(UserError { code: 4003, message: message.into(), data: None })
+	}
+
+	fn rpc_error(error: UserError) -> ClientError {
 		ClientError::SubxtError(subxt::Error::Rpc(subxt::error::RpcError::ClientError(
-			subxt::ext::subxt_rpcs::Error::User(UserError {
-				code: 4003,
-				message: message.into(),
-				data: None,
-			}),
+			subxt::ext::subxt_rpcs::Error::User(error),
 		)))
+	}
+
+	// 使用真实 state RPC 错误转换，覆盖框架包装后的消息、代码与 data。
+	fn wrapped_missing_api() -> ClientError {
+		let original = std::io::Error::other(
+			"Execution failed: Other: Exported method ReviveApi_eth_block is not found",
+		);
+		let error: jsonrpsee::types::ErrorObjectOwned =
+			sc_rpc_api::state::error::Error::Client(Box::new(original)).into();
+		rpc_error(UserError {
+			code: error.code().into(),
+			message: error.message().into(),
+			data: error.data().map(ToOwned::to_owned),
+		})
+	}
+
+	#[test]
+	fn rpc_missing_error_requires_exact_message_code_and_no_data() {
+		let plain = "Exported method ReviveApi_eth_block is not found";
+		let wrapped = "Client error: Execution failed: Other: Exported method ReviveApi_eth_block is not found";
+		assert!(missing_eth_block_api(&rpc_missing_api(plain)));
+		assert!(missing_eth_block_api(&wrapped_missing_api()));
+		for message in [
+			"Client error: Execution failed: Other: Exported method ReviveApi_balance is not found",
+			"database unavailable: Exported method ReviveApi_eth_block is not found",
+			"Client error: Execution failed: Other: Exported method ReviveApi_eth_block is not found extra",
+			" Exported method ReviveApi_eth_block is not found",
+			"Exported method ReviveApi_eth_block is not found\n",
+		] {
+			assert!(!missing_eth_block_api(&rpc_missing_api(message)), "{message}");
+		}
+		for message in [plain, wrapped] {
+			for code in [4004, -32603] {
+				assert!(!missing_eth_block_api(&rpc_error(UserError {
+					code, message: message.into(), data: None,
+				})));
+			}
+			assert!(!missing_eth_block_api(&rpc_error(UserError {
+				code: 4003, message: message.into(),
+				data: Some(serde_json::value::RawValue::from_string("null".into()).unwrap()),
+			})));
+		}
+	}
+
+	#[tokio::test]
+	async fn wrapped_runtime_prefix_discovers_boundary_without_fixed_height() {
+		let mut visited = Vec::new();
+		let boundary = scan_recent_evm_blocks(9, 13, |number| {
+			visited.push(number);
+			async move { if number < 12 { Err(wrapped_missing_api()) } else { Ok(()) } }
+		}).await.expect("准确框架错误只允许跨过连续旧前缀");
+		assert_eq!(boundary, Some(12));
+		assert_eq!(visited, vec![9, 10, 11, 12, 13]);
+	}
+
+	#[tokio::test]
+	async fn wrapped_missing_after_evm_or_at_best_is_returned_unchanged() {
+		let expected = wrapped_missing_api().to_string();
+		let result = scan_recent_evm_blocks(9, 11, |number| async move {
+			if number == 9 { Ok(()) } else { Err(wrapped_missing_api()) }
+		}).await;
+		assert_eq!(result.unwrap_err().to_string(), expected);
+		for first in [9, 11] {
+			let result = scan_recent_evm_blocks(first, 11, |_| async { Err(wrapped_missing_api()) }).await;
+			assert_eq!(result.unwrap_err().to_string(), expected);
+		}
+	}
+
+	#[tokio::test]
+	async fn unrelated_errors_stop_old_prefix_without_replacement() {
+		for error in [
+			ClientError::BlockNotFound,
+			missing_api("ReviveApi_balance"),
+			rpc_missing_api("Client error: Execution failed: Other: state unavailable"),
+		] {
+			let expected = error.to_string();
+			let mut error = Some(error);
+			let result = scan_recent_evm_blocks(0, 2, |_| std::future::ready(
+				Err(error.take().expect("其它错误必须在首块立即返回")),
+			)).await;
+			assert_eq!(result.unwrap_err().to_string(), expected);
+		}
 	}
 
 	#[tokio::test]
