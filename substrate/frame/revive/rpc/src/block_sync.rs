@@ -22,6 +22,8 @@ use crate::{
 	client::{Client, ClientError, GapFillRequest, SubstrateBlockNumber},
 };
 use pallet_revive::evm::H256;
+use std::future::Future;
+use subxt::{Error::Metadata, error::MetadataError, ext::subxt_rpcs::UserError};
 use tokio::sync::mpsc;
 
 const LOG_TARGET: &str = "eth-rpc::block-sync";
@@ -78,6 +80,50 @@ impl SyncCheckpoint {
 /// How often (in blocks) the backward sync checkpoints are persisted to the database.
 const BLOCK_INTERVAL: u32 = 128;
 
+/// 旧 Runtime 尚未导出 Revive API 时，只接受准确的缺方法错误作为历史边界。
+/// 网络、状态和已支持 Revive 后的执行错误不能被当作空 Ethereum 区块。
+fn missing_eth_block_api(error: &ClientError) -> bool {
+	match error {
+		ClientError::SubxtError(Metadata(MetadataError::RuntimeMethodNotFound(name))) => {
+			name == "ReviveApi_eth_block"
+		},
+		ClientError::SubxtError(subxt::Error::Rpc(subxt::error::RpcError::ClientError(
+			subxt::ext::subxt_rpcs::Error::User(UserError { message, .. }),
+		))) => message == "Exported method ReviveApi_eth_block is not found",
+		_ => false,
+	}
+}
+
+/// 只跳过近期窗口开头连续的旧 Runtime 区块；一旦发现 Ethereum 区块，后续错误即失败。
+async fn scan_recent_evm_blocks<F, Fut>(
+	first: SubstrateBlockNumber,
+	best: SubstrateBlockNumber,
+	mut visit: F,
+) -> Result<Option<SubstrateBlockNumber>, ClientError>
+where
+	F: FnMut(SubstrateBlockNumber) -> Fut,
+	Fut: Future<Output = Result<(), ClientError>>,
+{
+	let mut skipped_old_runtime = false;
+	let mut found_evm = false;
+	let mut boundary = None;
+	for number in first..=best {
+		match visit(number).await {
+			Ok(()) => {
+				if skipped_old_runtime && !found_evm {
+					boundary = Some(number);
+				}
+				found_evm = true;
+			},
+			Err(error) if !found_evm && number < best && missing_eth_block_api(&error) => {
+				skipped_old_runtime = true;
+			},
+			Err(error) => return Err(error),
+		}
+	}
+	Ok(boundary)
+}
+
 /// Options for [`Client::sync_backward_range`].
 struct BackwardSyncRange {
 	from: SubstrateBlockNumber,
@@ -96,13 +142,18 @@ impl Client {
 	pub(crate) async fn rebuild_recent_index(&self, keep_latest: usize) -> Result<(), ClientError> {
 		let best = self.block_provider().latest_block_number().await;
 		let first = best.saturating_sub((keep_latest - 1) as u32);
-		for number in first..=best {
+		let boundary = scan_recent_evm_blocks(first, best, |number| async move {
 			let block = self
 				.block_provider()
 				.block_by_number(number)
 				.await?
 				.ok_or(ClientError::BlockNotFound)?;
 			self.process_block(&block).await?;
+			Ok(())
+		})
+		.await?;
+		if let Some(first_evm) = boundary {
+			self.receipt_provider().set_first_evm_block(first_evm).await?;
 		}
 		Ok(())
 	}
@@ -445,5 +496,80 @@ impl Client {
 		}
 
 		log::info!(target: LOG_TARGET, "🔄 Subscription gap filler stopped");
+	}
+}
+
+#[cfg(test)]
+mod recent_runtime_upgrade_tests {
+	use super::{missing_eth_block_api, scan_recent_evm_blocks};
+	use crate::client::ClientError;
+	use subxt::{Error::Metadata, error::MetadataError, ext::subxt_rpcs::UserError};
+
+	fn missing_api(name: &str) -> ClientError {
+		ClientError::SubxtError(Metadata(MetadataError::RuntimeMethodNotFound(name.into())))
+	}
+
+	fn rpc_missing_api(message: &str) -> ClientError {
+		ClientError::SubxtError(subxt::Error::Rpc(subxt::error::RpcError::ClientError(
+			subxt::ext::subxt_rpcs::Error::User(UserError {
+				code: 4003,
+				message: message.into(),
+				data: None,
+			}),
+		)))
+	}
+
+	#[tokio::test]
+	async fn old_runtime_prefix_has_one_first_evm_boundary() {
+		let boundary = scan_recent_evm_blocks(0, 80, |number| async move {
+			if number < 79 {
+				Err(rpc_missing_api("Exported method ReviveApi_eth_block is not found"))
+			} else {
+				Ok(())
+			}
+		})
+		.await
+		.expect("升级前历史应允许重建");
+		assert_eq!(boundary, Some(79));
+	}
+
+	#[tokio::test]
+	async fn evm_only_window_needs_no_new_boundary() {
+		let boundary = scan_recent_evm_blocks(79, 80, |_| async { Ok(()) })
+			.await
+			.expect("全部区块均支持 Revive");
+		assert_eq!(boundary, None);
+	}
+
+	#[tokio::test]
+	async fn missing_api_after_first_evm_block_stops_rebuild() {
+		let result = scan_recent_evm_blocks(78, 81, |number| async move {
+			if number == 78 || number == 81 {
+				Err(missing_api("ReviveApi_eth_block"))
+			} else {
+				Ok(())
+			}
+		})
+		.await;
+		assert!(result.is_err());
+	}
+
+	#[tokio::test]
+	async fn wrong_method_or_no_current_evm_block_stops_rebuild() {
+		assert!(!missing_eth_block_api(&missing_api("ReviveApi_balance")));
+		assert!(!missing_eth_block_api(&rpc_missing_api(
+			"Exported method ReviveApi_balance is not found"
+		)));
+		assert!(!missing_eth_block_api(&ClientError::BlockNotFound));
+		assert!(scan_recent_evm_blocks(0, 1, |_| async {
+			Err(missing_api("ReviveApi_balance"))
+		})
+		.await
+		.is_err());
+		assert!(scan_recent_evm_blocks(0, 1, |_| async {
+			Err(missing_api("ReviveApi_eth_block"))
+		})
+		.await
+		.is_err());
 	}
 }

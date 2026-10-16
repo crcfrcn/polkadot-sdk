@@ -657,27 +657,32 @@ where
 		})
 	};
 
-	// Generate the RPC module for the server
-	let rpc_api = gen_rpc_module()?;
-
-	let rpc_server_handle = start_rpc_servers(
-		&config.rpc,
-		config.prometheus_registry(),
-		&config.tokio_handle,
-		rpc_api,
-		rpc_runtime,
-		rpc_id_provider,
-	)?;
-
-	let listen_addrs = rpc_server_handle
-		.listen_addrs()
-		.into_iter()
-		.map(|socket_addr| {
-			let mut multiaddr: Multiaddr = socket_addr.ip().into();
-			multiaddr.push(Protocol::Tcp(socket_addr.port()));
-			multiaddr
-		})
-		.collect();
+	// 显式空端点保留进程内 RPC，但不创建明文网络监听；None 仍采用原默认端点。
+	let (listen_addrs, rpc_server_handle) = if network_rpc_requested(config.rpc.addr.as_deref()) {
+		let rpc_api = gen_rpc_module()?;
+		let handle = start_rpc_servers(
+			&config.rpc,
+			config.prometheus_registry(),
+			&config.tokio_handle,
+			rpc_api,
+			rpc_runtime,
+			rpc_id_provider,
+		)?;
+		let addresses = handle
+			.listen_addrs()
+			.into_iter()
+			.map(|socket_addr| {
+				let mut multiaddr: Multiaddr = socket_addr.ip().into();
+				multiaddr.push(Protocol::Tcp(socket_addr.port()));
+				multiaddr
+			})
+			.collect();
+		(addresses, Some(handle))
+	} else {
+		// 进程内模块的任务仍使用专属 Runtime，须与 TaskManager 一同存活。
+		task_manager.keep_alive(rpc_runtime);
+		(Vec::new(), None)
+	};
 
 	// In-memory RPC uses the same dedicated RPC runtime
 	let in_memory_rpc = {
@@ -698,6 +703,27 @@ where
 	task_manager.keep_alive((config.base_path, rpc_server_handle));
 
 	Ok(in_memory_rpc_handle)
+}
+
+/// 显式空列表是唯一关闭外部监听的配置；未设置时保持 SDK 原有回环默认值。
+fn network_rpc_requested<T>(endpoints: Option<&[T]>) -> bool {
+	!matches!(endpoints, Some([]))
+}
+
+#[cfg(test)]
+mod rpc_listener_tests {
+	use super::network_rpc_requested;
+
+	#[test]
+	fn default_and_populated_endpoints_keep_network_listener() {
+		assert!(network_rpc_requested::<()>(None));
+		assert!(network_rpc_requested(Some(&[()])));
+	}
+
+	#[test]
+	fn explicit_empty_endpoints_keep_only_in_process_rpc() {
+		assert!(!network_rpc_requested::<()>(Some(&[])));
+	}
 }
 
 /// Returns a future that forwards imported transactions to the transaction networking protocol.

@@ -43,6 +43,31 @@
 
 功能清单核验回读本仓实际Git跟踪源码，使用明确的本仓上游排除边界；漏登记、重复、不存在的入口或Rust具名用例集合不一致均失败。归档消费者仍属于本仓功能检查，不因上游目录豁免而排除。
 
+## 跨 Runtime 升级的近期 Ethereum 索引与进程内 RPC
+
+Revive RPC 重启时重建有限近期索引：窗口开头若处于尚未导出
+`ReviveApi_eth_block` 的旧 Runtime，只把准确缺方法错误识别为连续的旧历史，
+从首个可执行 Ethereum 区块开始写入索引并登记现有 `FirstEvmBlock` 边界。
+已遇到 Ethereum 区块后再缺方法、当前最佳块缺方法、其它方法缺失或读取故障
+均停止初始化，不能被记成无交易历史；不硬编码链高度或创世身份。
+
+`sc-service` 的 RPC 端点 `None` 保留官方默认回环监听，非空列表按声明监听；
+显式空列表只建立进程内 `RpcHandlers` 并保留其专用 Runtime，不启动网络监听。
+这一模式供产品自身的受信 TLS 入口消费，不开放明文备用端口。
+实际 SDK 回归及消费产品 TLS/端口验收结果记录于所属唯一任务卡。
+
+本机 SDK 编译的 C 构建脚本和 Rustc 链接均使用本轮 Xcode 验真 `clang` 绝对入口；
+受控 PATH 无 `cc` 名称时，Rustc 按 `CARGO_TARGET_AARCH64_APPLE_DARWIN_LINKER`
+完成宿主构建脚本链接。同一Xcode交付的 macOS SDK经 `SDKROOT` 提供系统库，
+其工具链内 `libclang.dylib` 目录仅交给本轮 Cargo 的 `LIBCLANG_PATH` 和
+`DYLD_LIBRARY_PATH`。SDK或动态库缺失、越过当前Xcode均在准备阶段失败；
+工具版本、系统配置与 Cargo 锁不变。
+
+测试与编译若触发官方 `-Z build-std`，依赖仍来自本轮Rust1.97.1工具附带的
+`rust-src/library/Cargo.lock`。产品在自己的原锁闭包后取得并验真这份工具原锁，
+仅在准备阶段获取其锁定来源；测试与正式编译继续离线。缺锁、越过本轮Rust工具
+或工具原锁依赖准备失败均立即停止，不修改两份锁或换取替代版本。
+
 ## 严格原生 Ethereum 钱包费用参数
 
 Revive 的 StrictNativeBalance 路径共用 native_gas_price 校验报价和已签交易。

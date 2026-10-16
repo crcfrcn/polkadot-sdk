@@ -63,18 +63,48 @@ export async function prepareToolSupply(tool,{original,payload,work,signal,acqui
 export async function standaloneApple(plan,work,environment,signal,execute=run){
  const developerDirectory=(await execute('/usr/bin/xcode-select',['-p'],{cwd:work,env:environment,signal,capture:true})).trim(),tools={};
  for(const name of plan.names)tools[name]=name==='xcrun'?'/usr/bin/xcrun':(await execute('/usr/bin/xcrun',['--find',name],{cwd:work,env:{...environment,DEVELOPER_DIR:developerDirectory},signal,capture:true})).trim();
- return {developerDirectory,tools};
+ const sdk=(await execute('/usr/bin/xcrun',['--sdk','macosx','--show-sdk-path'],{cwd:work,env:{...environment,DEVELOPER_DIR:developerDirectory},signal,capture:true})).trim();
+ return {developerDirectory,tools,sdk};
+}
+// 只接受当前Xcode内的SDK与宿主libclang，链接器和动态库不从PATH或其它安装取得。
+export async function checkedAppleCargo(apple){
+ if(typeof apple?.developerDirectory!=='string'||!isAbsolute(apple.developerDirectory)||typeof apple.sdk!=='string'||!isAbsolute(apple.sdk)||typeof apple?.tools?.clang!=='string'||!isAbsolute(apple.tools.clang))fail('SDK Apple工具路径无效');
+ try{
+  const developerDirectory=await realpath(apple.developerDirectory),sdk=await realpath(apple.sdk),clang=await realpath(apple.tools.clang);
+  if(!inside(developerDirectory,sdk)||!inside(developerDirectory,clang)||!(await lstat(sdk)).isDirectory()||!(await lstat(clang)).isFile())fail('SDK Apple工具越界');
+  const system=await realpath(join(sdk,'usr/lib/libSystem.tbd'));
+  if(!inside(sdk,system)||!(await lstat(system)).isFile())fail('SDK macOS系统库无效');
+  const libclang=await realpath(join(dirname(dirname(clang)),'lib/libclang.dylib')),info=await lstat(libclang);
+  if(!inside(developerDirectory,libclang)||!info.isFile()||info.nlink!==1)fail('SDK libclang无效');
+  return {developerDirectory,sdk,clang,libclangDirectory:dirname(libclang)};
+ }catch(error){if(String(error?.message||'').startsWith('Polkadot SDK编译：'))throw error;fail('SDK Apple工具缺失或越界');}
+}
+// build-std读取所交付Rust工具自己的原锁；不能只准备产品Cargo.lock后离线猜包。
+export async function rustLibraryManifest(rustc){
+ if(typeof rustc!=='string'||!isAbsolute(rustc))fail('SDK Rust工具入口无效');
+ const root=dirname(dirname(rustc)),library=join(root,'lib/rustlib/src/rust/library');
+ try{
+  for(const name of ['Cargo.toml','Cargo.lock']){
+   const file=join(library,name),actual=await realpath(file),info=await lstat(actual);
+   if(!inside(root,actual)||!info.isFile()||info.nlink!==1)fail('SDK Rust工具原锁越界或无效');
+  }
+  return join(library,'Cargo.toml');
+ }catch(error){if(String(error?.message||'').startsWith('Polkadot SDK编译：'))throw error;fail('SDK Rust工具原锁缺失');}
 }
 export async function prepareResourceSupply(platform,work,previous,options={}){
  if(options.provided===true&&['acquireTool','acquireApple','runCommand'].some(name=>typeof options[name]!=='function'))fail('调度供给能力不完整');
  const plan=await requirements(platform,work),tools={},signal=options.signal,environment={HOME:work,TMPDIR:join(work,'tmp'),PATH:''};await directory(environment.TMPDIR);
  for(const tool of plan.tools){signal?.throwIfAborted();if(options.acquireTool)tools[tool.id]=await options.acquireTool(tool);else{const original=await standaloneOriginal(tool.archive,{work,offline:options.offline,signal}),payload=await directory(join(work,'tools',tool.id));await prepareToolSupply(tool,{original,payload,work,signal,acquireOriginal:e=>standaloneOriginal(e,{work,offline:options.offline,signal})});tools[tool.id]={version:tool.version,path:join(payload,tool.archive.executable)};}}
  const apple=options.acquireApple?await options.acquireApple(plan.apple):await standaloneApple(plan.apple,work,environment,signal);
+ const appleCargo=await checkedAppleCargo(apple);
  const cargo=join(dirname(tools.rust.path),'cargo'),cargoHome=await directory(join(work,'dependencies/cargo')),cargoTarget=await directory(join(work,'work/cargo-target'));
- Object.assign(environment,{CARGO_HOME:cargoHome,CARGO_TARGET_DIR:cargoTarget,RUSTC:tools.rust.path,DEVELOPER_DIR:apple.developerDirectory,CC:apple.tools.clang,CXX:apple.tools['clang++'],AR:apple.tools.ar,PROTOC:tools.protoc.path,SOLC:tools.solc.path,RESOLC:tools.resolc.path,CMAKE:tools.cmake.path,PATH:[...new Set(Object.values(tools).map(t=>dirname(t.path))),dirname(apple.tools.make)].join(':')});
+ // Rust链接、系统库和bindgen均使用本轮同一Xcode；只交给当前Cargo任务。
+ Object.assign(environment,{CARGO_HOME:cargoHome,CARGO_TARGET_DIR:cargoTarget,RUSTC:tools.rust.path,DEVELOPER_DIR:appleCargo.developerDirectory,SDKROOT:appleCargo.sdk,CC:appleCargo.clang,CARGO_TARGET_AARCH64_APPLE_DARWIN_LINKER:appleCargo.clang,CXX:apple.tools['clang++'],AR:apple.tools.ar,LIBCLANG_PATH:appleCargo.libclangDirectory,DYLD_LIBRARY_PATH:appleCargo.libclangDirectory,PROTOC:tools.protoc.path,SOLC:tools.solc.path,RESOLC:tools.resolc.path,CMAKE:tools.cmake.path,PATH:[...new Set(Object.values(tools).map(t=>dirname(t.path))),dirname(apple.tools.make)].join(':')});
  // Cargo只按本仓原始锁准备依赖；随后构建强制离线，不改锁、不跟随新版本。
  const prepareCommand=options.provided===true?options.runCommand:run;if(typeof prepareCommand!=='function')fail('调度供给缺少依赖执行能力');
+ const rustLibrary=await rustLibraryManifest(tools.rust.path);
  await prepareCommand(cargo,['fetch','--manifest-path',join(root,'Cargo.toml'),'--locked',...(options.offline?['--offline']:[])],{cwd:work,env:environment,signal});
+ await prepareCommand(cargo,['fetch','--manifest-path',rustLibrary,'--locked',...(options.offline?['--offline']:[])],{cwd:work,env:{...environment,RUSTC_BOOTSTRAP:'1'},signal});
  return {schema:1,product_id:contract.product_id,platform,work,run_id:previous.run_id,offline:true,tools,environment,dependencies:{own:{cargoHome}},archives:{}};
 }
 export function resourceEnvironment(platform,work,value){checkWork(work);if(platform!=='sdk'||value?.schema!==1||value.product_id!==contract.product_id||value.platform!==platform||value.work!==work||value.offline!==true)fail('资源回执身份无效');for(const tool of contract.platforms.sdk.tools)if(value.tools?.[tool.id]?.version!==tool.version)fail('资源版本与本仓声明不符');return value.environment;}
@@ -149,7 +179,7 @@ if(process.env.NODE_TEST_CONTEXT&&process.argv.length===2&&process.argv[1]===imp
   }
   const parent=join(root,'target/test/sessions');if(existsSync(parent)&&readdirSync(parent).length===0)rmdirSync(parent);
  });
- test('独立供给只为开发者工具查询xcrun，系统xcrun直接交付',async()=>{const calls=[];const value=await standaloneApple({names:['xcrun','clang']},'/fixture',{},undefined,async(file,args)=>{calls.push([file,args]);return file.endsWith('xcode-select')?'/fixture/Xcode':'/fixture/Xcode/clang';});assert.equal(value.tools.xcrun,'/usr/bin/xcrun');assert.equal(value.tools.clang,'/fixture/Xcode/clang');assert.equal(calls.some(([,args])=>args.includes('xcrun')),false);});
+ test('独立供给从同一Xcode查询Clang和macOS SDK，系统xcrun直接交付',async()=>{const calls=[];const value=await standaloneApple({names:['xcrun','clang']},'/fixture',{},undefined,async(file,args)=>{calls.push([file,args]);return file.endsWith('xcode-select')?'/fixture/Xcode':args[0]==='--sdk'?'/fixture/Xcode/MacOSX.sdk':'/fixture/Xcode/clang';});assert.equal(value.tools.xcrun,'/usr/bin/xcrun');assert.equal(value.tools.clang,'/fixture/Xcode/clang');assert.equal(value.sdk,'/fixture/Xcode/MacOSX.sdk');assert.equal(calls.filter(([,args])=>args[0]==='--sdk').length,1);assert.equal(calls.some(([,args])=>args.includes('xcrun')),false);});
  test('SDK平台编译现场位于独立目录且空现场收尾删除目录',async()=>{
   const work=buildWork();assert.equal(checkWork(work),work);
   assert.throws(()=>checkWork(join(root,'target/build')),/工作根/);
@@ -162,11 +192,29 @@ if(process.env.NODE_TEST_CONTEXT&&process.argv.length===2&&process.argv[1]===imp
  test('SDK调度依赖只使用交付执行能力，缺能力及执行失败不回退',async()=>{
   const work=testRoot();await mkdir(dirname(work),{recursive:true});await mkdir(work,{recursive:true});
   try{
+   const developerDirectory=join(work,'Xcode'),sdk=join(developerDirectory,'MacOSX.sdk'),bin=join(developerDirectory,'Toolchains/usr/bin'),lib=join(developerDirectory,'Toolchains/usr/lib'),clang=join(bin,'clang');
+   await mkdir(join(sdk,'usr/lib'),{recursive:true});await mkdir(bin,{recursive:true});await mkdir(lib,{recursive:true});
+   await writeFile(join(sdk,'usr/lib/libSystem.tbd'),'stub');await writeFile(clang,'clang');await writeFile(join(lib,'libclang.dylib'),'library');
+   const rustc=join(work,'rust/bin/rustc'),rustLibrary=join(work,'rust/lib/rustlib/src/rust/library');
+   await mkdir(dirname(rustc),{recursive:true});await mkdir(rustLibrary,{recursive:true});
+   await writeFile(rustc,'rustc');await writeFile(join(rustLibrary,'Cargo.toml'),'workspace');await writeFile(join(rustLibrary,'Cargo.lock'),'lock');
    const previous={run_id:'123456789'};let calls=0;
-   const options={provided:true,acquireTool:async tool=>({version:tool.version,path:'/fixture/'+tool.id+'/bin/'+(tool.id==='rust'?'rustc':tool.id)}),acquireApple:async plan=>({developerDirectory:'/fixture/Xcode',tools:Object.fromEntries(plan.names.map(name=>[name,'/fixture/Apple/'+name]))}),runCommand:async(file,args,settings)=>{calls++;assert.equal(file,'/fixture/rust/bin/cargo');assert.equal(args[0],'fetch');assert.ok(args.includes('--locked'));assert.equal(settings.cwd,work);}};
-   const result=await prepareResourceSupply('sdk',work,previous,options);assert.equal(calls,1);assert.equal(result.offline,true);
-   await assert.rejects(prepareResourceSupply('sdk',work,previous,{...options,runCommand:undefined}),/能力不完整/);assert.equal(calls,1);
+   const options={provided:true,acquireTool:async tool=>({version:tool.version,path:tool.id==='rust'?rustc:'/fixture/'+tool.id+'/bin/'+tool.id}),acquireApple:async plan=>({developerDirectory,sdk,tools:Object.fromEntries(plan.names.map(name=>[name,name==='clang'?clang:join(bin,name)]))}),runCommand:async(file,args,settings)=>{calls++;assert.equal(file,join(dirname(rustc),'cargo'));assert.equal(args[0],'fetch');assert.ok(args.includes('--locked'));assert.equal(args[2],calls===1?join(root,'Cargo.toml'):join(rustLibrary,'Cargo.toml'));assert.equal(settings.env.RUSTC_BOOTSTRAP,calls===1?undefined:'1');assert.equal(settings.cwd,work);assert.equal(settings.env.CARGO_TARGET_AARCH64_APPLE_DARWIN_LINKER,clang);assert.equal(settings.env.SDKROOT,sdk);assert.equal(settings.env.LIBCLANG_PATH,lib);assert.equal(settings.env.DYLD_LIBRARY_PATH,lib);}};
+   const result=await prepareResourceSupply('sdk',work,previous,options);assert.equal(calls,2);assert.equal(result.offline,true);assert.equal(result.environment.CARGO_TARGET_AARCH64_APPLE_DARWIN_LINKER,clang);
+   await assert.rejects(prepareResourceSupply('sdk',work,previous,{...options,acquireApple:async()=>({developerDirectory,sdk,tools:{}})}),/Apple工具路径无效/);assert.equal(calls,2);
+   await assert.rejects(prepareResourceSupply('sdk',work,previous,{...options,acquireApple:async()=>({developerDirectory,tools:{clang}})}),/Apple工具路径无效/);assert.equal(calls,2);
+   const outside=join(work,'Outside');await mkdir(outside);
+   await assert.rejects(prepareResourceSupply('sdk',work,previous,{...options,acquireApple:async()=>({developerDirectory,sdk:outside,tools:{clang}})}),/Apple工具越界/);assert.equal(calls,2);
+   await rm(join(lib,'libclang.dylib'));
+   await assert.rejects(prepareResourceSupply('sdk',work,previous,options),/Apple工具缺失或越界/);assert.equal(calls,2);
+   await writeFile(join(lib,'libclang.dylib'),'library');
+   await rm(join(rustLibrary,'Cargo.lock'));
+   await assert.rejects(prepareResourceSupply('sdk',work,previous,options),/Rust工具原锁缺失/);assert.equal(calls,2);
+   await writeFile(join(rustLibrary,'Cargo.lock'),'lock');
+   await assert.rejects(prepareResourceSupply('sdk',work,previous,{...options,acquireTool:async tool=>({version:tool.version,path:tool.id==='rust'?'/fixture/foreign/rustc':'/fixture/'+tool.id+'/bin/'+tool.id})}),/Rust工具原锁缺失/);assert.equal(calls,2);
+   await assert.rejects(prepareResourceSupply('sdk',work,previous,{...options,runCommand:undefined}),/能力不完整/);assert.equal(calls,2);
    await assert.rejects(prepareResourceSupply('sdk',work,previous,{...options,runCommand:async()=>{throw Error('fixture fetch failure');}}),/fixture fetch failure/);
+   let stages=0;await assert.rejects(prepareResourceSupply('sdk',work,previous,{...options,runCommand:async()=>{if(++stages===2)throw Error('fixture rust library failure');}}),/fixture rust library failure/);assert.equal(stages,2);
   }finally{await rm(work,{recursive:true,force:true});}
  });
 
