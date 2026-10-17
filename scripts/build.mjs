@@ -1,9 +1,8 @@
 #!/usr/bin/env node
-// Polkadot SDK唯一完整本机编译入口；只消费本仓锁与声明，不调用控制台或兄弟仓流程。
+// 本产品独立拥有此实现，通过自身公开接口执行。
 import {writeFileSync,existsSync,readdirSync,rmdirSync} from 'node:fs';
 import {spawn} from 'node:child_process';
 import {AsyncLocalStorage} from 'node:async_hooks';
-import {Socket} from 'node:net';
 import {createHash,randomUUID} from 'node:crypto';
 import {readFile,writeFile,mkdir,lstat,realpath,readdir,rm,rmdir,copyFile,rename,chmod} from 'node:fs/promises';
 import {dirname,join,resolve,relative,isAbsolute,sep} from 'node:path';
@@ -32,7 +31,7 @@ export function testRoot(){return testSession?join(root,'target/test/sessions',t
 function buildWork(){return testSession?join(testRoot(),'build/sdk'):join(root,'target/build/sdk');}
 export function checkWork(work){if(work!==buildWork()&&work!==testRoot())fail('工作根必须归本仓本轮Build或测试会话');return work;}
 async function directory(path){await mkdir(path,{recursive:true,mode:0o700});if(await realpath(path)!==path||!(await lstat(path)).isDirectory())fail('工作路径经过链接或非目录');return path;}
-export async function requirements(platform,work){checkWork(work);if(platform!=='sdk'||process.platform!==contract.bootstrap.platform||process.arch!==contract.bootstrap.arch)fail('本机平台没有声明实现');await readFile(join(root,'Cargo.lock'));return {schema:1,product_id:contract.product_id,platform,tools:contract.platforms.sdk.tools,locks:contract.platforms.sdk.locks,apple:contract.apple,bootstrap:contract.bootstrap};}
+export async function requirements(platform,work){checkWork(work);if(platform!=='sdk'||process.platform!==contract.bootstrap.platform||process.arch!==contract.bootstrap.arch)fail('本机平台没有声明实现');await readFile(join(root,'Cargo.lock'));return {schema:1,product_id:contract.product_id,platform,tools:contract.platforms.sdk.tools.map(tool=>({...tool,cache_key:tool.id==='node'?tool.archive.sha256:tool.archive.sha256+'-'+hash(JSON.stringify([tool,prepareToolSupply.toString()]))})),locks:contract.platforms.sdk.locks,apple:contract.apple,bootstrap:contract.bootstrap};}
 async function run(file,args,{cwd,env,signal,capture=false}={}){
  signal?.throwIfAborted();return new Promise((ok,reject)=>{let reason,closed=false,output=[];const child=spawn(file,args,{cwd,env,detached:true,stdio:['ignore','pipe','pipe']});const state=task.getStore(),work=[buildWork(),testRoot()].find(path=>cwd===path||cwd?.startsWith(path+sep));const groups=work?(recipeGroups.get(work)||new Set()):new Set();if(work)recipeGroups.set(work,groups);const record=()=>{if(work)writeFileSync(join(work,'.resource-active.json'),JSON.stringify({pid:process.pid,groups:[...groups]})+'\n');};if(Number.isSafeInteger(child.pid)){groups.add(child.pid);state?.groups.add(child.pid);state?.onGroups?.(state.groups);record();}
  let killer;const stop=()=>{reason??=Error('编译已取消');try{process.kill(-child.pid,'SIGTERM');}catch{}killer??=setTimeout(()=>{try{process.kill(-child.pid,'SIGKILL');}catch{}},1500);};signal?.addEventListener('abort',stop,{once:true});
@@ -47,7 +46,23 @@ async function bootstrapTools(work,signal){
  }return tools;
 }
 async function standaloneOriginal(entry,{work,offline,signal}){const dir=await directory(join(work,'originals')),file=join(dir,entry.sha256+'.blob');try{const bytes=await readFile(file);if(hash(bytes)!==entry.sha256)fail('原件与本仓声明不符');return file;}catch(e){if(e.code!=='ENOENT')throw e;}if(offline)fail('离线缺少声明原件');const url=new URL(entry.url);if(url.protocol!=='https:'||url.username||url.password)fail('原件必须为公开HTTPS');const response=await fetch(url,{signal});if(!response.ok)fail('原件获取失败');const bytes=Buffer.from(await response.arrayBuffer());if(!bytes.length||bytes.length>4*1024**3||hash(bytes)!==entry.sha256)fail('原件与声明不符');await writeFile(file,bytes,{flag:'wx',mode:0o444});return file;}
-export async function prepareToolSupply(tool,{original,payload,work,signal,acquireOriginal,acquireApple}){
+// 组件语义仅归SDK；供应端不理解rust-src与目标标准库的布局。
+async function validateSDKTool(tool,payload){
+ const base=await realpath(payload);if(base!==payload)fail('SDK工具根经过链接');
+ for(const slot of tool.slots){const file=await realpath(join(base,slot)),info=await lstat(file);if(!inside(base,file)||!info.isFile()||!(info.mode&0o111))fail('SDK工具入口缺失或越界');}
+ for(const component of tool.components||[]){
+  if(component.target==='rust-src')await rustLibraryManifest(join(base,tool.archive.executable));
+  else {const path=await realpath(join(base,'lib/rustlib',component.target,'lib'));if(!inside(base,path)||!(await lstat(path)).isDirectory())fail('SDK目标标准库缺失或越界');}
+ }
+}
+async function acceptSDKTool(tool,value){
+ const suffix='/'+tool.archive.executable;
+ if(value?.version!==tool.version||value.id!==undefined&&value.id!==tool.id||typeof value.path!=='string'||!value.path.endsWith(suffix))fail('SDK工具交付身份不符');
+ const payload=value.root||value.path.slice(0,-suffix.length);if(!isAbsolute(payload)||value.path!==join(payload,tool.archive.executable))fail('SDK工具交付路径不符');
+ await validateSDKTool(tool,payload);return value;
+}
+export async function prepareToolSupply(tool,{payload,work,signal,acquireOriginal,acquireApple}){
+ const original=await acquireOriginal(tool.archive,{kind:'tool'});
  const bootstrap=await bootstrapTools(work,signal),environment={PATH:'/usr/bin:/bin',HOME:work,TMPDIR:work};await directory(payload);
  if(tool.archive.kind==='binary'){await directory(dirname(join(payload,tool.archive.executable)));await copyFile(original,join(payload,tool.archive.executable));await chmod(join(payload,tool.archive.executable),0o555);}
  else{const unpack=await directory(join(work,'unpack-'+tool.id+'-'+randomUUID()));try{
@@ -58,12 +73,13 @@ export async function prepareToolSupply(tool,{original,payload,work,signal,acqui
    for(const component of tool.components||[]){const file=await acquireOriginal(component,{kind:'tool'}),at=await directory(join(unpack,component.target));await run(bootstrap.tar,['-xf',file,'-C',at],{cwd:work,env:environment,signal});await run(bootstrap.shell,[join(at,component.root,'install.sh'),'--prefix='+payload,'--disable-ldconfig'],{cwd:work,env:environment,signal});}
   }else{for(const name of await readdir(source))await rename(join(source,name),join(payload,name));}
  }finally{assertWorkQuiescent(work);await rm(unpack,{recursive:true,force:true});}}
- return {schema:1,id:tool.id,version:tool.version,payload,original};
+ await validateSDKTool(tool,payload);return {schema:1,id:tool.id,version:tool.version,payload};
 }
 export async function standaloneApple(plan,work,environment,signal,execute=run){
+ if(typeof plan.sdk!=='string'||!/^[a-z0-9][a-z0-9.-]{0,63}$/u.test(plan.sdk))fail('SDK未声明Apple SDK目标');
  const developerDirectory=(await execute('/usr/bin/xcode-select',['-p'],{cwd:work,env:environment,signal,capture:true})).trim(),tools={};
  for(const name of plan.names)tools[name]=name==='xcrun'?'/usr/bin/xcrun':(await execute('/usr/bin/xcrun',['--find',name],{cwd:work,env:{...environment,DEVELOPER_DIR:developerDirectory},signal,capture:true})).trim();
- const sdk=(await execute('/usr/bin/xcrun',['--sdk','macosx','--show-sdk-path'],{cwd:work,env:{...environment,DEVELOPER_DIR:developerDirectory},signal,capture:true})).trim();
+ const sdk=(await execute('/usr/bin/xcrun',['--sdk',plan.sdk,'--show-sdk-path'],{cwd:work,env:{...environment,DEVELOPER_DIR:developerDirectory},signal,capture:true})).trim();
  return {developerDirectory,tools,sdk};
 }
 // 只接受当前Xcode内的SDK与宿主libclang，链接器和动态库不从PATH或其它安装取得。
@@ -92,23 +108,22 @@ export async function rustLibraryManifest(rustc){
  }catch(error){if(String(error?.message||'').startsWith('Polkadot SDK编译：'))throw error;fail('SDK Rust工具原锁缺失');}
 }
 export async function prepareResourceSupply(platform,work,previous,options={}){
- if(options.provided===true&&['acquireTool','acquireApple','runCommand'].some(name=>typeof options[name]!=='function'))fail('调度供给能力不完整');
  const plan=await requirements(platform,work),tools={},signal=options.signal,environment={HOME:work,TMPDIR:join(work,'tmp'),PATH:''};await directory(environment.TMPDIR);
- for(const tool of plan.tools){signal?.throwIfAborted();if(options.acquireTool)tools[tool.id]=await options.acquireTool(tool);else{const original=await standaloneOriginal(tool.archive,{work,offline:options.offline,signal}),payload=await directory(join(work,'tools',tool.id));await prepareToolSupply(tool,{original,payload,work,signal,acquireOriginal:e=>standaloneOriginal(e,{work,offline:options.offline,signal})});tools[tool.id]={version:tool.version,path:join(payload,tool.archive.executable)};}}
- const apple=options.acquireApple?await options.acquireApple(plan.apple):await standaloneApple(plan.apple,work,environment,signal);
+ for(const tool of plan.tools){signal?.throwIfAborted();{const payload=await directory(join(work,'tools',tool.id));await prepareToolSupply(tool,{payload,work,signal,acquireOriginal:e=>standaloneOriginal(e,{work,offline:options.offline,signal})});tools[tool.id]=await acceptSDKTool(tool,{version:tool.version,path:join(payload,tool.archive.executable)});}}
+ const apple=await standaloneApple(plan.apple,work,environment,signal);
  const appleCargo=await checkedAppleCargo(apple);
  const cargo=join(dirname(tools.rust.path),'cargo'),cargoHome=await directory(join(work,'dependencies/cargo')),cargoTarget=await directory(join(work,'work/cargo-target'));
  // Rust链接、系统库和bindgen均使用本轮同一Xcode；只交给当前Cargo任务。
  Object.assign(environment,{CARGO_HOME:cargoHome,CARGO_TARGET_DIR:cargoTarget,RUSTC:tools.rust.path,DEVELOPER_DIR:appleCargo.developerDirectory,SDKROOT:appleCargo.sdk,CC:appleCargo.clang,CARGO_TARGET_AARCH64_APPLE_DARWIN_LINKER:appleCargo.clang,CXX:apple.tools['clang++'],AR:apple.tools.ar,LIBCLANG_PATH:appleCargo.libclangDirectory,DYLD_LIBRARY_PATH:appleCargo.libclangDirectory,PROTOC:tools.protoc.path,SOLC:tools.solc.path,RESOLC:tools.resolc.path,CMAKE:tools.cmake.path,PATH:[...new Set(Object.values(tools).map(t=>dirname(t.path))),dirname(apple.tools.make)].join(':')});
  // Cargo只按本仓原始锁准备依赖；随后构建强制离线，不改锁、不跟随新版本。
- const prepareCommand=options.provided===true?options.runCommand:run;if(typeof prepareCommand!=='function')fail('调度供给缺少依赖执行能力');
+ const prepareCommand=run;
  const rustLibrary=await rustLibraryManifest(tools.rust.path);
  await prepareCommand(cargo,['fetch','--manifest-path',join(root,'Cargo.toml'),'--locked',...(options.offline?['--offline']:[])],{cwd:work,env:environment,signal});
  await prepareCommand(cargo,['fetch','--manifest-path',rustLibrary,'--locked',...(options.offline?['--offline']:[])],{cwd:work,env:{...environment,RUSTC_BOOTSTRAP:'1'},signal});
  return {schema:1,product_id:contract.product_id,platform,work,run_id:previous.run_id,offline:true,tools,environment,dependencies:{own:{cargoHome}},archives:{}};
 }
 export function resourceEnvironment(platform,work,value){checkWork(work);if(platform!=='sdk'||value?.schema!==1||value.product_id!==contract.product_id||value.platform!==platform||value.work!==work||value.offline!==true)fail('资源回执身份无效');for(const tool of contract.platforms.sdk.tools)if(value.tools?.[tool.id]?.version!==tool.version)fail('资源版本与本仓声明不符');return value.environment;}
-async function suppliedResources(platform,work,request,signal){const stream=new Socket({fd:4,readable:true,writable:true}),plan=await requirements(platform,work);return new Promise((ok,reject)=>{let text='',done=false;const finish=(error,value)=>{if(done)return;done=true;signal?.removeEventListener('abort',abort);stream.destroy();error?reject(error):ok(value);},abort=()=>finish(Error('资源供给已取消'));signal?.throwIfAborted();signal?.addEventListener('abort',abort,{once:true});stream.setEncoding('utf8');stream.on('data',chunk=>{text+=chunk;if(Buffer.byteLength(text)>2*1024**2)return finish(Error('供给回执超限'));if(!text.includes('\n'))return;try{const [line,extra]=text.split('\n');if(extra)fail('供给回执不是唯一帧');const reply=JSON.parse(line);if(reply.id!=='1'||reply.ok!==true||reply.value?.run_id!==request.run_id)fail('供给回执失败或任务不符');finish(null,reply.value);}catch(e){finish(e);}});stream.on('error',e=>finish(e));stream.on('end',()=>finish(Error('供给通道中断')));stream.write(JSON.stringify({id:'1',operation:'prepare',previous:request})+'\n');});}
+
 // 领取与收尾共用本仓短锁，直到全部子内容删除后才释放。
 async function withWorkClaim(work,action){
  checkWork(work);await directory(work);const path=work===buildWork()?join(dirname(work),'.claim-sdk'):join(work,'.claim.lock');await mkdir(path,{mode:0o700});const held=await lstat(path);
@@ -150,11 +165,10 @@ async function runProductTests(platform,work,receipt,signal){
 
 export async function execute(platform,work,request={},options={}){
  options.signal?.throwIfAborted();checkWork(work);await directory(work);await requirements(platform,work);if(!request||typeof request!=='object'||Array.isArray(request)||Object.keys(request).some(k=>k!=='run_id')||request.run_id!==undefined&&(typeof request.run_id!=='string'||!/^[1-9][0-9]{8}$/u.test(request.run_id)))fail('SDK Build只接受本轮运行编号');
- const provided=process.env.PRODUCT_RESOURCE_FD==='4';
- const runID=request.run_id||randomUUID(),mode=provided?'provided':'independent',lock=join(work,'.active.json');const owner={schema:1,product_id:contract.product_id,platform,scope:'build',work,run_id:runID,pid:process.pid,nonce:randomUUID(),groups:[]};await withWorkClaim(work,async()=>{await assertSupplyExited(work);await writeFile(lock,JSON.stringify(owner)+'\n',{flag:'wx',mode:0o600});});let unsafe=false;
+ const runID=request.run_id||randomUUID(),lock=join(work,'.active.json');const owner={schema:1,product_id:contract.product_id,platform,scope:'build',work,run_id:runID,pid:process.pid,nonce:randomUUID(),groups:[]};await withWorkClaim(work,async()=>{await assertSupplyExited(work);await writeFile(lock,JSON.stringify(owner)+'\n',{flag:'wx',mode:0o600});});let unsafe=false;
  const cancellation=new AbortController(),abort=()=>cancellation.abort();options.signal?.addEventListener('abort',abort,{once:true});
- try{return await task.run({work,groups:new Set(),onGroups:groups=>writeFileSync(lock,JSON.stringify({...owner,groups:[...groups]})+'\n')},async()=>{const receipt=mode==='provided'?await suppliedResources(platform,work,{run_id:runID},cancellation.signal):await prepareResourceSupply(platform,work,{run_id:runID},{...options,provided:false});const env=resourceEnvironment(platform,work,receipt);await runProductTests(platform,work,receipt,cancellation.signal);await build(platform,work,receipt,{signal:cancellation.signal});assertWorkQuiescent();return {schema:1,product_id:contract.product_id,platform,work,run_id:runID,completion:'compile-only',files:[]};});}
- catch(e){unsafe=String(e.message).includes('退出未确认')||String(e.message).includes('后代仍运行');throw e;}finally{options.signal?.removeEventListener('abort',abort);if(!unsafe&&mode==='independent')await withWorkClaim(work,async()=>{await clearBuildContents(work);await rmdir(work);});}
+ try{return await task.run({work,groups:new Set(),onGroups:groups=>writeFileSync(lock,JSON.stringify({...owner,groups:[...groups]})+'\n')},async()=>{const receipt=await prepareResourceSupply(platform,work,{run_id:runID},{...options,signal:cancellation.signal});const env=resourceEnvironment(platform,work,receipt);await runProductTests(platform,work,receipt,cancellation.signal);await build(platform,work,receipt,{signal:cancellation.signal});assertWorkQuiescent();return {schema:1,product_id:contract.product_id,platform,work,run_id:runID,completion:'compile-only',files:[]};});}
+ catch(e){unsafe=String(e.message).includes('退出未确认')||String(e.message).includes('后代仍运行');throw e;}finally{options.signal?.removeEventListener('abort',abort);if(!unsafe)await withWorkClaim(work,async()=>{await clearBuildContents(work);await rmdir(work);});}
 }
 
 const sdkRepository='crcfrcn/polkadot-sdk';
@@ -257,11 +271,11 @@ if(process.argv[1]===fileURLToPath(import.meta.url)&&!process.env.NODE_TEST_CONT
  }else fail('本机编译参数无效');
 }
 
-// 产品自行管理 GitHub 自动化的派发、观察、取消与原 Run 恢复；控制台仅提供安全授权和任务宿主。
+// 本产品公开GitHub接口只使用普通参数与返回值；平台流程及终态处理归本仓。
 const automationRepository="crcfrcn/polkadot-sdk";
 const automationWorkflow=Object.freeze({"sdk":"sdk.yml"});
-const automationModuleFile="polkadot.mjs";
-const automationObservers=new WeakMap(),automationReconnects=new WeakSet();
+
+
 const automationFail=message=>{throw Error(message);};
 function automationRoute(route,action){
  const workflow=automationWorkflow[route?.platform];
@@ -272,16 +286,7 @@ function automationRoute(route,action){
     ||action.authorizationLevel!==2))automationFail('产品自动化动作与目标不一致');
  return workflow;
 }
-async function automationAccess(host,route,actionId,task){
- const payload={repository:automationRepository,purpose:'workflow',action_id:actionId,platform:route.platform,
-  ...(task?{run_id:task.id,recovery_run_id:task.id}:{})};
- const response=await host.security('github.repository.token',{payload_base64:Buffer.from(JSON.stringify(payload)).toString('base64')});
- if(response?.ok!==true||!response.values)automationFail('产品 GitHub 授权失败');
- const token=Buffer.from(response.values['repository-main:TOKEN']||'','base64').toString('utf8');
- const expiresAt=Number(Buffer.from(response.values['repository-main:EXPIRES_AT']||'','base64').toString('utf8'));
- if(!/^ghs_[^\s\u0000-\u001f\u007f]{1,2044}$/u.test(token)||!Number.isSafeInteger(expiresAt)||expiresAt<=Date.now()/1000)automationFail('产品 GitHub 短期授权无效');
- return {token,expiresAt};
-}
+
 async function automationRequest(path,access,{method='GET',body,fetchImpl=fetch}={}){
  if(typeof path!=='string'||!/^actions\/[A-Za-z0-9_/?=&.%-]+$/u.test(path)||path.includes('..'))automationFail('产品 GitHub 请求路径无效');
  let response;
@@ -356,7 +361,7 @@ async function automationReadLogs(runId,access){
  return automationLogArchive(Buffer.concat(parts));
 }
 
-// 独立调用与控制台调度共用本产品的同一派发入口；正式令牌由调用方授权取得。
+// 本产品独立拥有此实现，通过自身公开接口执行。
 export async function dispatch(platform,token,{fetchImpl=fetch,accepted}={}){
  const workflow=automationWorkflow[platform];if(!workflow||typeof token!=='string'||!token)automationFail('产品自动化派发参数无效');
  const route={repository:automationRepository.split('/')[1],product:automationRepository.split('/')[1],platform,
@@ -369,116 +374,12 @@ export async function dispatch(platform,token,{fetchImpl=fetch,accepted}={}){
  await accepted?.(receipt);
  return automationCheckedRun(await automationRequest(`actions/runs/${receipt.workflow_run_id}`,access,{fetchImpl}),route,receipt.workflow_run_id);
 }
-function automationIdentity(task,route,run){
- Object.assign(task,{repository:route.repository,productId:route.product,platform:route.platform,mode:'release',flow:'release',
-  githubRepository:automationRepository,githubWorkflow:automationWorkflow[route.platform],githubRunId:run.id,
-  githubRunNumber:run.run_number,githubRunAttempt:run.run_attempt,githubRunUrl:run.html_url,
-  sourceSHA:run.head_sha,githubRemoteStatus:run.status,recovered:false});
-}
-function automationSchedule(task,route,host){
- if(!task.active||automationReconnects.has(task))return;
- automationReconnects.add(task);const timer=setTimeout(()=>{
-  automationReconnects.delete(task);
-  if(!task.active)return;
-  // 宿主恢复必须重新进入原产品请求及本次授权上下文；独立调用仍使用同一本仓入口。
-  void Promise.resolve().then(()=>typeof host.recoverTask==='function'
-   ?host.recoverTask(task):recoverAutomation(task,route,host)).catch(error=>{
-    if(!task.active)return;task.recovered=true;host.report(task,'原 Run 重连未完成：'+error.message);host.changed(task);
-    automationSchedule(task,route,host);
-   });
- },120000);timer.unref?.();
-}
-async function automationObserve(task,route,access,host){
- automationObservers.set(task,access);let previous='';const jobStates=new Map();
- try{while(task.active){
-  const run=automationCheckedRun(await automationRequest(`actions/runs/${task.githubRunId}`,access),route,task.githubRunId);
-  if(task.sourceSHA&&task.sourceSHA!==run.head_sha)automationFail('产品自动化提交身份漂移');
-  automationIdentity(task,route,run);
-  const state=run.status==='completed'?run.conclusion:run.status;
-  if(state!==previous){host.report(task,'GitHub：'+state);host.changed(task);previous=state;}
-  const jobs=await automationJobs(run.id,access);
-  for(const job of jobs){const current=job.status+':'+job.conclusion;
-   if(jobStates.get(job.id)!==current){jobStates.set(job.id,current);host.report(task,automationSafeText(job.name,access.token)+'：'+(job.conclusion||job.status));}
-  }
-  if(run.status==='completed'){
-   try{for(const file of await automationReadLogs(run.id,access)){
-    host.report(task,'GitHub 日志：'+automationSafeText(file.name,access.token));
-    for(const line of file.text.split(/\r?\n/u))if(line)host.report(task,automationSafeText(line,access.token));
-   }}catch{host.report(task,'GitHub 终态已确认；日志下载未完成，可从 Run 链接查看');}
-   await host.finish(task,task.cancelRequested?1:run.conclusion==='success'?0:1,
-    task.cancelRequested?'任务已取消；塔塔自动化终态：'+run.conclusion:run.conclusion==='success'?'塔塔自动化成功':'塔塔自动化失败：'+run.conclusion);
-   await host.refresh?.(route.repository,host.security);return;
-  }
-  await new Promise(resolve=>setTimeout(resolve,5000));
- }}catch(error){if(task.active){task.recovered=true;host.report(task,'原 Run 观察中断：'+error.message);host.changed(task);automationSchedule(task,route,host);}}
- finally{automationObservers.delete(task);}
-}
-async function automationCancel(task,route,host){
- if(!task.active)return {id:task.id,closed:true};
- automationRoute(route);task.cancelRequested=true;host.changed(task);
- if(!task.githubRunId)return {id:task.id,closed:true};
- // 取消单独领取本次权限；观察令牌过期时不能沿用旧授权。
- const observed=automationObservers.get(task);
- const access=observed?.expiresAt>Date.now()/1000?observed:await automationAccess(host,route,task.actionId,task);
- let run=automationCheckedRun(await automationRequest(`actions/runs/${task.githubRunId}`,access),route,task.githubRunId);
- if(task.sourceSHA&&task.sourceSHA!==run.head_sha)automationFail('产品自动化取消目标提交已变化');
- if(run.status!=='completed'){
-  try{await automationRequest(`actions/runs/${task.githubRunId}/cancel`,access,{method:'POST'});}
-  catch(error){run=automationCheckedRun(await automationRequest(`actions/runs/${task.githubRunId}`,access),route,task.githubRunId);if(run.status!=='completed')throw error;}
- }
- for(let attempt=0;attempt<60&&run.status!=='completed';attempt++){
-  await new Promise(resolve=>setTimeout(resolve,5000));
-  run=automationCheckedRun(await automationRequest(`actions/runs/${task.githubRunId}`,access),route,task.githubRunId);
- }
- if(run.status!=='completed'){
-  host.report(task,'普通取消未收口，按原 Run 请求强制取消');
-  await automationRequest(`actions/runs/${task.githubRunId}/force-cancel`,access,{method:'POST'});
-  for(let attempt=0;attempt<60&&run.status!=='completed';attempt++){
-   await new Promise(resolve=>setTimeout(resolve,5000));
-   run=automationCheckedRun(await automationRequest(`actions/runs/${task.githubRunId}`,access),route,task.githubRunId);
-  }
- }
- if(run.status!=='completed')automationFail('GitHub 取消未收口，保留活动任务');
- if(task.active)await host.finish(task,1,'任务已取消；塔塔自动化终态：'+run.conclusion);
- return {id:task.id,closed:true};
-}
-export async function startAutomation(route,action,host){
- automationRoute(route,action);
- const existing=host.listTasks().find(task=>task.active&&task.recovered&&task.githubRunId
-  &&task.repository===route.repository&&task.platform===route.platform);
- if(existing){await recoverAutomation(existing,route,host);return {id:existing.id};}
- const access=await automationAccess(host,route,action.id);
- const task=host.createTask({moduleFile:automationModuleFile,canonicalId:route.canonicalId,actionId:action.id,
-  title:action.taskName,moduleId:route.product,repository:route.repository,productId:route.product,platform:route.platform,
-  mode:'release',flow:'release'});
- task.security=host.security;task.cancel=()=>automationCancel(task,route,host);task.secrets.push(access.token);host.created(task);
- host.report(task,'调用所属产品 '+automationWorkflow[route.platform]);
- try{const run=await dispatch(route.platform,access.token,{accepted:receipt=>{
-   Object.assign(task,{githubRunId:receipt.workflow_run_id,githubRunUrl:receipt.html_url,
-    githubRepository:automationRepository,githubWorkflow:automationWorkflow[route.platform]});host.changed(task);
-  }});automationIdentity(task,route,run);host.changed(task);host.report(task,'GitHub 已接收：'+run.html_url);
-  if(task.cancelRequested)void automationCancel(task,route,host).catch(error=>{if(task.active){task.recovered=true;host.report(task,error.message);host.changed(task);automationSchedule(task,route,host);}});else void automationObserve(task,route,access,host);
- }catch(error){if(task.githubRunId){task.recovered=true;host.report(task,'原 Run 已接收，读取中断：'+error.message);host.changed(task);automationSchedule(task,route,host);}
-  else await host.finish(task,1,error.message);}
- return {id:task.id};
-}
-export async function recoverAutomation(task,route,host){
- automationRoute(route);
- if(!task?.active||task.mode!=='release'||task.repository!==route.repository||task.platform!==route.platform
-  ||task.githubRepository!==automationRepository||task.githubWorkflow!==automationWorkflow[route.platform]
-  ||task.moduleFile!==automationModuleFile||task.canonicalId!==route.canonicalId
-  ||!Number.isSafeInteger(task.githubRunId)||task.githubRunId<1
-  ||task.sourceSHA!==undefined&&task.sourceSHA!==null&&!/^[a-f0-9]{40}$/u.test(task.sourceSHA))
-  automationFail('产品自动化恢复身份无效');
- task.security=host.security;task.cancel=()=>automationCancel(task,route,host);task.recovered=true;host.changed(task);
- try{const access=await automationAccess(host,route,task.actionId,task);task.secrets.push(access.token);
-  const run=automationCheckedRun(await automationRequest(`actions/runs/${task.githubRunId}`,access),route,task.githubRunId);
-  if(task.sourceSHA&&task.sourceSHA!==run.head_sha)automationFail('产品自动化恢复提交身份已变化');
-  automationIdentity(task,route,run);task.recovered=false;host.changed(task);
-  if(task.cancelRequested)void automationCancel(task,route,host).catch(error=>{if(task.active){task.recovered=true;host.report(task,error.message);host.changed(task);automationSchedule(task,route,host);}});else void automationObserve(task,route,access,host);
- }catch(error){task.recovered=true;host.report(task,'原 Run 自动恢复未完成：'+error.message);host.changed(task);automationSchedule(task,route,host);}
- return {id:task.id};
-}
+
+
+
+
+
+
 
 import {inflateRawSync as automationInflateRawSync} from 'node:zlib';
 
@@ -550,7 +451,19 @@ if(process.env.NODE_TEST_CONTEXT&&process.argv.length===2&&process.argv[1]===imp
   }
   const parent=join(root,'target/test/sessions');if(existsSync(parent)&&readdirSync(parent).length===0)rmdirSync(parent);
  });
- test('独立供给从同一Xcode查询Clang和macOS SDK，系统xcrun直接交付',async()=>{const calls=[];const value=await standaloneApple({names:['xcrun','clang']},'/fixture',{},undefined,async(file,args)=>{calls.push([file,args]);return file.endsWith('xcode-select')?'/fixture/Xcode':args[0]==='--sdk'?'/fixture/Xcode/MacOSX.sdk':'/fixture/Xcode/clang';});assert.equal(value.tools.xcrun,'/usr/bin/xcrun');assert.equal(value.tools.clang,'/fixture/Xcode/clang');assert.equal(value.sdk,'/fixture/Xcode/MacOSX.sdk');assert.equal(calls.filter(([,args])=>args[0]==='--sdk').length,1);assert.equal(calls.some(([,args])=>args.includes('xcrun')),false);});
+ test('通用供给合同：SDK明确SDK目标并自行验收rust-src及目标标准库',async t=>{
+  const work=join(testRoot(),'contract-'+randomUUID());await directory(work);t.after(()=>rm(work,{recursive:true,force:true}));
+  assert.equal(contract.apple.sdk,'macosx');const tool=contract.platforms.sdk.tools.find(t=>t.id==='rust'),payload=join(work,'rust');await directory(payload);
+  for(const slot of tool.slots){await directory(dirname(join(payload,slot)));await writeFile(join(payload,slot),'fixture',{mode:0o755});}
+  await assert.rejects(validateSDKTool(tool,payload));
+  const library=join(payload,'lib/rustlib/src/rust/library');await directory(library);
+  for(const name of ['Cargo.toml','Cargo.lock'])await writeFile(join(library,name),'fixture');
+  for(const component of tool.components)if(component.target!=='rust-src')await directory(join(payload,'lib/rustlib',component.target,'lib'));
+  const receipt={version:tool.version,path:join(payload,tool.archive.executable),root:payload};assert.equal(await acceptSDKTool(tool,receipt),receipt);
+  await assert.rejects(acceptSDKTool(tool,{...receipt,version:'wrong'}),/身份/u);
+  await rm(join(library,'Cargo.lock'));await assert.rejects(acceptSDKTool(tool,receipt),/原锁/u);
+ });
+ test('独立供给从同一Xcode查询Clang和macOS SDK，系统xcrun直接交付',async()=>{const calls=[];const value=await standaloneApple({sdk:'macosx',names:['xcrun','clang']},'/fixture',{},undefined,async(file,args)=>{calls.push([file,args]);return file.endsWith('xcode-select')?'/fixture/Xcode':args[0]==='--sdk'?'/fixture/Xcode/MacOSX.sdk':'/fixture/Xcode/clang';});assert.equal(value.tools.xcrun,'/usr/bin/xcrun');assert.equal(value.tools.clang,'/fixture/Xcode/clang');assert.equal(value.sdk,'/fixture/Xcode/MacOSX.sdk');assert.equal(calls.filter(([,args])=>args[0]==='--sdk').length,1);assert.equal(calls.some(([,args])=>args.includes('xcrun')),false);});
  test('SDK平台编译现场位于独立目录且空现场收尾删除目录',async()=>{
   const work=buildWork();assert.equal(checkWork(work),work);
   assert.throws(()=>checkWork(join(root,'target/build')),/工作根/);
@@ -560,34 +473,7 @@ if(process.env.NODE_TEST_CONTEXT&&process.argv.length===2&&process.argv[1]===imp
  const receipt=()=>({schema:1,product_id:contract.product_id,platform:'sdk',work:testRoot(),run_id:'123456789',offline:true,environment:{},tools:Object.fromEntries(contract.platforms.sdk.tools.map(t=>[t.id,{version:t.version,path:'/fixture/'+t.id+'/bin/'+(t.id==='rust'?'rustc':t.id)}]))});
  test('SDK编译使用本仓原始锁，完整工作区和离线依赖',async()=>{const value=receipt();let called=0;await build('sdk',testRoot(),value,{runner:async(file,args,options)=>{called++;assert.equal(file,'/fixture/rust/bin/cargo');assert.ok(args.includes('--workspace')&&args.includes('--all-targets')&&args.includes('--locked')&&args.includes('--offline'));assert.equal(options.env.CARGO_NET_OFFLINE,'true');assert.equal(options.cwd,testRoot());}});assert.equal(called,1);});
  test('SDK工具版本不符、取消或真实执行失败不能产生成功',async()=>{const value=receipt();value.tools.rust.version='invalid';let called=false;await assert.rejects(build('sdk',testRoot(),value,{runner:()=>{called=true;}}),/版本/);assert.equal(called,false);const abort=new AbortController();abort.abort();await assert.rejects(build('sdk',testRoot(),receipt(),{signal:abort.signal,runner:()=>assert.fail('取消不得执行')}));await assert.rejects(build('sdk',testRoot(),receipt(),{runner:()=>{throw Error('fixture compiler failure');}}),/fixture compiler failure/);});
- test('SDK调度依赖只使用交付执行能力，缺能力及执行失败不回退',async()=>{
-  const work=testRoot();await mkdir(dirname(work),{recursive:true});await mkdir(work,{recursive:true});
-  try{
-   const developerDirectory=join(work,'Xcode'),sdk=join(developerDirectory,'MacOSX.sdk'),bin=join(developerDirectory,'Toolchains/usr/bin'),lib=join(developerDirectory,'Toolchains/usr/lib'),clang=join(bin,'clang');
-   await mkdir(join(sdk,'usr/lib'),{recursive:true});await mkdir(bin,{recursive:true});await mkdir(lib,{recursive:true});
-   await writeFile(join(sdk,'usr/lib/libSystem.tbd'),'stub');await writeFile(clang,'clang');await writeFile(join(lib,'libclang.dylib'),'library');
-   const rustc=join(work,'rust/bin/rustc'),rustLibrary=join(work,'rust/lib/rustlib/src/rust/library');
-   await mkdir(dirname(rustc),{recursive:true});await mkdir(rustLibrary,{recursive:true});
-   await writeFile(rustc,'rustc');await writeFile(join(rustLibrary,'Cargo.toml'),'workspace');await writeFile(join(rustLibrary,'Cargo.lock'),'lock');
-   const previous={run_id:'123456789'};let calls=0;
-   const options={provided:true,acquireTool:async tool=>({version:tool.version,path:tool.id==='rust'?rustc:'/fixture/'+tool.id+'/bin/'+tool.id}),acquireApple:async plan=>({developerDirectory,sdk,tools:Object.fromEntries(plan.names.map(name=>[name,name==='clang'?clang:join(bin,name)]))}),runCommand:async(file,args,settings)=>{calls++;assert.equal(file,join(dirname(rustc),'cargo'));assert.equal(args[0],'fetch');assert.ok(args.includes('--locked'));assert.equal(args[2],calls===1?join(root,'Cargo.toml'):join(rustLibrary,'Cargo.toml'));assert.equal(settings.env.RUSTC_BOOTSTRAP,calls===1?undefined:'1');assert.equal(settings.cwd,work);assert.equal(settings.env.CARGO_TARGET_AARCH64_APPLE_DARWIN_LINKER,clang);assert.equal(settings.env.SDKROOT,sdk);assert.equal(settings.env.LIBCLANG_PATH,lib);assert.equal(settings.env.DYLD_LIBRARY_PATH,lib);}};
-   const result=await prepareResourceSupply('sdk',work,previous,options);assert.equal(calls,2);assert.equal(result.offline,true);assert.equal(result.environment.CARGO_TARGET_AARCH64_APPLE_DARWIN_LINKER,clang);
-   await assert.rejects(prepareResourceSupply('sdk',work,previous,{...options,acquireApple:async()=>({developerDirectory,sdk,tools:{}})}),/Apple工具路径无效/);assert.equal(calls,2);
-   await assert.rejects(prepareResourceSupply('sdk',work,previous,{...options,acquireApple:async()=>({developerDirectory,tools:{clang}})}),/Apple工具路径无效/);assert.equal(calls,2);
-   const outside=join(work,'Outside');await mkdir(outside);
-   await assert.rejects(prepareResourceSupply('sdk',work,previous,{...options,acquireApple:async()=>({developerDirectory,sdk:outside,tools:{clang}})}),/Apple工具越界/);assert.equal(calls,2);
-   await rm(join(lib,'libclang.dylib'));
-   await assert.rejects(prepareResourceSupply('sdk',work,previous,options),/Apple工具缺失或越界/);assert.equal(calls,2);
-   await writeFile(join(lib,'libclang.dylib'),'library');
-   await rm(join(rustLibrary,'Cargo.lock'));
-   await assert.rejects(prepareResourceSupply('sdk',work,previous,options),/Rust工具原锁缺失/);assert.equal(calls,2);
-   await writeFile(join(rustLibrary,'Cargo.lock'),'lock');
-   await assert.rejects(prepareResourceSupply('sdk',work,previous,{...options,acquireTool:async tool=>({version:tool.version,path:tool.id==='rust'?'/fixture/foreign/rustc':'/fixture/'+tool.id+'/bin/'+tool.id})}),/Rust工具原锁缺失/);assert.equal(calls,2);
-   await assert.rejects(prepareResourceSupply('sdk',work,previous,{...options,runCommand:undefined}),/能力不完整/);assert.equal(calls,2);
-   await assert.rejects(prepareResourceSupply('sdk',work,previous,{...options,runCommand:async()=>{throw Error('fixture fetch failure');}}),/fixture fetch failure/);
-   let stages=0;await assert.rejects(prepareResourceSupply('sdk',work,previous,{...options,runCommand:async()=>{if(++stages===2)throw Error('fixture rust library failure');}}),/fixture rust library failure/);assert.equal(stages,2);
-  }finally{await rm(work,{recursive:true,force:true});}
- });
+
 
  test('SDK领取与收尾互斥，异任务及资源后代不能清场',async()=>{
   const work=testRoot();await mkdir(dirname(work),{recursive:true});await mkdir(work,{recursive:true});
@@ -621,17 +507,8 @@ if(process.env.NODE_TEST_CONTEXT&&process.argv.length===2&&process.argv[1]===imp
   run_number:1,run_attempt:1,status:'completed',conclusion:'success',...change});
  const response=value=>Response.json(value);
  const token='ghs_fixture',expiry=Date.now()+3600000;
- function fixtureHost(){let finish;const finished=new Promise(resolve=>{finish=resolve;});const tasks=[],reports=[];let grants=0;
-  const host={listTasks:()=>tasks,createTask:details=>{const task={...details,id:'123456789',active:true,secrets:[]};tasks.push(task);return task;},
-   created(){},changed(){},report(_task,message){reports.push(message);},async finish(task,code){task.active=false;finish(code);},
-   async security(){grants++;return {ok:true,values:{'repository-main:TOKEN':Buffer.from(token).toString('base64'),
-    'repository-main:EXPIRES_AT':Buffer.from(String(Math.floor(expiry/1000))).toString('base64')}};}};
-  return {host,tasks,reports,finished,get grants(){return grants;}};
- }
- const task=()=>({id:'123456789',active:true,secrets:[],mode:'release',repository:route.repository,platform,
-  githubRepository:automationRepository,githubWorkflow:workflow,moduleFile:automationModuleFile,
-  canonicalId:route.canonicalId,actionId,githubRunId:runId,githubRunUrl:`https://github.com/${automationRepository}/actions/runs/${runId}`,
-  sourceSHA:sha,recovered:true});
+
+
  test('产品自动化派发成功只发一次，并拒绝无 Run 回执的重复派发',async()=>{
   let posts=0;const fetchImpl=async(url,options)=>{
    if(options.method==='POST'){posts++;return response({workflow_run_id:runId,html_url:`https://github.com/${automationRepository}/actions/runs/${runId}`});}
@@ -648,43 +525,37 @@ if(process.env.NODE_TEST_CONTEXT&&process.argv.length===2&&process.argv[1]===imp
   assert.throws(()=>automationCheckedRun(run({repository:{full_name:'foreign/repo'}}),route,runId),/身份/);
   assert.doesNotThrow(()=>automationRoute(route,action));
  });
- test('产品自动化观察成功与失败均按原 Run 终态收口',async()=>{
-  const original=globalThis.fetch;
-  try{for(const conclusion of ['success','failure']){
-   globalThis.fetch=async url=>String(url).includes('/jobs?')?response({jobs:[]}):new Response(null,{status:404});
-   const f=fixtureHost(),value=task();
-   globalThis.fetch=async url=>String(url).includes('/actions/runs/'+runId+'/logs')?new Response(null,{status:404})
-    :String(url).includes('/jobs?')?response({jobs:[]}):response(run({conclusion}));
-   await automationObserve(value,route,{token,expiresAt:expiry/1000},f.host);
-   assert.equal(await f.finished,conclusion==='success'?0:1);assert.equal(value.active,false);
-  }}finally{globalThis.fetch=original;}
- });
- test('产品自动化取消原 Run，过期观察令牌改领本次授权',async()=>{
-  const original=globalThis.fetch;let cancelled=false,posts=0;
-  try{globalThis.fetch=async(url,options)=>{
-   if(options.method==='POST'){posts++;cancelled=true;return new Response(null,{status:202});}
-   return response(run({status:cancelled?'completed':'in_progress',conclusion:cancelled?'cancelled':null}));
-  };
-   const f=fixtureHost(),value=task();automationObservers.set(value,{token:'ghs_expired',expiresAt:0});
-   assert.equal((await automationCancel(value,route,f.host)).closed,true);assert.equal(posts,1);
-   assert.equal(f.grants,1);assert.equal(await f.finished,1);
-  }finally{globalThis.fetch=original;}
- });
- test('产品自动化恢复只读取原 Run，失败授权前已绑定取消入口',async()=>{
-  const original=globalThis.fetch;let posts=0;
-  try{globalThis.fetch=async(url,options)=>{
-   if(options.method==='POST')posts++;
-   if(String(url).includes('/jobs?'))return response({jobs:[]});
-   if(String(url).includes('/logs'))return new Response(null,{status:404});
-   return response(run());
-  };
-   const f=fixtureHost(),value=task();await recoverAutomation(value,route,f.host);
-   assert.equal(typeof value.cancel,'function');assert.equal(await f.finished,0);assert.equal(posts,0);
-   const denied=fixtureHost(),pending=task();denied.host.security=async()=>{throw Error('合成授权拒绝');};
-   await recoverAutomation(pending,route,denied.host);
-   assert.equal(typeof pending.cancel,'function');assert.equal(pending.active,true);assert.equal(pending.recovered,true);
-  }finally{globalThis.fetch=original;}
- });
+
+
+
 }
 
 // END INLINE TESTS
+
+// 外部调用方使用普通参数和返回值；此公开接口不接收任务宿主。
+export const automationClient=Object.freeze({automationRepository,automationWorkflow,automationFail,automationRoute,automationRequest,automationCheckedRun,automationSafeText,automationJobs,automationLogArchive,automationReadLogs,dispatch});
+
+// 合成回归只在本文件作为测试入口时注册；普通导入不要求调度器、其它仓库或外部服务。
+if(process.env.NODE_TEST_CONTEXT&&process.argv.length===2&&process.argv[1]===import.meta.filename){
+ const {test}=await import('node:test'),{default:assert}=await import('node:assert/strict');
+ test('独立自动化接口不接收任务宿主，准确派发与错误回执只请求一次',async()=>{
+  const api=automationClient,workflows=api.automationWorkflows||api.automationWorkflow;
+  const platform=Object.keys(workflows)[0],workflow=workflows[platform],repository=api.automationRepository;
+  const dispatch=api.dispatchAutomation||api.dispatchProductAutomation||api.dispatch;
+  let dispatches=0,mode='success';
+  const run={id:731,run_number:1,run_attempt:1,path:'.github/workflows/'+workflow,event:'workflow_dispatch',head_branch:'main',
+   head_sha:'a'.repeat(40),repository:{full_name:repository},status:'completed',conclusion:'success',
+   html_url:'https://github.com/'+repository+'/actions/runs/731'};
+  const fetchImpl=async(url,options)=>{
+   if(new URL(url).pathname.endsWith('/dispatches')){
+    dispatches++;assert.equal(options.method,'POST');
+    return mode==='ambiguous'?new Response(null,{status:204}):Response.json({workflow_run_id:731,html_url:run.html_url});
+   }
+   assert.ok(new URL(url).pathname.endsWith('/runs/731'));
+   return Response.json(mode==='wrong'?{...run,head_sha:'invalid'}:run);
+  };
+  const invoke=()=>api.automationTransport?api.automationTransport.run({fetchImpl},()=>dispatch(platform,'fixture',{fetchImpl})):dispatch(platform,'fixture',{fetchImpl});
+  assert.equal((await invoke()).id,731);assert.equal(dispatches,1);
+  for(const failure of ['ambiguous','wrong']){mode=failure;dispatches=0;await assert.rejects(invoke);assert.equal(dispatches,1);}
+ });
+}

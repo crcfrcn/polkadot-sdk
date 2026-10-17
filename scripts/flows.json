@@ -131,7 +131,8 @@
       "clang++",
       "make",
       "ar"
-    ]
+    ],
+    "sdk": "macosx"
   },
   "bootstrap": {
     "platform": "darwin",
