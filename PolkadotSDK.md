@@ -163,3 +163,6 @@ GitHub 门禁为同一 Xcode 的规范 macOS SDK 与 ARM Clang 显式交付 SDKR
 ## 产品自有编译前测试
 
 SDK完整 Build 在本仓资源回执验真后，使用同一受控 Node 入口运行本仓 Node 回归；回归成功才运行原有离线锁定的 Cargo 工作区正式编译。控制台仅调用本仓完整 Build、按本仓声明供给资源并回传结果。测试时本仓将固定夹具映射到 `target/test/sessions/<随机会话>/`，结束后核对工具与守卫并仅清本轮会话；正式 `target/build/sdk` 保持固定互斥工作根。
+
+本产品的 `scripts/build.mjs` 公开 `dispatch`、`startAutomation` 与 `recoverAutomation`：由产品按本仓平台和 Workflow 坐标派发 GitHub Run，核对仓库、main、workflow、提交与 Run 身份，并负责观察终态、按原 Run 取消及恢复。控制台的 `tata/产品.mjs` 只调用本产品入口并提供本次授权与任务宿主；观察中断后的定时重连由宿主重新进入所属产品请求以领取本次恢复授权，独立调用仍使用同一本仓入口；恢复失败时原 Run 取消入口仍保持可用，取消不沿用过期观察令牌；远端记录、资产、GitHub App 授权和保存推送仍由原有接口承担。
+同一产品 Build 源码中的合成回归以模拟 GitHub 响应覆盖派发回执、禁止重复派发、身份拒绝、终态观察、原 Run 取消、恢复及过期令牌重新授权；验证过程不触发真实 GitHub 自动化。
