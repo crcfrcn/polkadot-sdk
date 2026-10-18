@@ -2,7 +2,6 @@
   "schema": 1,
   "product_id": "polkadot-sdk",
   "entry": "scripts/build.mjs",
-  "resource_entry": "scripts/build.mjs",
   "platforms": {
     "sdk": {
       "completion": "compile-only",
