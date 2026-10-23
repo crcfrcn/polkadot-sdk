@@ -11,10 +11,12 @@ export const manifest=Object.freeze({
 });
 export function describeConfiguration(){return JSON.parse(JSON.stringify(manifest));}
 
-// 本仓流程的公开入口声明；调用方只交付标准传输能力，不拥有产品规则或任务宿主。
-export async function describeAction({flow,platform}){
- if(flow!=='release')throw Error('本产品尚未声明该流程入口：'+flow+'·'+platform);
- const {automationClient}=await import('./build.mjs');
- return {repository:automationClient.automationRepository,
-  launch:async({token})=>({runID:(await automationClient.dispatch(platform,token)).id})};
+// 本产品Workflow坐标声明。
+export const workflows=Object.freeze({"sdk":"sdk.yml"});
+
+// 只返回声明数据；派发与观察归通用调用方，版本及交付归本仓YAML。
+export function describeAction({flow,platform,inputs={}}){
+ const workflow=workflows[platform];
+ if(flow==='release'&&workflow)return {repository:"crcfrcn/polkadot-sdk",workflow,ref:'main',inputs};
+ throw Error('本产品未声明该流程：'+flow+'·'+platform);
 }
