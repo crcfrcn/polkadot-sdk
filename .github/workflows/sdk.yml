@@ -1,3 +1,5 @@
+# 回归和编译锁定的Polkadot SDK，维护构建缓存及所属运行记录。
+
 name: polkadot-sdk.sdk
 run-name: polkadot-sdk.sdk·${{ github.run_number }}
 'on':

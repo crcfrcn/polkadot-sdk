@@ -1,5 +1,7 @@
 #!/usr/bin/env node
-// 本产品独立拥有此实现，通过自身公开接口执行。
+// 准备Polkadot SDK编译所需的工具、资源和独占工作目录。
+// 执行工作区编译，并维护自动化运行记录及缓存。
+
 import {writeFileSync,existsSync,readdirSync,rmdirSync} from 'node:fs';
 import {spawn} from 'node:child_process';
 import {AsyncLocalStorage} from 'node:async_hooks';
